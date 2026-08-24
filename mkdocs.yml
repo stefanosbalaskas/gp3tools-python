@@ -1,0 +1,15 @@
+site_name: gp3tools for Python
+site_description: Python migration of gp3tools Gazepoint GP3 workflows
+nav:
+  - Home: index.md
+  - API parity: API_PARITY.md
+  - API reference: API_REFERENCE.md
+  - Articles:
+      - End-to-end workflow: articles/end-to-end-workflow.md
+      - Pupil workflow: articles/pupil-workflow.md
+      - AOI workflow: articles/aoi-workflow.md
+      - Fixations and scanpaths: articles/fixation-transitions-scanpaths.md
+      - Statistical extensions: articles/statistical-extensions-plots.md
+      - Cluster permutation: articles/cluster-permutation-timecourse.md
+      - Face workflow: articles/face-complete-workflow.md
+      - Ecosystem exports: articles/ecosystem-exports.md

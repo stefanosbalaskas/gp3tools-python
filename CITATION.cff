@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use gp3tools for Python, cite the gp3tools software paper and report the Python package version."
+title: "gp3tools for Python"
+type: software
+version: "0.1.0a1"
+authors:
+  - family-names: "Balaskas"
+    given-names: "Stefanos"
+license: MIT
+repository-code: "https://github.com/stefanosbalaskas/gp3tools"
+preferred-citation:
+  type: article
+  title: "gp3tools: An R Package for Reproducible Analysis and Reporting of Gazepoint GP3 Eye-Tracking Exports"
+  authors:
+    - family-names: "Balaskas"
+      given-names: "Stefanos"
+  year: 2026
+  journal: "Journal of Eye Movement Research"
+  volume: 19
+  issue: 4
+  start: 76
+  doi: "10.3390/jemr19040076"

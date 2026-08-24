@@ -1,0 +1,7 @@
+include README.md LICENSE CITATION.cff CHANGELOG.md CONTRIBUTING.md R_NAMESPACE_REFERENCE.txt mkdocs.yml
+recursive-include docs *.md *.png
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include src/gp3tools/data *.csv
+include src/gp3tools/api_manifest.csv
+include src/gp3tools/py.typed
