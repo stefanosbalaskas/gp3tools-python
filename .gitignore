@@ -36,3 +36,6 @@ Thumbs.db
 # Temporary
 *.tmp
 *.temp
+
+# Documentation build
+site/

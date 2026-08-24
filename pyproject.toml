@@ -37,11 +37,17 @@ bayes = ["pymc>=5", "arviz>=0.19", "bambi>=0.15"]
 rbridge = ["rpy2>=3.6"]
 dashboard = ["shiny>=1.2"]
 dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.8", "build>=1.2"]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.6",
+]
 
 [project.urls]
-Homepage = "https://github.com/stefanosbalaskas/gp3tools"
-Documentation = "https://stefanosbalaskas.github.io/gp3tools/"
-Issues = "https://github.com/stefanosbalaskas/gp3tools/issues"
+Homepage = "https://github.com/stefanosbalaskas/gp3tools-python"
+Documentation = "https://stefanosbalaskas.github.io/gp3tools-python/"
+Repository = "https://github.com/stefanosbalaskas/gp3tools-python"
+Issues = "https://github.com/stefanosbalaskas/gp3tools-python/issues"
+"R implementation" = "https://github.com/stefanosbalaskas/gp3tools"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
