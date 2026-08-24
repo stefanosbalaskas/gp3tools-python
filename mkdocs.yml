@@ -1,4 +1,7 @@
 site_name: gp3tools for Python
+site_url: "https://stefanosbalaskas.github.io/gp3tools-python/"
+repo_url: "https://github.com/stefanosbalaskas/gp3tools-python"
+repo_name: "stefanosbalaskas/gp3tools-python"
 site_description: Python migration of gp3tools Gazepoint GP3 workflows
 nav:
   - Home: index.md
