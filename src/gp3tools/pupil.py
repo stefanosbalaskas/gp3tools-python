@@ -224,30 +224,258 @@ def flag_gazepoint_pupil(
     physiological_min: float = 1.0,
     physiological_max: float = 9.0,
     output_col="pupil_flag",
+    *,
+    time_col=None,
+    missing_pupil_col=None,
+    group_cols=None,
+    outlier_k: float = 1.5,
+    flag_iqr_outliers: bool = True,
 ) -> pd.DataFrame:
+    """Flag pupil samples with legacy or R v2.3.0 quality columns."""
     df = ensure_dataframe(data)
     pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+    r_mode = (
+        any(v is not None for v in (time_col, missing_pupil_col, group_cols))
+        or outlier_k != 1.5
+        or flag_iqr_outliers is not True
+    )
     x = finite_numeric(df[pupil_col])
-    flag = pd.Series("ok", index=df.index, dtype="string")
-    flag[x.isna()] = "missing"
-    flag[x < physiological_min] = "below_min"
-    flag[x > physiological_max] = "above_max"
-    df[output_col] = flag
-    df["pupil_valid"] = flag.eq("ok")
+    if not r_mode:
+        flag = pd.Series("ok", index=df.index, dtype="string")
+        flag[x.isna()] = "missing"
+        flag[x < physiological_min] = "below_min"
+        flag[x > physiological_max] = "above_max"
+        df[output_col] = flag
+        df["pupil_valid"] = flag.eq("ok")
+        return df
+
+    if physiological_max <= physiological_min:
+        raise ValueError("max_pupil must be greater than min_pupil")
+    if not (np.isfinite(outlier_k) and outlier_k >= 0):
+        raise ValueError("outlier_k must be a finite non-negative number")
+    if not isinstance(flag_iqr_outliers, (bool, np.bool_)):
+        raise ValueError("flag_iqr_outliers must be TRUE or FALSE")
+    time_col = infer_column(df, "time", time_col, required=True)
+    subject_col = infer_column(df, "subject", None, required=True)
+    media_col = infer_column(df, "media", None, required=True)
+    if group_cols is None:
+        groups = ["subject", "media_id"]
+    elif isinstance(group_cols, str):
+        groups = [group_cols]
+    else:
+        groups = list(group_cols)
+    if set(groups) - {"subject", "media_id"}:
+        raise ValueError("group_cols can only contain subject and media_id")
+
+    raw = pd.to_numeric(df[pupil_col], errors="coerce").to_numpy(float)
+    if missing_pupil_col is None:
+        missing = np.isnan(raw)
+    else:
+        if missing_pupil_col not in df:
+            raise KeyError(f"Missing required column: {missing_pupil_col}")
+        missing = df[missing_pupil_col].fillna(False).astype(bool).to_numpy() | np.isnan(raw)
+    nonfinite = ~missing & ~np.isfinite(raw)
+    low = ~missing & ~nonfinite & (raw < physiological_min)
+    high = ~missing & ~nonfinite & (raw > physiological_max)
+    implausible = low | high
+    candidate = raw.copy()
+    candidate[missing | nonfinite | implausible] = np.nan
+    iqr_flags = np.zeros(len(df), dtype=bool)
+    if flag_iqr_outliers:
+        keys = pd.DataFrame(
+            {"subject": df[subject_col].astype(str), "media_id": df[media_col].astype(str)}
+        )
+        iterator = (
+            [(None, np.arange(len(df)))]
+            if not groups
+            else keys.groupby(groups, dropna=False, sort=False).indices.items()
+        )
+        for _, pos in iterator:
+            pos = np.asarray(pos, dtype=int)
+            vals = candidate[pos]
+            finite = vals[np.isfinite(vals)]
+            if finite.size < 4:
+                continue
+            q1, q3 = np.quantile(finite, [0.25, 0.75])
+            iqr = q3 - q1
+            if not np.isfinite(iqr) or iqr == 0:
+                continue
+            lo = q1 - outlier_k * iqr
+            hi = q3 + outlier_k * iqr
+            local = np.isfinite(vals) & ((vals < lo) | (vals > hi))
+            iqr_flags[pos[local]] = True
+    invalid = missing | nonfinite | implausible | iqr_flags
+    reason = np.full(len(df), "valid", dtype=object)
+    reason[iqr_flags] = "iqr_outlier"
+    reason[high] = "implausible_high"
+    reason[low] = "implausible_low"
+    reason[nonfinite] = "nonfinite"
+    reason[missing] = "missing"
+    df["pupil_raw_value"] = raw
+    df["pupil_flag_missing"] = missing
+    df["pupil_flag_nonfinite"] = nonfinite
+    df["pupil_flag_implausible_low"] = low
+    df["pupil_flag_implausible_high"] = high
+    df["pupil_flag_implausible"] = implausible
+    df["pupil_flag_iqr_outlier"] = iqr_flags
+    df["pupil_flag_invalid"] = invalid
+    df["pupil_flag_reason"] = reason
+    df["pupil_for_preprocessing"] = np.where(invalid, np.nan, raw)
+    df["pupil_flag_pupil_column"] = pupil_col
+    df["pupil_flag_time_column"] = time_col
+    df["pupil_flag_min_plausible"] = physiological_min
+    df["pupil_flag_max_plausible"] = physiological_max
+    df["pupil_flag_outlier_k"] = outlier_k
+    legacy_reason = pd.Series(reason, index=df.index, dtype="string").replace(
+        {"valid": "ok", "implausible_low": "below_min", "implausible_high": "above_max"}
+    )
+    df[output_col] = legacy_reason
+    df["pupil_valid"] = ~invalid
     return df
 
 
 def flag_gazepoint_pupil_hampel(
-    data, pupil_col=None, window: int = 7, n_sigma: float = 3.0, output_col="pupil_hampel_flag"
+    data,
+    pupil_col=None,
+    window=None,
+    n_sigma=None,
+    output_col=None,
+    *,
+    time_col=None,
+    grouping_cols=None,
+    window_size_samples: int = 7,
+    k: float = 3.0,
+    min_valid_samples: int = 3,
+    scale_mad: float = 1.4826,
+    flag_col="pupil_hampel_outlier",
+    median_col="pupil_hampel_median",
+    mad_col="pupil_hampel_mad",
+    threshold_col="pupil_hampel_threshold",
+    corrected_col=None,
+    status_col="pupil_hampel_status",
+    overwrite: bool = False,
+    name="gazepoint_pupil_hampel",
 ) -> pd.DataFrame:
+    """Apply a Hampel filter with legacy or R v2.3.0 outputs."""
     df = ensure_dataframe(data)
     pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    x = finite_numeric(df[pupil_col])
-    med = x.rolling(window, center=True, min_periods=max(1, window // 2)).median()
-    dev = (x - med).abs()
-    mad = dev.rolling(window, center=True, min_periods=max(1, window // 2)).median()
-    threshold = 1.4826 * n_sigma * mad
-    df[output_col] = dev > threshold
+    legacy = window is not None or n_sigma is not None or output_col is not None
+    if legacy:
+        window = 7 if window is None else int(window)
+        n_sigma = 3.0 if n_sigma is None else float(n_sigma)
+        output_col = output_col or "pupil_hampel_flag"
+        x = finite_numeric(df[pupil_col])
+        med = x.rolling(window, center=True, min_periods=max(1, window // 2)).median()
+        dev = (x - med).abs()
+        mad = dev.rolling(window, center=True, min_periods=max(1, window // 2)).median()
+        threshold = 1.4826 * n_sigma * mad
+        df[output_col] = dev > threshold
+        return df
+    if len(df) == 0:
+        raise ValueError("data must contain at least one row")
+    if window_size_samples < 1 or window_size_samples % 2 == 0:
+        raise ValueError("window_size_samples must be an odd positive integer")
+    if min_valid_samples < 1 or min_valid_samples > window_size_samples:
+        raise ValueError("min_valid_samples must be between 1 and window_size_samples")
+    if not (np.isfinite(k) and k > 0 and np.isfinite(scale_mad) and scale_mad > 0):
+        raise ValueError("k and scale_mad must be positive finite numbers")
+    if grouping_cols is None:
+        groups = []
+    elif isinstance(grouping_cols, str):
+        groups = [grouping_cols]
+    else:
+        groups = list(grouping_cols)
+    missing = [c for c in groups if c not in df]
+    if missing:
+        raise KeyError(f"Grouping columns not found: {missing}")
+    if time_col is not None and time_col not in df:
+        raise KeyError(f"Missing required column: {time_col}")
+    outputs = [flag_col, median_col, mad_col, threshold_col, status_col]
+    if corrected_col is not None:
+        outputs.append(corrected_col)
+    if len(outputs) != len(set(outputs)):
+        raise ValueError("Output column names must be unique")
+    if not overwrite:
+        existing = [c for c in outputs if c in df]
+        if existing:
+            raise ValueError(f"Output column(s) already exist in data: {', '.join(existing)}")
+    work = df.copy()
+    work["_row"] = np.arange(len(work))
+    work["_p"] = pd.to_numeric(work[pupil_col], errors="coerce")
+    work["_time"] = (
+        np.arange(len(work), dtype=float)
+        if time_col is None
+        else pd.to_numeric(work[time_col], errors="coerce")
+    )
+    if not np.isfinite(work["_time"].to_numpy(float)).all():
+        raise ValueError("time_col must contain finite numeric values")
+    med_all = np.full(len(df), np.nan)
+    mad_all = np.full(len(df), np.nan)
+    threshold_all = np.full(len(df), np.nan)
+    flags = np.zeros(len(df), dtype=bool)
+    statuses = np.full(len(df), "complete", dtype=object)
+    iterator = [(None, work)] if not groups else work.groupby(groups, dropna=False, sort=False)
+    n_groups = 0
+    half = window_size_samples // 2
+    for _, part in iterator:
+        n_groups += 1
+        part = part.sort_values(["_time", "_row"], kind="stable")
+        vals = part["_p"].to_numpy(float)
+        rows = part["_row"].to_numpy(int)
+        for j, row in enumerate(rows):
+            if not np.isfinite(vals[j]):
+                statuses[row] = "missing_or_nonfinite_pupil"
+                continue
+            lo = max(0, j - half)
+            hi = min(len(vals), j + half + 1)
+            valid = vals[lo:hi][np.isfinite(vals[lo:hi])]
+            if len(valid) < min_valid_samples:
+                statuses[row] = "insufficient_valid_window"
+                continue
+            med = float(np.median(valid))
+            mad = float(np.median(np.abs(valid - med)) * scale_mad)
+            threshold = float(k * mad)
+            med_all[row] = med
+            mad_all[row] = mad
+            threshold_all[row] = threshold
+            flags[row] = abs(vals[j] - med) > threshold
+            statuses[row] = "complete_zero_mad" if threshold == 0 else "complete"
+    df[median_col] = med_all
+    df[mad_col] = mad_all
+    df[threshold_col] = threshold_all
+    df[flag_col] = flags
+    df[status_col] = statuses
+    if corrected_col is not None:
+        corrected = pd.to_numeric(df[pupil_col], errors="coerce").to_numpy(dtype=float, copy=True)
+        mask = flags & np.isfinite(med_all)
+        corrected[mask] = med_all[mask]
+        df[corrected_col] = corrected
+    df.attrs["gp3_hampel_overview"] = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "filter": "hampel",
+                "pupil_col": pupil_col,
+                "time_col": time_col,
+                "grouping_cols": ", ".join(groups) if groups else None,
+                "n_input_rows": len(df),
+                "n_groups": n_groups,
+                "window_size_samples": window_size_samples,
+                "k": k,
+                "min_valid_samples": min_valid_samples,
+                "scale_mad": scale_mad,
+                "n_flagged": int(flags.sum()),
+                "flagged_proportion": float(flags.mean()),
+                "n_complete": int(np.isin(statuses, ["complete", "complete_zero_mad"]).sum()),
+                "n_problem_rows": int(
+                    (~np.isin(statuses, ["complete", "complete_zero_mad"])).sum()
+                ),
+            }
+        ]
+    )
+    df.attrs["gp3_hampel_status_summary"] = (
+        pd.Series(statuses).value_counts().sort_index().rename_axis("status").reset_index(name="n")
+    )
     return df
 
 
@@ -3060,32 +3288,107 @@ def impute_gazepoint_pupil_gp(
     output_col=None,
     max_points: int = 2000,
     random_state: int = 123,
+    *,
+    subject=None,
+    trial=None,
+    length_scale=None,
+    noise: float = 1e-4,
+    flag="pupil_was_gp_imputed",
 ) -> pd.DataFrame:
+    """Impute pupil values with legacy sklearn or grouped R-style GP smoothing."""
     df = ensure_dataframe(data)
     pupil_col = infer_column(df, "pupil", pupil_col, required=True)
     time_col = infer_column(df, "time", time_col, required=True)
-    output_col = output_col or f"{pupil_col}_gp"
-    t = finite_numeric(df[time_col]).to_numpy(float)
-    y = finite_numeric(df[pupil_col]).to_numpy(float)
-    ok = np.isfinite(t) & np.isfinite(y)
-    miss = np.isfinite(t) & ~np.isfinite(y)
-    if ok.sum() < 3:
-        df[output_col] = y
+    r_mode = (
+        subject is not None
+        or trial is not None
+        or length_scale is not None
+        or noise != 1e-4
+        or flag != "pupil_was_gp_imputed"
+    )
+    if not r_mode:
+        output_col = output_col or f"{pupil_col}_gp"
+        t = finite_numeric(df[time_col]).to_numpy(float)
+        y = finite_numeric(df[pupil_col]).to_numpy(float)
+        ok = np.isfinite(t) & np.isfinite(y)
+        miss = np.isfinite(t) & ~np.isfinite(y)
+        if ok.sum() < 3:
+            df[output_col] = y
+            return df
+        ids = np.flatnonzero(ok)
+        if len(ids) > max_points:
+            ids = np.linspace(0, len(ids) - 1, max_points).astype(int)
+            ids = np.flatnonzero(ok)[ids]
+        kernel = 1.0 * RBF(length_scale=max(np.nanstd(t[ok]) * 0.1, 1e-6)) + WhiteKernel(
+            noise_level=max(np.nanvar(y[ok]) * 0.01, 1e-6)
+        )
+        gp = GaussianProcessRegressor(
+            kernel=kernel, normalize_y=True, random_state=random_state, n_restarts_optimizer=0
+        )
+        gp.fit(t[ids, None], y[ids])
+        values = y.copy()
+        values[miss] = gp.predict(t[miss, None])
+        df[output_col] = values
         return df
-    ids = np.flatnonzero(ok)
-    if len(ids) > max_points:
-        ids = np.linspace(0, len(ids) - 1, max_points).astype(int)
-        ids = np.flatnonzero(ok)[ids]
-    kernel = 1.0 * RBF(length_scale=max(np.nanstd(t[ok]) * 0.1, 1e-6)) + WhiteKernel(
-        noise_level=max(np.nanvar(y[ok]) * 0.01, 1e-6)
+    for col in (subject, trial):
+        if col is not None and col not in df:
+            raise KeyError(f"Missing required column: {col}")
+    if max_points < 1:
+        raise ValueError("max_train must be positive")
+    if not (np.isfinite(noise) and noise >= 0):
+        raise ValueError("noise must be a finite non-negative number")
+    if length_scale is not None and (not np.isfinite(length_scale) or length_scale <= 0):
+        raise ValueError("length_scale must be a positive finite number")
+    output_col = output_col or "pupil_gp_imputed"
+    values = pd.to_numeric(df[pupil_col], errors="coerce").to_numpy(dtype=float, copy=True)
+    was_imputed = np.zeros(len(df), dtype=bool)
+    groups = [c for c in (subject, trial) if c is not None]
+    iterator = (
+        [(None, np.arange(len(df)))]
+        if not groups
+        else df.groupby(groups, dropna=False, sort=False).indices.items()
     )
-    gp = GaussianProcessRegressor(
-        kernel=kernel, normalize_y=True, random_state=random_state, n_restarts_optimizer=0
-    )
-    gp.fit(t[ids, None], y[ids])
-    out = y.copy()
-    out[miss] = gp.predict(t[miss, None])
-    df[output_col] = out
+    for _, positions in iterator:
+        positions = np.asarray(positions, dtype=int)
+        local_t = pd.to_numeric(df.iloc[positions][time_col], errors="coerce").to_numpy(float)
+        order = np.argsort(local_t, kind="stable")
+        positions = positions[order]
+        local_t = local_t[order]
+        local_y = pd.to_numeric(df.iloc[positions][pupil_col], errors="coerce").to_numpy(float)
+        obs = np.isfinite(local_t) & np.isfinite(local_y)
+        miss = np.isfinite(local_t) & ~np.isfinite(local_y)
+        if obs.sum() < 3 or not miss.any():
+            continue
+        train_t = local_t[obs]
+        train_y = local_y[obs]
+        if len(train_t) > max_points:
+            pick = np.unique(np.rint(np.linspace(0, len(train_t) - 1, max_points)).astype(int))
+            train_t = train_t[pick]
+            train_y = train_y[pick]
+        ell = length_scale
+        if ell is None:
+            diffs = np.diff(np.unique(np.sort(train_t)))
+            ell = float(np.median(diffs) * 10) if len(diffs) else np.nan
+            if not np.isfinite(ell) or ell <= 0:
+                ell = float(np.ptp(train_t) / 10)
+            if not np.isfinite(ell) or ell <= 0:
+                ell = 1.0
+        ell = float(ell)
+        if not np.isfinite(ell) or ell <= 0:
+            raise ValueError("length_scale must be a positive finite number")
+        k_tt = np.exp(-0.5 * ((train_t[:, None] - train_t[None, :]) / ell) ** 2)
+        k_tt.flat[:: len(train_t) + 1] += noise
+        mean_y = float(np.mean(train_y))
+        try:
+            alpha = np.linalg.solve(k_tt, train_y - mean_y)
+        except np.linalg.LinAlgError:
+            continue
+        k_mt = np.exp(-0.5 * ((local_t[miss, None] - train_t[None, :]) / ell) ** 2)
+        target = positions[miss]
+        values[target] = k_mt @ alpha + mean_y
+        was_imputed[target] = True
+    df[output_col] = values
+    df[flag] = was_imputed
     return df
 
 
