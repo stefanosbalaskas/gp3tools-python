@@ -30,43 +30,219 @@ def detect_gazepoint_fixations_velocity(
     velocity_threshold: float = 0.08,
     min_duration_ms: float = 100.0,
     group_cols=None,
-) -> pd.DataFrame:
-    """Detect fixations with a transparent velocity-threshold algorithm."""
+    *,
+    id_col=None,
+    time_unit=None,
+    x_scale: float = 1.0,
+    y_scale: float = 1.0,
+    return_mode=None,
+    keep_single_sample: bool = False,
+    **kwargs,
+):
+    """Detect I-VT fixations with legacy Python or R v2.3.0 semantics.
+
+    The R argument named ``return`` is accepted through ``**{"return": ...}``
+    because ``return`` is a reserved Python keyword. Unknown keyword arguments
+    are rejected explicitly.
+    """
+    r_return = kwargs.pop("return", None)
+    if kwargs:
+        unexpected = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unexpected}")
+    if r_return is not None:
+        if return_mode is not None:
+            raise TypeError("Specify only one of return_mode or the R-compatible 'return' argument")
+        return_mode = r_return
+
+    r_mode = (
+        any(value is not None for value in (id_col, time_unit, return_mode))
+        or x_scale != 1.0
+        or y_scale != 1.0
+        or keep_single_sample
+    )
+
+    if not r_mode:
+        df = ensure_dataframe(data)
+        x_col = x_col or infer_column(df, "x")
+        y_col = y_col or infer_column(df, "y")
+        time_col = time_col or infer_column(df, "time")
+        if not all([x_col, y_col, time_col]):
+            raise ValueError("x, y, and time columns are required")
+        groups = normalize_group_cols(df, group_cols)
+        if not groups:
+            groups = [c for c in [infer_column(df, "subject"), infer_column(df, "trial")] if c]
+        out = df.copy()
+        out["event_velocity"] = np.nan
+        out["fixation"] = False
+        out["fixation_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+        next_id = 1
+        iterator = out.groupby(groups, sort=False, dropna=False) if groups else [(None, out)]
+        for _, g in iterator:
+            idx = g.index
+            vel = _velocity(g, x_col, y_col, time_col)
+            cand = np.isfinite(vel) & (vel <= velocity_threshold)
+            run = np.cumsum(np.r_[True, cand[1:] != cand[:-1]])
+            keep = np.zeros(len(g), dtype=bool)
+            t = time_to_seconds(g[time_col]).to_numpy(float)
+            for rid in np.unique(run[cand]):
+                loc = np.where((run == rid) & cand)[0]
+                if not len(loc):
+                    continue
+                duration = (t[loc[-1]] - t[loc[0]]) * 1000 if len(loc) > 1 else 0.0
+                if duration >= min_duration_ms:
+                    keep[loc] = True
+                    out.loc[idx[loc], "fixation_id"] = next_id
+                    next_id += 1
+            out.loc[idx, "event_velocity"] = vel
+            out.loc[idx, "fixation"] = keep
+        return out
+
     df = ensure_dataframe(data)
-    x_col = x_col or infer_column(df, "x")
-    y_col = y_col or infer_column(df, "y")
-    time_col = time_col or infer_column(df, "time")
-    if not all([x_col, y_col, time_col]):
-        raise ValueError("x, y, and time columns are required")
-    groups = normalize_group_cols(df, group_cols)
-    if not groups:
-        groups = [c for c in [infer_column(df, "subject"), infer_column(df, "trial")] if c]
-    out = df.copy()
-    out["event_velocity"] = np.nan
-    out["fixation"] = False
-    out["fixation_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
-    next_id = 1
-    iterator = out.groupby(groups, sort=False, dropna=False) if groups else [(None, out)]
-    for _, g in iterator:
-        idx = g.index
-        vel = _velocity(g, x_col, y_col, time_col)
-        cand = np.isfinite(vel) & (vel <= velocity_threshold)
-        # run-length filter by measured duration
-        run = np.cumsum(np.r_[True, cand[1:] != cand[:-1]])
-        keep = np.zeros(len(g), dtype=bool)
-        t = time_to_seconds(g[time_col]).to_numpy(float)
-        for rid in np.unique(run[cand]):
-            loc = np.where((run == rid) & cand)[0]
-            if not len(loc):
+    id_col = "USER_ID" if id_col is None else id_col
+    x_col = "FPOGX" if x_col is None else x_col
+    y_col = "FPOGY" if y_col is None else y_col
+    time_col = "TIME" if time_col is None else time_col
+    velocity_threshold = 10.0 if velocity_threshold == 0.08 else float(velocity_threshold)
+    min_duration_ms = 50.0 if min_duration_ms == 100.0 else float(min_duration_ms)
+    time_unit = "auto" if time_unit is None else str(time_unit)
+    return_mode = "events" if return_mode is None else str(return_mode)
+
+    if time_unit not in {"auto", "seconds", "milliseconds"}:
+        raise ValueError("time_unit must be 'auto', 'seconds', or 'milliseconds'")
+    if return_mode not in {"events", "samples", "both"}:
+        raise ValueError("return must be 'events', 'samples', or 'both'")
+    if not np.isfinite(velocity_threshold) or velocity_threshold <= 0:
+        raise ValueError("vmax must be one finite positive number")
+    if not np.isfinite(min_duration_ms) or min_duration_ms < 0:
+        raise ValueError("min_duration must be one finite non-negative number")
+    if not np.isfinite(x_scale) or x_scale <= 0 or not np.isfinite(y_scale) or y_scale <= 0:
+        raise ValueError("x_scale and y_scale must be finite positive numbers")
+    if not isinstance(keep_single_sample, (bool, np.bool_)):
+        raise ValueError("keep_single_sample must be TRUE or FALSE")
+
+    extra_groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    groups = list(dict.fromkeys([id_col, *extra_groups]))
+    required = list(dict.fromkeys([*groups, x_col, y_col, time_col]))
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError("all_gaze is missing required column(s): " + ", ".join(missing))
+
+    def seconds(values):
+        raw = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+        if time_unit == "seconds":
+            return raw
+        if time_unit == "milliseconds":
+            return raw * 0.001
+        finite = raw[np.isfinite(raw)]
+        delta = np.diff(np.unique(np.sort(finite))) if finite.size else np.array([])
+        delta = delta[np.isfinite(delta) & (delta > 0)]
+        typical = float(np.median(delta)) if delta.size else np.nan
+        return raw * 0.001 if np.isfinite(typical) and typical >= 1 else raw
+
+    labelled = df.copy()
+    gaze_velocity = np.full(len(df), np.nan)
+    fixation_flag_all = np.zeros(len(df), dtype=bool)
+    fixation_id_all = np.full(len(df), np.nan)
+    event_rows = []
+
+    grouped = df.groupby(groups, sort=False, dropna=False).indices
+    for _, positions in grouped.items():
+        positions = np.asarray(positions, dtype=int)
+        raw_time = pd.to_numeric(df.iloc[positions][time_col], errors="coerce").to_numpy(
+            dtype=float
+        )
+        order = np.argsort(np.where(np.isfinite(raw_time), raw_time, np.inf), kind="stable")
+        pos = positions[order]
+        time_sec = seconds(df.iloc[pos][time_col])
+        x = pd.to_numeric(df.iloc[pos][x_col], errors="coerce").to_numpy(dtype=float)
+        y = pd.to_numeric(df.iloc[pos][y_col], errors="coerce").to_numpy(dtype=float)
+        dt = np.r_[np.nan, np.diff(time_sec)]
+        dx = np.r_[np.nan, np.diff(x) * float(x_scale)]
+        dy = np.r_[np.nan, np.diff(y) * float(y_scale)]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            velocity = np.sqrt(dx**2 + dy**2) / dt
+        velocity[~np.isfinite(velocity) | ~np.isfinite(dt) | (dt <= 0)] = np.nan
+        if len(velocity) >= 2 and np.isnan(velocity[0]):
+            velocity[0] = velocity[1]
+        valid = np.isfinite(time_sec) & np.isfinite(x) & np.isfinite(y)
+        candidate = valid & np.isfinite(velocity) & (velocity <= velocity_threshold)
+        gaze_velocity[pos] = velocity
+
+        if candidate.any():
+            starts = np.flatnonzero(candidate & np.r_[True, ~candidate[:-1]])
+            ends = np.flatnonzero(candidate & np.r_[~candidate[1:], True])
+        else:
+            starts = ends = np.array([], dtype=int)
+        positive_dt = dt[np.isfinite(dt) & (dt > 0)]
+        sample_interval = float(np.median(positive_dt)) if positive_dt.size else 0.0
+        local_id = 0
+        for start, end in zip(starts, ends, strict=True):
+            run = np.arange(start, end + 1)
+            duration_sec = max(0.0, float(time_sec[end] - time_sec[start]))
+            coverage = (
+                duration_sec + sample_interval
+                if len(run) > 1 or keep_single_sample
+                else duration_sec
+            )
+            duration_ms = coverage * 1000.0
+            if duration_ms + np.sqrt(np.finfo(float).eps) < min_duration_ms:
                 continue
-            duration = (t[loc[-1]] - t[loc[0]]) * 1000 if len(loc) > 1 else 0.0
-            if duration >= min_duration_ms:
-                keep[loc] = True
-                out.loc[idx[loc], "fixation_id"] = next_id
-                next_id += 1
-        out.loc[idx, "event_velocity"] = vel
-        out.loc[idx, "fixation"] = keep
-    return out
+            local_id += 1
+            run_pos = pos[run]
+            fixation_flag_all[run_pos] = True
+            fixation_id_all[run_pos] = local_id
+            row = {column: df.iloc[run_pos[0]][column] for column in groups}
+            vv = velocity[run]
+            finite_v = vv[np.isfinite(vv)]
+            row.update(
+                {
+                    "fixation_id": local_id,
+                    "start_time": df.iloc[run_pos[0]][time_col],
+                    "end_time": df.iloc[run_pos[-1]][time_col],
+                    "duration": duration_ms,
+                    "duration_ms": duration_ms,
+                    "n_samples": len(run),
+                    "mean_x": float(np.nanmean(x[run])),
+                    "mean_y": float(np.nanmean(y[run])),
+                    "median_velocity": float(np.median(finite_v)) if finite_v.size else np.nan,
+                    "max_velocity": float(np.max(finite_v)) if finite_v.size else np.nan,
+                    "velocity_threshold": float(velocity_threshold),
+                    "algorithm": "I-VT",
+                }
+            )
+            event_rows.append(row)
+
+    labelled["gaze_velocity"] = gaze_velocity
+    labelled["velocity_fixation"] = fixation_flag_all
+    labelled["velocity_fixation_id"] = pd.array(fixation_id_all, dtype="Int64")
+    labelled.attrs["_gp3_class"] = "gp3_velocity_fixation_samples"
+
+    columns = [
+        *groups,
+        "fixation_id",
+        "start_time",
+        "end_time",
+        "duration",
+        "duration_ms",
+        "n_samples",
+        "mean_x",
+        "mean_y",
+        "median_velocity",
+        "max_velocity",
+        "velocity_threshold",
+        "algorithm",
+    ]
+    events = pd.DataFrame(event_rows, columns=columns)
+    events.attrs["_gp3_class"] = "gp3_velocity_fixations"
+    if return_mode == "events":
+        return events
+    if return_mode == "samples":
+        return labelled
+    return {"events": events, "samples": labelled, "_gp3_class": "gp3_velocity_fixation_result"}
 
 
 def detect_gazepoint_fixations_ivt(data, **kwargs) -> pd.DataFrame:
@@ -329,27 +505,418 @@ def summarise_fixations(
 
 
 def summarise_gazepoint_fixation_trials(
-    data, trial_col=None, subject_col=None, duration_col="duration_ms"
+    data,
+    trial_col=None,
+    subject_col=None,
+    duration_col=None,
+    *,
+    group_cols=None,
+    fixation_id_col=None,
+    start_col=None,
+    x_col=None,
+    y_col=None,
+    valid_col=None,
+    aoi_col=None,
+    start_time_unit="auto",
+    duration_unit="auto",
+    valid_only=True,
+    include_non_aoi=True,
+    target_aoi_values=None,
+    distractor_aoi_values=None,
+    non_aoi_values=(
+        "non_aoi",
+        "none",
+        "background",
+        "outside",
+        "outside_aoi",
+        "missing",
+        "missing_aoi",
+    ),
+    missing_aoi_label="missing_aoi",
 ) -> pd.DataFrame:
+    """Summarise fixation-level data with legacy or R v2.3.0 trial features."""
     df = ensure_dataframe(data)
-    trial_col = trial_col or infer_column(df, "trial")
-    subject_col = subject_col or infer_column(df, "subject")
-    keys = [c for c in [subject_col, trial_col] if c]
-    if not keys:
-        keys = []
-    agg = {
-        "n_fixations": (duration_col, "size"),
-        "mean_fixation_duration_ms": (duration_col, "mean"),
-        "total_fixation_duration_ms": (duration_col, "sum"),
-    }
-    if keys:
-        return df.groupby(keys, dropna=False).agg(**agg).reset_index()
-    return pd.DataFrame(
-        {
-            k: [getattr(df[duration_col], fn)() if fn != "size" else len(df)]
-            for k, (_, fn) in agg.items()
-        }
+    r_mode = (
+        any(
+            value is not None
+            for value in (
+                group_cols,
+                fixation_id_col,
+                start_col,
+                x_col,
+                y_col,
+                valid_col,
+                aoi_col,
+                target_aoi_values,
+                distractor_aoi_values,
+            )
+        )
+        or start_time_unit != "auto"
+        or duration_unit != "auto"
+        or valid_only is not True
+        or include_non_aoi is not True
     )
+
+    if not r_mode and (trial_col is not None or subject_col is not None):
+        duration_col = duration_col or "duration_ms"
+        trial_col = trial_col or infer_column(df, "trial")
+        subject_col = subject_col or infer_column(df, "subject")
+        keys = [c for c in [subject_col, trial_col] if c]
+        if duration_col not in df.columns:
+            raise KeyError(f"Missing required column: {duration_col}")
+        agg = {
+            "n_fixations": (duration_col, "size"),
+            "mean_fixation_duration_ms": (duration_col, "mean"),
+            "total_fixation_duration_ms": (duration_col, "sum"),
+        }
+        if keys:
+            return df.groupby(keys, dropna=False).agg(**agg).reset_index()
+        return pd.DataFrame(
+            {
+                k: [getattr(df[duration_col], fn)() if fn != "size" else len(df)]
+                for k, (_, fn) in agg.items()
+            }
+        )
+
+    if start_time_unit not in {"auto", "ms", "s"}:
+        raise ValueError("start_time_unit must be 'auto', 'ms', or 's'")
+    if duration_unit not in {"auto", "ms", "s"}:
+        raise ValueError("duration_unit must be 'auto', 'ms', or 's'")
+    if not isinstance(valid_only, (bool, np.bool_)) or not isinstance(
+        include_non_aoi, (bool, np.bool_)
+    ):
+        raise ValueError("valid_only and include_non_aoi must be TRUE or FALSE")
+
+    def first_existing(candidates, informative=False):
+        hits = [column for column in candidates if column in df.columns]
+        if not informative:
+            return hits[0] if hits else None
+        for column in hits:
+            values = df[column].astype("string").str.strip().dropna()
+            values = values.loc[values.ne("")]
+            if values.nunique() > 0:
+                return column
+        return hits[0] if hits else None
+
+    if group_cols is None:
+        detected = [
+            first_existing(
+                [
+                    "subject",
+                    "USER_ID",
+                    "USER_FILE",
+                    "USER",
+                    "user",
+                    "participant",
+                    "participant_id",
+                ],
+                True,
+            ),
+            first_existing(["MEDIA_ID", "media_id", "MEDIA_NAME", "media_name", "stimulus"], True),
+            first_existing(["trial_global", "trial", "trial_id", "TRIAL"], True),
+        ]
+        groups = list(dict.fromkeys([value for value in detected if value is not None]))
+        if not groups:
+            if trial_col is not None or subject_col is not None:
+                groups = [value for value in (subject_col, trial_col) if value is not None]
+            else:
+                raise ValueError(
+                    "Could not automatically detect grouping columns. Please provide group_cols"
+                )
+    else:
+        groups = [group_cols] if isinstance(group_cols, str) else list(group_cols)
+        if len(groups) != len(set(groups)) or not groups:
+            raise ValueError("group_cols must be NULL or a vector of unique column names")
+    missing = [column for column in groups if column not in df.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+
+    fixation_id_col = fixation_id_col or first_existing(
+        ["FPOGID", "fixation_id", "fixationID", "fix_id", "id"]
+    )
+    start_col = start_col or first_existing(
+        [
+            "FPOGS",
+            "fixation_start_time",
+            "fixation_start_ms",
+            "start_time",
+            "start_time_ms",
+            "time",
+            "TIME",
+            "TIMETICK",
+        ]
+    )
+    duration_col = duration_col or first_existing(
+        [
+            "FPOGD",
+            "fixation_duration_ms",
+            "fixation_duration",
+            "duration_ms",
+            "duration",
+            "FPOGD_MS",
+        ]
+    )
+    x_col = x_col or first_existing(["FPOGX", "fixation_x", "x", "X", "gaze_x"])
+    y_col = y_col or first_existing(["FPOGY", "fixation_y", "y", "Y", "gaze_y"])
+    valid_col = valid_col or first_existing(["FPOGV", "fixation_valid", "valid", "VALID"])
+    aoi_col = aoi_col or first_existing(["AOI", "aoi_current", "aoi_state", "aoi"])
+    if start_col is None or duration_col is None:
+        missing_names = [
+            name
+            for name, value in (("start_col", start_col), ("duration_col", duration_col))
+            if value is None
+        ]
+        raise ValueError(
+            "Could not automatically detect required fixation columns: " + ", ".join(missing_names)
+        )
+    for column in [start_col, duration_col, fixation_id_col, x_col, y_col, valid_col, aoi_col]:
+        if column is not None and column not in df.columns:
+            raise ValueError(f"Missing required column: {column}")
+
+    def to_ms(series, column, unit, role):
+        values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+        if unit == "s":
+            return values * 1000.0
+        if unit == "ms":
+            return values
+        name = str(column).lower()
+        seconds = name in {"fpogs", "fpogd"}
+        finite = values[np.isfinite(values)]
+        if not seconds and (name == "time" or role == "duration") and finite.size:
+            seconds = float(np.max(finite)) <= 60.0
+        return values * 1000.0 if seconds else values
+
+    work = df.copy()
+    work[".gp3_start_time_ms"] = to_ms(work[start_col], start_col, start_time_unit, "start")
+    work[".gp3_duration_ms"] = to_ms(work[duration_col], duration_col, duration_unit, "duration")
+    work[".gp3_x"] = pd.to_numeric(work[x_col], errors="coerce") if x_col else np.nan
+    work[".gp3_y"] = pd.to_numeric(work[y_col], errors="coerce") if y_col else np.nan
+
+    if valid_col is None:
+        work[".gp3_valid"] = True
+    else:
+        raw_valid = work[valid_col]
+        numeric = pd.to_numeric(raw_valid, errors="coerce")
+        text = raw_valid.astype("string").str.strip().str.lower()
+        valid = pd.Series(False, index=work.index)
+        valid.loc[numeric.notna()] = numeric.loc[numeric.notna()].ne(0)
+        valid.loc[text.isin(["true", "valid", "yes", "y"])] = True
+        work[".gp3_valid"] = valid
+
+    aoi_available = aoi_col is not None
+    if aoi_available:
+        state = work[aoi_col].astype("string").str.strip()
+        state = state.mask(state.isna() | state.eq(""), missing_aoi_label)
+        work[".gp3_aoi_state"] = state.astype(object)
+    else:
+        work[".gp3_aoi_state"] = None
+    background = {str(value).strip().lower() for value in non_aoi_values}
+    work[".gp3_is_non_aoi"] = (
+        work[".gp3_aoi_state"].astype("string").str.strip().str.lower().isin(background)
+        if aoi_available
+        else False
+    )
+    targets = (
+        set()
+        if target_aoi_values is None
+        else {str(value).strip().lower() for value in target_aoi_values}
+    )
+    distractors = (
+        set()
+        if distractor_aoi_values is None
+        else {str(value).strip().lower() for value in distractor_aoi_values}
+    )
+    target_defined = bool(targets)
+    distractor_defined = bool(distractors)
+    state_norm = work[".gp3_aoi_state"].astype("string").str.strip().str.lower()
+    state_class = np.full(
+        len(work), "no_aoi_column" if not aoi_available else "other_aoi", dtype=object
+    )
+    if aoi_available:
+        state_class[work[".gp3_is_non_aoi"].to_numpy(bool)] = "background"
+        if targets:
+            state_class[state_norm.isin(targets).to_numpy()] = "target"
+        if distractors:
+            state_class[state_norm.isin(distractors).to_numpy()] = "distractor"
+    work[".gp3_state_class"] = state_class
+    work[".gp3_fixation_id"] = (
+        work[fixation_id_col].astype("string")
+        if fixation_id_col
+        else pd.Series(np.arange(1, len(work) + 1), index=work.index).astype("string")
+    )
+    work = work.loc[np.isfinite(work[".gp3_start_time_ms"])].copy()
+    if valid_only:
+        work = work.loc[work[".gp3_valid"]].copy()
+    if not include_non_aoi and aoi_available:
+        work = work.loc[~work[".gp3_is_non_aoi"]].copy()
+    if work.empty:
+        raise ValueError("No fixation rows remain after filtering")
+
+    work = work.sort_values([*groups, ".gp3_start_time_ms"], kind="stable")
+    fix_rows = []
+    for key, block in work.groupby([*groups, ".gp3_fixation_id"], dropna=False, sort=False):
+        values = key if isinstance(key, tuple) else (key,)
+        row = dict(zip([*groups, ".gp3_fixation_id"], values, strict=True))
+        first = block.iloc[0]
+        start = float(first[".gp3_start_time_ms"])
+        duration = (
+            float(first[".gp3_duration_ms"]) if np.isfinite(first[".gp3_duration_ms"]) else np.nan
+        )
+        row.update(
+            {
+                "fixation_start_time_ms": start,
+                "fixation_duration_ms": duration,
+                "fixation_end_time_ms": start + duration if np.isfinite(duration) else np.nan,
+                "fixation_x": first[".gp3_x"],
+                "fixation_y": first[".gp3_y"],
+                "fixation_valid": bool(first[".gp3_valid"]),
+                "fixation_aoi": first[".gp3_aoi_state"],
+                "is_non_aoi": bool(first[".gp3_is_non_aoi"]),
+                "state_class": first[".gp3_state_class"],
+                "n_rows_per_fixation": len(block),
+            }
+        )
+        fix_rows.append(row)
+    fix = pd.DataFrame(fix_rows)
+    if fix.empty:
+        raise ValueError("No fixation rows remain after fixation-level reduction")
+
+    def ratio(a, b):
+        return np.nan if not np.isfinite(b) or b <= 0 else float(a) / float(b)
+
+    rows = []
+    for key, block in fix.groupby(groups, dropna=False, sort=False):
+        values = key if isinstance(key, tuple) else (key,)
+        row = dict(zip(groups, values, strict=True))
+        duration = pd.to_numeric(block["fixation_duration_ms"], errors="coerce")
+        start = pd.to_numeric(block["fixation_start_time_ms"], errors="coerce")
+        end = pd.to_numeric(block["fixation_end_time_ms"], errors="coerce")
+        x = pd.to_numeric(block["fixation_x"], errors="coerce")
+        y = pd.to_numeric(block["fixation_y"], errors="coerce")
+        aoi_mask = (
+            ~block["is_non_aoi"].astype(bool)
+            if aoi_available
+            else pd.Series(False, index=block.index)
+        )
+        target_mask = block["state_class"].eq("target")
+        distractor_mask = block["state_class"].eq("distractor")
+        other_mask = block["state_class"].eq("other_aoi")
+        trial_start = float(start.min())
+        trial_end = float(end.max())
+        n_aoi = int(aoi_mask.sum())
+        n_fix = len(block)
+        target_n = int(target_mask.sum())
+        distractor_n = int(distractor_mask.sum())
+        target_duration = float(duration.loc[target_mask].sum(skipna=True))
+        distractor_duration = float(duration.loc[distractor_mask].sum(skipna=True))
+        other_duration = float(duration.loc[other_mask].sum(skipna=True))
+        aoi_states = (
+            block.loc[aoi_mask]
+            .sort_values("fixation_start_time_ms", kind="stable")["fixation_aoi"]
+            .astype(str)
+        )
+        row.update(
+            {
+                "trial_start_time_ms": trial_start,
+                "trial_end_time_ms": trial_end,
+                "n_fixations": n_fix,
+                "n_valid_fixations": int(block["fixation_valid"].astype(bool).sum()),
+                "n_rows_represented": int(block["n_rows_per_fixation"].sum()),
+                "total_fixation_duration_ms": float(duration.sum(skipna=True)),
+                "mean_fixation_duration_ms": float(duration.mean())
+                if duration.notna().any()
+                else np.nan,
+                "median_fixation_duration_ms": float(duration.median())
+                if duration.notna().any()
+                else np.nan,
+                "min_fixation_duration_ms": float(duration.min())
+                if duration.notna().any()
+                else np.nan,
+                "max_fixation_duration_ms": float(duration.max())
+                if duration.notna().any()
+                else np.nan,
+                "mean_fixation_x": float(x.mean()) if x.notna().any() else np.nan,
+                "mean_fixation_y": float(y.mean()) if y.notna().any() else np.nan,
+                "sd_fixation_x": float(x.std(ddof=1)) if x.notna().sum() >= 2 else np.nan,
+                "sd_fixation_y": float(y.std(ddof=1)) if y.notna().sum() >= 2 else np.nan,
+                "min_fixation_x": float(x.min()) if x.notna().any() else np.nan,
+                "max_fixation_x": float(x.max()) if x.notna().any() else np.nan,
+                "min_fixation_y": float(y.min()) if y.notna().any() else np.nan,
+                "max_fixation_y": float(y.max()) if y.notna().any() else np.nan,
+                "n_aoi_fixations": n_aoi,
+                "n_non_aoi_fixations": int(block["is_non_aoi"].astype(bool).sum())
+                if aoi_available
+                else 0,
+                "n_unique_aoi_fixated": int(
+                    block.loc[aoi_mask, "fixation_aoi"].astype(str).nunique()
+                )
+                if aoi_available
+                else 0,
+                "first_aoi_fixated": aoi_states.iloc[0] if len(aoi_states) else pd.NA,
+                "last_aoi_fixated": aoi_states.iloc[-1] if len(aoi_states) else pd.NA,
+                "first_aoi_fixation_time_ms": float(start.loc[aoi_mask].min())
+                if aoi_mask.any()
+                else np.nan,
+                "target_fixation_count": target_n,
+                "target_revisits": max(target_n - 1, 0),
+                "target_fixation_duration_ms": target_duration,
+                "target_ttff_ms": float(start.loc[target_mask].min())
+                if target_mask.any()
+                else np.nan,
+                "mean_target_fixation_duration_ms": float(duration.loc[target_mask].mean())
+                if target_mask.any()
+                else np.nan,
+                "distractor_fixation_count": distractor_n,
+                "distractor_revisits": max(distractor_n - 1, 0),
+                "distractor_fixation_duration_ms": distractor_duration,
+                "distractor_ttff_ms": float(start.loc[distractor_mask].min())
+                if distractor_mask.any()
+                else np.nan,
+                "mean_distractor_fixation_duration_ms": float(duration.loc[distractor_mask].mean())
+                if distractor_mask.any()
+                else np.nan,
+                "other_aoi_fixation_count": int(other_mask.sum()),
+                "other_aoi_fixation_duration_ms": other_duration,
+            }
+        )
+        trial_duration = trial_end - trial_start
+        row.update(
+            {
+                "trial_duration_ms": trial_duration,
+                "fixation_rate_per_sec": ratio(n_fix, trial_duration / 1000.0),
+                "fixation_duration_prop": ratio(row["total_fixation_duration_ms"], trial_duration),
+                "aoi_fixation_prop": ratio(n_aoi, n_fix),
+                "non_aoi_fixation_prop": ratio(row["n_non_aoi_fixations"], n_fix),
+                "target_fixation_prop_of_aoi": ratio(target_n, n_aoi),
+                "distractor_fixation_prop_of_aoi": ratio(distractor_n, n_aoi),
+                "target_duration_prop_of_aoi": ratio(
+                    target_duration, target_duration + distractor_duration + other_duration
+                ),
+                "distractor_duration_prop_of_aoi": ratio(
+                    distractor_duration, target_duration + distractor_duration + other_duration
+                ),
+                "aoi_available": aoi_available,
+                "target_aoi_defined": target_defined,
+                "distractor_aoi_defined": distractor_defined,
+            }
+        )
+        if not aoi_available:
+            status = "no_aoi_column"
+        elif n_aoi == 0:
+            status = "no_aoi_fixations"
+        elif not target_defined and not distractor_defined:
+            status = "no_target_or_distractor_defined"
+        elif target_defined and target_n == 0:
+            status = "target_not_observed"
+        elif distractor_defined and distractor_n == 0:
+            status = "distractor_not_observed"
+        else:
+            status = "ok"
+        row["fixation_trial_feature_status"] = status
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    out.attrs["_gp3_class"] = "gp3_fixation_trial_features"
+    return out
 
 
 def audit_gazepoint_fixation_reliability(

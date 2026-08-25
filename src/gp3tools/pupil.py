@@ -486,27 +486,269 @@ def detect_gazepoint_blinks(
     min_duration_ms: float = 50.0,
     max_duration_ms: float = 800.0,
     output_col="blink",
-) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    time_col = infer_column(df, "time", time_col)
-    missing = finite_numeric(df[pupil_col]).isna().to_numpy()
-    labels, n = ndimage.label(missing.astype(int))
-    blink = np.zeros(len(df), dtype=bool)
-    t = time_to_seconds(df[time_col]).to_numpy(float) if time_col else np.arange(len(df)) / 60.0
-    for lab in range(1, n + 1):
-        idx = np.flatnonzero(labels == lab)
-        if not idx.size:
-            continue
-        duration_ms = (
-            (t[idx[-1]] - t[idx[0]] + np.nanmedian(np.diff(t[np.isfinite(t)]))) * 1000
-            if idx.size > 1
-            else 1000 / 60
+    *,
+    id_col=None,
+    group_cols=None,
+    z_thresh=None,
+    zero_threshold=None,
+    merge_gap_ms=None,
+    time_unit=None,
+    include_rapid_changes=None,
+    return_mode=None,
+    **kwargs,
+):
+    """Detect blink periods with legacy or R v2.3.0 event-table semantics."""
+    r_return = kwargs.pop("return", None)
+    if kwargs:
+        unexpected = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unexpected}")
+    if r_return is not None:
+        if return_mode is not None:
+            raise TypeError("Specify only one of return_mode or the R-compatible 'return' argument")
+        return_mode = r_return
+
+    r_mode = any(
+        value is not None
+        for value in (
+            id_col,
+            group_cols,
+            z_thresh,
+            zero_threshold,
+            merge_gap_ms,
+            time_unit,
+            include_rapid_changes,
+            return_mode,
         )
-        if min_duration_ms <= duration_ms <= max_duration_ms:
-            blink[idx] = True
-    df[output_col] = blink
-    return df
+    )
+    if not r_mode:
+        df = ensure_dataframe(data)
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        time_col = infer_column(df, "time", time_col)
+        missing = finite_numeric(df[pupil_col]).isna().to_numpy()
+        labels, n = ndimage.label(missing.astype(int))
+        blink = np.zeros(len(df), dtype=bool)
+        t = time_to_seconds(df[time_col]).to_numpy(float) if time_col else np.arange(len(df)) / 60.0
+        for lab in range(1, n + 1):
+            idx = np.flatnonzero(labels == lab)
+            if not idx.size:
+                continue
+            duration_ms = (
+                (t[idx[-1]] - t[idx[0]] + np.nanmedian(np.diff(t[np.isfinite(t)]))) * 1000
+                if idx.size > 1
+                else 1000 / 60
+            )
+            if min_duration_ms <= duration_ms <= max_duration_ms:
+                blink[idx] = True
+        df[output_col] = blink
+        return df
+
+    df = ensure_dataframe(data)
+    id_col = "USER_ID" if id_col is None else id_col
+    time_col = "TIME" if time_col is None else time_col
+    z_thresh = 4.0 if z_thresh is None else float(z_thresh)
+    zero_threshold = 0.0 if zero_threshold is None else float(zero_threshold)
+    merge_gap_ms = 20.0 if merge_gap_ms is None else float(merge_gap_ms)
+    time_unit = "auto" if time_unit is None else str(time_unit)
+    include_rapid_changes = True if include_rapid_changes is None else include_rapid_changes
+    return_mode = "events" if return_mode is None else str(return_mode)
+    if time_unit not in {"auto", "seconds", "milliseconds"}:
+        raise ValueError("time_unit must be 'auto', 'seconds', or 'milliseconds'")
+    if return_mode not in {"events", "samples", "both"}:
+        raise ValueError("return must be 'events', 'samples', or 'both'")
+    for value, name in (
+        (min_duration_ms, "min_duration"),
+        (z_thresh, "z_thresh"),
+        (merge_gap_ms, "merge_gap_ms"),
+    ):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be one finite non-negative number")
+    if not np.isfinite(zero_threshold):
+        raise ValueError("zero_threshold must be finite")
+    if not isinstance(include_rapid_changes, (bool, np.bool_)):
+        raise ValueError("include_rapid_changes must be TRUE or FALSE")
+
+    if pupil_col is None:
+        candidates = [
+            "mean_pupil",
+            "pupil_regressed",
+            "pupil_smoothed",
+            "pupil_interpolated",
+            "pupil_clean",
+            "pupil",
+            "LPupil",
+            "RPupil",
+            "LPD",
+            "RPD",
+            "LPMM",
+            "RPMM",
+        ]
+        pupil_cols = [column for column in candidates if column in df.columns]
+        if not pupil_cols:
+            raise ValueError("No pupil column was supplied or detected")
+    elif isinstance(pupil_col, str):
+        pupil_cols = [pupil_col]
+    else:
+        pupil_cols = list(dict.fromkeys(pupil_col))
+    extra_groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    groups = list(dict.fromkeys([id_col, *extra_groups]))
+    required = list(dict.fromkeys([*groups, *pupil_cols, time_col]))
+    missing_cols = [column for column in required if column not in df.columns]
+    if missing_cols:
+        raise ValueError("all_gaze is missing required column(s): " + ", ".join(missing_cols))
+
+    def seconds(values):
+        raw = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+        if time_unit == "seconds":
+            return raw
+        if time_unit == "milliseconds":
+            return raw * 0.001
+        finite = raw[np.isfinite(raw)]
+        delta = np.diff(np.unique(np.sort(finite))) if finite.size else np.array([])
+        delta = delta[np.isfinite(delta) & (delta > 0)]
+        typical = float(np.median(delta)) if delta.size else np.nan
+        return raw * 0.001 if np.isfinite(typical) and typical >= 1 else raw
+
+    labelled = df.copy()
+    blink_detected = np.zeros(len(df), dtype=bool)
+    blink_id = np.full(len(df), np.nan)
+    blink_reason = np.full(len(df), None, dtype=object)
+    events_rows = []
+
+    grouped = df.groupby(groups, sort=False, dropna=False).indices
+    for _, positions in grouped.items():
+        positions = np.asarray(positions, dtype=int)
+        raw_time = pd.to_numeric(df.iloc[positions][time_col], errors="coerce").to_numpy(
+            dtype=float
+        )
+        order = np.argsort(np.where(np.isfinite(raw_time), raw_time, np.inf), kind="stable")
+        pos = positions[order]
+        time_sec = seconds(df.iloc[pos][time_col])
+        pupil_matrix = np.column_stack(
+            [
+                pd.to_numeric(df.iloc[pos][column], errors="coerce").to_numpy(dtype=float)
+                for column in pupil_cols
+            ]
+        )
+        available = np.isfinite(pupil_matrix).sum(axis=1)
+        totals = np.nansum(pupil_matrix, axis=1)
+        pupil = np.divide(
+            totals,
+            available,
+            out=np.full(len(available), np.nan, dtype=float),
+            where=available > 0,
+        )
+        missing_flag = ~np.isfinite(pupil)
+        zero_flag = np.isfinite(pupil) & (pupil <= zero_threshold)
+        finite_pupil = pupil[np.isfinite(pupil) & (pupil > zero_threshold)]
+        pupil_med = float(np.median(finite_pupil)) if finite_pupil.size else np.nan
+        if finite_pupil.size >= 3:
+            mad_raw = float(np.median(np.abs(finite_pupil - np.median(finite_pupil))))
+            pupil_mad = 1.4826 * mad_raw
+        else:
+            pupil_mad = np.nan
+        low_flag = np.zeros(len(pupil), dtype=bool)
+        if np.isfinite(pupil_mad) and pupil_mad > 0:
+            low_flag = np.isfinite(pupil) & (pupil < pupil_med - z_thresh * pupil_mad)
+        drop_flag = np.zeros(len(pupil), dtype=bool)
+        recovery_flag = np.zeros(len(pupil), dtype=bool)
+        if include_rapid_changes and len(pupil) >= 3:
+            delta = np.r_[np.nan, np.diff(pupil)]
+            finite_delta = delta[np.isfinite(delta)]
+            if finite_delta.size >= 3:
+                center = float(np.median(finite_delta))
+                delta_mad = 1.4826 * float(np.median(np.abs(finite_delta - center)))
+            else:
+                delta_mad = np.nan
+            if np.isfinite(delta_mad) and delta_mad > 0:
+                raw_drop = np.isfinite(delta) & (delta < -z_thresh * delta_mad)
+                raw_recovery = np.isfinite(delta) & (delta > z_thresh * delta_mad)
+                drop_flag = raw_drop | np.r_[raw_drop[1:], False]
+                recovery_flag = raw_recovery | np.r_[False, raw_recovery[:-1]]
+        candidate = missing_flag | zero_flag | low_flag | drop_flag | recovery_flag
+        if candidate.any():
+            starts = np.flatnonzero(candidate & np.r_[True, ~candidate[:-1]])
+            ends = np.flatnonzero(candidate & np.r_[~candidate[1:], True])
+            runs = [[int(a), int(b)] for a, b in zip(starts, ends, strict=True)]
+        else:
+            runs = []
+        if merge_gap_ms > 0 and len(runs) > 1:
+            merged = [runs[0]]
+            for start, end in runs[1:]:
+                prev = merged[-1]
+                gap = time_sec[start] - time_sec[prev[1]]
+                if np.isfinite(gap) and gap <= merge_gap_ms / 1000.0:
+                    prev[1] = end
+                else:
+                    merged.append([start, end])
+            runs = merged
+        positive_dt = np.diff(time_sec)
+        positive_dt = positive_dt[np.isfinite(positive_dt) & (positive_dt > 0)]
+        sample_interval = float(np.median(positive_dt)) if positive_dt.size else 0.0
+        local_id = 0
+        for start, end in runs:
+            run = np.arange(start, end + 1)
+            duration_ms = (
+                max(0.0, float(time_sec[end] - time_sec[start] + sample_interval)) * 1000.0
+            )
+            if duration_ms + np.sqrt(np.finfo(float).eps) < min_duration_ms:
+                continue
+            reasons = []
+            for flag, reason in (
+                (missing_flag, "missing"),
+                (zero_flag, "zero"),
+                (low_flag, "low_outlier"),
+                (drop_flag, "rapid_drop"),
+                (recovery_flag, "rapid_recovery"),
+            ):
+                if flag[run].any():
+                    reasons.append(reason)
+            reason = ";".join(dict.fromkeys(reasons))
+            local_id += 1
+            run_pos = pos[run]
+            blink_detected[run_pos] = True
+            blink_id[run_pos] = local_id
+            blink_reason[run_pos] = reason
+            row = {column: df.iloc[run_pos[0]][column] for column in groups}
+            row.update(
+                {
+                    "blink_id": local_id,
+                    "start_time": df.iloc[run_pos[0]][time_col],
+                    "end_time": df.iloc[run_pos[-1]][time_col],
+                    "duration": duration_ms,
+                    "duration_ms": duration_ms,
+                    "n_samples": len(run),
+                    "reason": reason,
+                    "pupil_columns": ";".join(pupil_cols),
+                }
+            )
+            events_rows.append(row)
+
+    labelled["blink_detected"] = blink_detected
+    labelled["blink_id"] = pd.array(blink_id, dtype="Int64")
+    labelled["blink_reason"] = pd.Series(blink_reason, index=labelled.index, dtype="string")
+    labelled.attrs["_gp3_class"] = "gp3_blink_samples"
+    columns = [
+        *groups,
+        "blink_id",
+        "start_time",
+        "end_time",
+        "duration",
+        "duration_ms",
+        "n_samples",
+        "reason",
+        "pupil_columns",
+    ]
+    events = pd.DataFrame(events_rows, columns=columns)
+    events.attrs["_gp3_class"] = "gp3_blink_events"
+    if return_mode == "events":
+        return events
+    if return_mode == "samples":
+        return labelled
+    return {"events": events, "samples": labelled, "_gp3_class": "gp3_blink_detection_result"}
 
 
 def flag_gazepoint_pupil_artifacts(
