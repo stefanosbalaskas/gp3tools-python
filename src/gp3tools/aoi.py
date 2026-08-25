@@ -11,6 +11,7 @@ import pandas as pd
 from shapely.geometry import Point, Polygon
 from sklearn.cluster import AgglomerativeClustering
 
+from ._compat import r_aliases
 from ._utils import (
     collapse_consecutive,
     ensure_dataframe,
@@ -750,3 +751,27 @@ def summarise_gazepoint_scanpath_cluster_stability(data) -> pd.DataFrame:
             }
         ]
     )
+
+
+# BEGIN R V2.3.0 CALL-SURFACE ALIASES
+add_gazepoint_aoi = r_aliases(
+    add_gazepoint_aoi, master_df="data", aoi_defs="aoi_geometry", label_col="output_col"
+)
+add_gazepoint_dynamic_aoi = r_aliases(
+    add_gazepoint_dynamic_aoi, master_df="data", aoi_defs="aoi_data", label_col="output_col"
+)
+audit_gazepoint_aoi_geometry = r_aliases(audit_gazepoint_aoi_geometry, data="aoi_geometry")
+audit_gazepoint_aoi_margin_sensitivity = r_aliases(
+    audit_gazepoint_aoi_margin_sensitivity, gaze_data="data"
+)
+audit_gazepoint_aoi_overlap = r_aliases(audit_gazepoint_aoi_overlap, data="aoi_geometry")
+audit_gazepoint_aoi_screen_coverage = r_aliases(
+    audit_gazepoint_aoi_screen_coverage,
+    data="aoi_geometry",
+    screen_width="width",
+    screen_height="height",
+)
+extract_gazepoint_representative_scanpaths = r_aliases(
+    extract_gazepoint_representative_scanpaths, x="clustered"
+)
+# END R V2.3.0 CALL-SURFACE ALIASES

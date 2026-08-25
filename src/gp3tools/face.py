@@ -7,6 +7,7 @@ import re
 import numpy as np
 import pandas as pd
 
+from ._compat import r_aliases
 from ._utils import ensure_dataframe, infer_column, normalize_group_cols, time_to_seconds
 
 
@@ -161,3 +162,10 @@ def create_gazepoint_face_reporting_checklist(data=None) -> pd.DataFrame:
             "reported": [False] * 5,
         }
     )
+
+
+# BEGIN R V2.3.0 CALL-SURFACE ALIASES
+sync_gazepoint_face_data = r_aliases(
+    sync_gazepoint_face_data, gazepoint_data="gaze", face_data="face"
+)
+# END R V2.3.0 CALL-SURFACE ALIASES

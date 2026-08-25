@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from jinja2 import Template
 
+from ._compat import r_aliases
 from ._utils import ensure_dataframe
 
 
@@ -338,3 +339,11 @@ def launch_gazepoint_qc_dashboard(data=None, **kwargs):
             return f"Rows: {len(df):,}\nColumns: {df.shape[1]}\nMissing cells: {int(df.isna().sum().sum()):,}"
 
     return App(app_ui, server)
+
+
+# BEGIN R V2.3.0 CALL-SURFACE ALIASES
+export_gazepoint_cluster_results = r_aliases(export_gazepoint_cluster_results, outdir="output_dir")
+report_gazepoint_multiverse = r_aliases(report_gazepoint_multiverse, multiverse_results="data")
+report_gazepoint_qc_overview = r_aliases(report_gazepoint_qc_overview, qc_bundle="data")
+summarise_gazepoint_workflow = r_aliases(summarise_gazepoint_workflow, results="result")
+# END R V2.3.0 CALL-SURFACE ALIASES

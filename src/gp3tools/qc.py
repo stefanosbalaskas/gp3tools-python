@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ._compat import r_aliases
 from ._utils import (
     as_bool,
     attach_attrs,
@@ -631,3 +632,13 @@ def write_gazepoint_naming_audit(path, names=None) -> Path:
     audit = audit_gazepoint_naming_consistency(names)
     audit["summary"].to_csv(out, index=False)
     return out
+
+
+# BEGIN R V2.3.0 CALL-SURFACE ALIASES
+audit_gazepoint_master = r_aliases(audit_gazepoint_master, master="data")
+audit_gazepoint_screen_bounds = r_aliases(
+    audit_gazepoint_screen_bounds, screen_width="width", screen_height="height"
+)
+summarise_gazepoint_qc_status = r_aliases(summarise_gazepoint_qc_status, qc_bundle="qc")
+validate_gazepoint_master = r_aliases(validate_gazepoint_master, master="data")
+# END R V2.3.0 CALL-SURFACE ALIASES

@@ -10,6 +10,7 @@ from scipy import interpolate, ndimage, signal, stats
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
+from ._compat import r_aliases
 from ._utils import (
     ensure_dataframe,
     finite_numeric,
@@ -982,3 +983,26 @@ def create_gazepoint_preprocessing_multiverse(**grids) -> pd.DataFrame:
             for vals in itertools.product(*[grids[k] for k in keys])
         ]
     )
+
+
+# BEGIN R V2.3.0 CALL-SURFACE ALIASES
+detect_gazepoint_blinks = r_aliases(
+    detect_gazepoint_blinks, all_gaze="data", ts_col="time_col", min_duration="min_duration_ms"
+)
+flag_gazepoint_pupil = r_aliases(
+    flag_gazepoint_pupil,
+    master="data",
+    min_pupil="physiological_min",
+    max_pupil="physiological_max",
+)
+impute_gazepoint_pupil_gp = r_aliases(
+    impute_gazepoint_pupil_gp,
+    pupil="pupil_col",
+    time="time_col",
+    output="output_col",
+    max_train="max_points",
+)
+mean_gazepoint_pupil = r_aliases(
+    mean_gazepoint_pupil, master_df="data", lp_col="left_col", rp_col="right_col"
+)
+# END R V2.3.0 CALL-SURFACE ALIASES

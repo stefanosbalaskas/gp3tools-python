@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ._compat import r_aliases
 from ._utils import ensure_dataframe, infer_column, normalize_group_cols, time_to_seconds
 
 
@@ -321,3 +322,14 @@ def simulate_gazepoint_fixations(
             t += 1 / 60
         t += rng.uniform(0.02, 0.08)
     return pd.DataFrame(rows)
+
+
+# BEGIN R V2.3.0 CALL-SURFACE ALIASES
+detect_gazepoint_fixations_velocity = r_aliases(
+    detect_gazepoint_fixations_velocity,
+    all_gaze="data",
+    ts_col="time_col",
+    vmax="velocity_threshold",
+    min_duration="min_duration_ms",
+)
+# END R V2.3.0 CALL-SURFACE ALIASES

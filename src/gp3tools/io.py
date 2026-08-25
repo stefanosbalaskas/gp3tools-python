@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ._compat import r_aliases
 from ._utils import attach_attrs, ensure_dataframe, safe_path
 
 _AUTO_COLUMN_RE = re.compile(r"^(?:\.\.\d+|Unnamed.*)$", re.IGNORECASE)
@@ -190,3 +191,8 @@ def inspect_gazepoint_columns(data) -> pd.DataFrame:
             "n_unique": [int(df[c].nunique(dropna=True)) for c in df.columns],
         }
     )
+
+
+# BEGIN R V2.3.0 CALL-SURFACE ALIASES
+inspect_gazepoint_columns = r_aliases(inspect_gazepoint_columns, x="data")
+# END R V2.3.0 CALL-SURFACE ALIASES
