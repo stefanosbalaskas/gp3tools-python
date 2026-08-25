@@ -501,40 +501,580 @@ def audit_gazepoint_stimulus_luminance(
     return pd.DataFrame([{"n": int(ok.sum()), "correlation": r, "p_value": p}])
 
 
-def summarise_gazepoint_pupil(data, pupil_col=None, group_cols=None) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
-    work = df.copy()
-    work["_p"] = finite_numeric(work[pupil_col])
-    if groups:
-        return (
-            work.groupby(groups, dropna=False)
-            .agg(
-                n_samples=("_p", "size"),
-                n_valid=("_p", "count"),
-                mean_pupil=("_p", "mean"),
-                sd_pupil=("_p", "std"),
-                median_pupil=("_p", "median"),
-                min_pupil=("_p", "min"),
-                max_pupil=("_p", "max"),
-            )
-            .reset_index()
+def summarise_gazepoint_pupil(
+    data=None,
+    pupil_col=None,
+    group_cols=None,
+    *,
+    master=None,
+    time_col=None,
+    missing_pupil_col=None,
+    min_pupil=0,
+    max_pupil=np.inf,
+    outlier_k=1.5,
+) -> pd.DataFrame:
+    """Summarise Gazepoint pupil measurements.
+
+    ``master=`` activates the R gp3tools v2.3.0 summary contract.
+    Passing a DataFrame through ``data`` retains the historical Python
+    summary interface.
+    """
+    if master is None:
+        if data is None:
+            raise TypeError("data or master must be supplied")
+
+        df = ensure_dataframe(
+            data,
+            copy=False,
         )
-    x = work._p
-    return pd.DataFrame(
+
+        pupil_col = infer_column(
+            df,
+            "pupil",
+            pupil_col,
+            required=True,
+        )
+
+        groups = normalize_group_cols(
+            df,
+            group_cols,
+        )
+
+        work = df.copy()
+
+        work["_p"] = finite_numeric(work[pupil_col])
+
+        if groups:
+            return (
+                work.groupby(
+                    groups,
+                    dropna=False,
+                )
+                .agg(
+                    n_samples=(
+                        "_p",
+                        "size",
+                    ),
+                    n_valid=(
+                        "_p",
+                        "count",
+                    ),
+                    mean_pupil=(
+                        "_p",
+                        "mean",
+                    ),
+                    sd_pupil=(
+                        "_p",
+                        "std",
+                    ),
+                    median_pupil=(
+                        "_p",
+                        "median",
+                    ),
+                    min_pupil=(
+                        "_p",
+                        "min",
+                    ),
+                    max_pupil=(
+                        "_p",
+                        "max",
+                    ),
+                )
+                .reset_index()
+            )
+
+        values = work["_p"]
+
+        return pd.DataFrame(
+            [
+                {
+                    "n_samples": len(values),
+                    "n_valid": int(values.notna().sum()),
+                    "mean_pupil": float(values.mean()),
+                    "sd_pupil": float(values.std()),
+                    "median_pupil": float(values.median()),
+                    "min_pupil": float(values.min()),
+                    "max_pupil": float(values.max()),
+                }
+            ]
+        )
+
+    if data is not None:
+        raise TypeError("supply either data or master, not both")
+
+    if not isinstance(
+        master,
+        pd.DataFrame,
+    ):
+        raise TypeError("master must be a DataFrame")
+
+    if group_cols is None:
+        groups = [
+            "subject",
+            "media_id",
+        ]
+
+    elif isinstance(
+        group_cols,
+        str,
+    ):
+        groups = [group_cols]
+
+    elif isinstance(
+        group_cols,
+        (
+            list,
+            tuple,
+            pd.Index,
+            np.ndarray,
+        ),
+    ):
+        groups = list(group_cols)
+
+        if not all(
+            isinstance(
+                col,
+                str,
+            )
+            for col in groups
+        ):
+            raise ValueError("group_cols must be a character vector")
+
+    else:
+        raise ValueError("group_cols must be a character vector")
+
+    for argument, value in {
+        "pupil_col": pupil_col,
+        "time_col": time_col,
+        "missing_pupil_col": missing_pupil_col,
+    }.items():
+        if value is not None and (
+            not isinstance(
+                value,
+                str,
+            )
+            or not value
+        ):
+            raise ValueError(f"{argument} must be None or a single string")
+
+    def numeric_scalar(
+        value,
+        argument,
+    ):
+        if isinstance(
+            value,
+            (bool, np.bool_),
+        ):
+            raise ValueError(f"{argument} must be a single numeric value")
+
+        try:
+            return float(value)
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ValueError(f"{argument} must be a single numeric value") from exc
+
+    min_value = numeric_scalar(
+        min_pupil,
+        "min_pupil",
+    )
+
+    max_value = numeric_scalar(
+        max_pupil,
+        "max_pupil",
+    )
+
+    outlier_k = numeric_scalar(
+        outlier_k,
+        "outlier_k",
+    )
+
+    if max_value <= min_value:
+        raise ValueError("max_pupil must be greater than min_pupil")
+
+    invalid_groups = [
+        col
+        for col in groups
+        if col
+        not in {
+            "subject",
+            "media_id",
+        }
+    ]
+
+    if invalid_groups:
+        raise ValueError("group_cols can only contain: subject, media_id")
+
+    def detect_col(candidates):
+        for candidate in candidates:
+            if candidate in master.columns:
+                return candidate
+
+        return None
+
+    subject_source = detect_col(
         [
-            {
-                "n_samples": len(x),
-                "n_valid": int(x.notna().sum()),
-                "mean_pupil": float(x.mean()),
-                "sd_pupil": float(x.std()),
-                "median_pupil": float(x.median()),
-                "min_pupil": float(x.min()),
-                "max_pupil": float(x.max()),
-            }
+            "subject",
+            "pID",
+            "participant",
         ]
     )
+
+    media_source = detect_col(
+        [
+            "media_id",
+            "MEDIA_ID",
+        ]
+    )
+
+    pupil_source = (
+        pupil_col
+        if pupil_col is not None
+        else detect_col(
+            [
+                "mean_pupil",
+                "pupil",
+                "pupil_raw",
+                "left_pupil",
+                "right_pupil",
+            ]
+        )
+    )
+
+    time_source = (
+        time_col
+        if time_col is not None
+        else detect_col(
+            [
+                "time_ms",
+                "time",
+                "time_orig",
+                "time_orig_ms",
+            ]
+        )
+    )
+
+    missing_source = (
+        missing_pupil_col if missing_pupil_col is not None else detect_col(["missing_pupil"])
+    )
+
+    if subject_source is None:
+        raise ValueError("No subject column was found")
+
+    if media_source is None:
+        raise ValueError("No media/stimulus column was found")
+
+    if pupil_source is None or pupil_source not in master.columns:
+        raise ValueError("No pupil column was found")
+
+    if time_source is None or time_source not in master.columns:
+        raise ValueError("No time column was found")
+
+    if missing_source is not None and missing_source not in master.columns:
+        raise ValueError("missing_pupil_col was not found in master")
+
+    pupil = pd.to_numeric(
+        master[pupil_source],
+        errors="coerce",
+    )
+
+    time_values = pd.to_numeric(
+        master[time_source],
+        errors="coerce",
+    )
+
+    def as_r_logical(values):
+        series = pd.Series(
+            values,
+            index=master.index,
+        )
+
+        if pd.api.types.is_bool_dtype(series.dtype):
+            return series.astype("boolean")
+
+        if pd.api.types.is_numeric_dtype(series.dtype):
+            numeric = pd.to_numeric(
+                series,
+                errors="coerce",
+            )
+
+            result = pd.Series(
+                pd.NA,
+                index=series.index,
+                dtype="boolean",
+            )
+
+            result.loc[numeric.notna()] = numeric.loc[numeric.notna()] != 0
+
+            return result
+
+        text = series.astype("string").str.strip().str.lower()
+
+        result = pd.Series(
+            pd.NA,
+            index=series.index,
+            dtype="boolean",
+        )
+
+        result.loc[
+            text.isin(
+                [
+                    "true",
+                    "t",
+                    "1",
+                ]
+            )
+        ] = True
+
+        result.loc[
+            text.isin(
+                [
+                    "false",
+                    "f",
+                    "0",
+                ]
+            )
+        ] = False
+
+        return result
+
+    if missing_source is not None:
+        missing = as_r_logical(master[missing_source])
+
+        missing = missing.fillna(pupil.isna())
+
+    else:
+        missing = pupil.isna().astype("boolean")
+
+    pupil_valid = ~missing.astype(bool) & pupil.notna()
+
+    work = pd.DataFrame(
+        {
+            "subject": master[subject_source].astype("string"),
+            "media_id": master[media_source].astype("string"),
+            "time_ms": time_values,
+            "pupil": pupil,
+            "missing_pupil": missing.astype(bool),
+            "pupil_valid": pupil_valid,
+            "pupil_for_summary": pupil.where(
+                pupil_valid,
+                np.nan,
+            ),
+        }
+    )
+
+    def finite_values(values):
+        numeric = pd.to_numeric(
+            values,
+            errors="coerce",
+        ).to_numpy(float)
+
+        return numeric[np.isfinite(numeric)]
+
+    def safe_min(values):
+        values = finite_values(values)
+
+        return float(np.min(values)) if len(values) else np.nan
+
+    def safe_max(values):
+        values = finite_values(values)
+
+        return float(np.max(values)) if len(values) else np.nan
+
+    def safe_quantile(
+        values,
+        probability,
+    ):
+        values = finite_values(values)
+
+        return (
+            float(
+                np.quantile(
+                    values,
+                    probability,
+                    method="linear",
+                )
+            )
+            if len(values)
+            else np.nan
+        )
+
+    def safe_mean(values):
+        values = pd.to_numeric(
+            values,
+            errors="coerce",
+        ).dropna()
+
+        if not len(values):
+            return np.nan
+
+        return float(values.mean())
+
+    def safe_median(values):
+        values = pd.to_numeric(
+            values,
+            errors="coerce",
+        ).dropna()
+
+        if not len(values):
+            return np.nan
+
+        return float(values.median())
+
+    def safe_sd(values):
+        values = pd.to_numeric(
+            values,
+            errors="coerce",
+        ).dropna()
+
+        if len(values) < 2:
+            return np.nan
+
+        return float(values.std(ddof=1))
+
+    def percentage(
+        numerator,
+        denominator,
+    ):
+        if pd.isna(denominator) or denominator == 0:
+            return np.nan
+
+        return float(numerator / denominator * 100)
+
+    def count_iqr_outliers(values):
+        values = finite_values(values)
+
+        values = values[(values >= min_value) & (values <= max_value)]
+
+        if len(values) < 4:
+            return 0
+
+        q25, q75 = np.quantile(
+            values,
+            [
+                0.25,
+                0.75,
+            ],
+            method="linear",
+        )
+
+        iqr_value = q75 - q25
+
+        if not np.isfinite(iqr_value) or iqr_value == 0:
+            return 0
+
+        lower = q25 - outlier_k * iqr_value
+
+        upper = q75 + outlier_k * iqr_value
+
+        return int(((values < lower) | (values > upper)).sum())
+
+    def summarise_part(part):
+        n_rows = int(len(part))
+
+        n_valid = int(part["pupil_valid"].sum())
+
+        n_missing = int((~part["pupil_valid"]).sum())
+
+        below = int((part["pupil_valid"] & (part["pupil"] < min_value)).sum())
+
+        above = int((part["pupil_valid"] & (part["pupil"] > max_value)).sum())
+
+        iqr_outliers = count_iqr_outliers(part["pupil_for_summary"])
+
+        time_min = safe_min(part["time_ms"])
+
+        time_max = safe_max(part["time_ms"])
+
+        return {
+            "n_rows": n_rows,
+            "time_min_ms": time_min,
+            "time_max_ms": time_max,
+            "time_span_ms": (
+                time_max - time_min if (np.isfinite(time_min) and np.isfinite(time_max)) else np.nan
+            ),
+            "n_pupil_samples": n_valid,
+            "n_missing_pupil": n_missing,
+            "missing_pupil_pct": percentage(
+                n_missing,
+                n_rows,
+            ),
+            "valid_pupil_pct": percentage(
+                n_valid,
+                n_rows,
+            ),
+            "mean_pupil": safe_mean(part["pupil_for_summary"]),
+            "median_pupil": safe_median(part["pupil_for_summary"]),
+            "sd_pupil": safe_sd(part["pupil_for_summary"]),
+            "min_pupil": safe_min(part["pupil_for_summary"]),
+            "max_pupil": safe_max(part["pupil_for_summary"]),
+            "q05_pupil": safe_quantile(
+                part["pupil_for_summary"],
+                0.05,
+            ),
+            "q25_pupil": safe_quantile(
+                part["pupil_for_summary"],
+                0.25,
+            ),
+            "q75_pupil": safe_quantile(
+                part["pupil_for_summary"],
+                0.75,
+            ),
+            "q95_pupil": safe_quantile(
+                part["pupil_for_summary"],
+                0.95,
+            ),
+            "n_below_plausible": below,
+            "n_above_plausible": above,
+            "n_implausible": below + above,
+            "implausible_pct": percentage(
+                below + above,
+                n_rows,
+            ),
+            "n_iqr_outliers": iqr_outliers,
+            "iqr_outlier_pct": percentage(
+                iqr_outliers,
+                n_valid,
+            ),
+            "pupil_column": pupil_source,
+            "time_column": time_source,
+            "min_plausible": min_value,
+            "max_plausible": max_value,
+        }
+
+    if not groups:
+        return pd.DataFrame([summarise_part(work)])
+
+    rows = []
+
+    for key, part in work.groupby(
+        groups,
+        dropna=False,
+        sort=False,
+    ):
+        key_values = (
+            key
+            if isinstance(
+                key,
+                tuple,
+            )
+            else (key,)
+        )
+
+        row = dict(
+            zip(
+                groups,
+                key_values,
+                strict=True,
+            )
+        )
+
+        row.update(summarise_part(part))
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def summarise_gazepoint_pupil_windows(

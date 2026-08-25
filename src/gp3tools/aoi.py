@@ -8,7 +8,7 @@ from typing import Any
 import networkx as nx
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point, Polygon
+from shapely.geometry import MultiPoint, Point, Polygon
 from sklearn.cluster import AgglomerativeClustering
 
 from ._compat import r_aliases
@@ -239,7 +239,263 @@ def summarise_aoi_samples(data, aoi_col=None, group_cols=None) -> pd.DataFrame:
     return out
 
 
-summarise_gazepoint_aoi = summarise_aoi_samples
+def summarise_gazepoint_aoi(
+    data=None,
+    aoi_col=None,
+    group_cols=None,
+    *,
+    gaze_data=None,
+    fixation_data=None,
+    user_col="USER_FILE",
+    sample_rate=60,
+) -> pd.DataFrame:
+    """Summarise Gazepoint AOI data.
+
+    The historical Python sample-count interface remains available.
+    Supplying ``gaze_data``/``fixation_data`` or passing two DataFrames
+    positionally activates the R gp3tools v2.3.0 interface.
+    """
+    positional_r_mode = (
+        isinstance(
+            data,
+            pd.DataFrame,
+        )
+        and isinstance(
+            aoi_col,
+            pd.DataFrame,
+        )
+        and gaze_data is None
+        and fixation_data is None
+    )
+
+    r_mode = positional_r_mode or gaze_data is not None or fixation_data is not None
+
+    if not r_mode:
+        if data is None:
+            raise TypeError("data is required for the Python interface")
+
+        return summarise_aoi_samples(
+            data,
+            aoi_col=aoi_col,
+            group_cols=group_cols,
+        )
+
+    if positional_r_mode:
+        gaze_data = data
+        fixation_data = aoi_col
+
+    elif gaze_data is None:
+        if data is None:
+            raise TypeError("gaze_data is required")
+
+        gaze_data = data
+
+    if fixation_data is None:
+        raise TypeError("fixation_data is required")
+
+    gaze = ensure_dataframe(
+        gaze_data,
+        copy=False,
+    )
+
+    fix = ensure_dataframe(
+        fixation_data,
+        copy=False,
+    )
+
+    if not isinstance(user_col, str) or not user_col:
+        raise ValueError("user_col must be a non-empty string")
+
+    required_gaze = [
+        user_col,
+        "MEDIA_ID",
+        "MEDIA_NAME",
+        "AOI",
+        "TIME",
+    ]
+
+    required_fix = [
+        user_col,
+        "MEDIA_ID",
+        "MEDIA_NAME",
+        "AOI",
+        "FPOGD",
+        "FPOGS",
+    ]
+
+    missing_gaze = [col for col in required_gaze if col not in gaze.columns]
+
+    if missing_gaze:
+        raise ValueError("Missing required columns in `gaze_data`: " + ", ".join(missing_gaze))
+
+    missing_fix = [col for col in required_fix if col not in fix.columns]
+
+    if missing_fix:
+        raise ValueError("Missing required columns in `fixation_data`: " + ", ".join(missing_fix))
+
+    def user_ids(frame):
+        extracted = (
+            frame[user_col]
+            .astype("string")
+            .str.extract(
+                r"(\d+)",
+                expand=False,
+            )
+        )
+
+        return pd.to_numeric(
+            extracted,
+            errors="coerce",
+        ).astype("Int64")
+
+    gaze_work = gaze.loc[gaze["AOI"].notna() & gaze["AOI"].ne("")].copy()
+
+    gaze_work["USER_ID"] = user_ids(gaze_work)
+
+    gaze_work["_TIME"] = pd.to_numeric(
+        gaze_work["TIME"],
+        errors="coerce",
+    )
+
+    keys = [
+        "USER_ID",
+        "MEDIA_ID",
+        "MEDIA_NAME",
+        "AOI",
+    ]
+
+    sample_rows = []
+
+    for key, part in gaze_work.groupby(
+        keys,
+        dropna=False,
+        sort=False,
+    ):
+        values = part["_TIME"].dropna().to_numpy(float)
+
+        sample_ttff = float(np.min(values)) if len(values) else np.inf
+
+        row = dict(
+            zip(
+                keys,
+                (
+                    key
+                    if isinstance(
+                        key,
+                        tuple,
+                    )
+                    else (key,)
+                ),
+                strict=True,
+            )
+        )
+
+        row.update(
+            {
+                "sample_ttff_sec": sample_ttff,
+                "sample_count": int(len(part)),
+            }
+        )
+
+        sample_rows.append(row)
+
+    sample_summary = pd.DataFrame(
+        sample_rows,
+        columns=[
+            *keys,
+            "sample_ttff_sec",
+            "sample_count",
+        ],
+    )
+
+    if len(sample_summary):
+        sample_summary["sample_time_viewed_sec"] = sample_summary["sample_count"] / sample_rate
+    else:
+        sample_summary["sample_time_viewed_sec"] = pd.Series(dtype=float)
+
+    fix_work = fix.loc[fix["AOI"].notna() & fix["AOI"].ne("")].copy()
+
+    fix_work["USER_ID"] = user_ids(fix_work)
+
+    fix_work["_FPOGD"] = pd.to_numeric(
+        fix_work["FPOGD"],
+        errors="coerce",
+    )
+
+    fix_work["_FPOGS"] = pd.to_numeric(
+        fix_work["FPOGS"],
+        errors="coerce",
+    )
+
+    fixation_rows = []
+
+    for key, part in fix_work.groupby(
+        keys,
+        dropna=False,
+        sort=False,
+    ):
+        duration = part["_FPOGD"]
+
+        starts = part["_FPOGS"].dropna().to_numpy(float)
+
+        fixation_ttff = float(np.min(starts)) if len(starts) else np.inf
+
+        row = dict(
+            zip(
+                keys,
+                (
+                    key
+                    if isinstance(
+                        key,
+                        tuple,
+                    )
+                    else (key,)
+                ),
+                strict=True,
+            )
+        )
+
+        row.update(
+            {
+                "fixation_count": int(len(part)),
+                "fixation_duration_sum_sec": float(duration.sum(skipna=True)),
+                "fixation_duration_mean_ms": float(duration.mean(skipna=True) * 1000),
+                "fixation_ttff_sec": fixation_ttff,
+            }
+        )
+
+        fixation_rows.append(row)
+
+    fixation_summary = pd.DataFrame(
+        fixation_rows,
+        columns=[
+            *keys,
+            "fixation_count",
+            "fixation_duration_sum_sec",
+            "fixation_duration_mean_ms",
+            "fixation_ttff_sec",
+        ],
+    )
+
+    out = sample_summary.merge(
+        fixation_summary,
+        on=keys,
+        how="outer",
+        sort=False,
+    )
+
+    if len(out):
+        out = out.sort_values(
+            [
+                "USER_ID",
+                "MEDIA_ID",
+                "AOI",
+            ],
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    return out
 
 
 def _sequence_frame(
@@ -474,38 +730,259 @@ def compute_gazepoint_sequence_recurrence(sequence, lag=1) -> dict[str, float]:
 
 
 def compute_gazepoint_scanpath_geometry(
-    data, x_col=None, y_col=None, time_col=None, group_cols=None
+    data,
+    x_col=None,
+    y_col=None,
+    time_col=None,
+    group_cols=None,
+    *,
+    x=None,
+    y=None,
+    subject=None,
+    trial=None,
+    time=None,
+    condition=None,
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    x_col = infer_column(df, "x", x_col, required=True)
-    y_col = infer_column(df, "y", y_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
+    """Compute scanpath geometry.
+
+    Supplying the R argument names ``x``, ``y``, ``subject`` and
+    ``trial`` activates the gp3tools v2.3.0 interface. Otherwise the
+    historical Python group-based summary is retained.
+    """
+    df = ensure_dataframe(
+        data,
+        copy=False,
+    )
+
+    r_mode = any(
+        value is not None
+        for value in (
+            x,
+            y,
+            subject,
+            trial,
+            time,
+            condition,
+        )
+    )
+
+    if not r_mode:
+        x_col = infer_column(
+            df,
+            "x",
+            x_col,
+            required=True,
+        )
+        y_col = infer_column(
+            df,
+            "y",
+            y_col,
+            required=True,
+        )
+
+        groups = normalize_group_cols(
+            df,
+            group_cols,
+        )
+
+        rows = []
+
+        iterator = (
+            [((), df)]
+            if not groups
+            else df.groupby(
+                groups,
+                dropna=False,
+                sort=False,
+            )
+        )
+
+        for key, part in iterator:
+            if time_col and time_col in part:
+                part = part.sort_values(
+                    time_col,
+                    kind="stable",
+                )
+
+            px = finite_numeric(part[x_col]).to_numpy(float)
+
+            py = finite_numeric(part[y_col]).to_numpy(float)
+
+            ok = np.isfinite(px) & np.isfinite(py)
+
+            px = px[ok]
+            py = py[ok]
+
+            dist = np.sqrt(np.diff(px) ** 2 + np.diff(py) ** 2)
+
+            base = (
+                {
+                    col: value
+                    for col, value in zip(
+                        groups,
+                        (
+                            key
+                            if isinstance(
+                                key,
+                                tuple,
+                            )
+                            else (key,)
+                        ),
+                        strict=False,
+                    )
+                }
+                if groups
+                else {}
+            )
+
+            rows.append(
+                {
+                    **base,
+                    "n_points": len(px),
+                    "path_length": float(dist.sum()),
+                    "mean_step": (float(dist.mean()) if len(dist) else 0),
+                    "dispersion_x": (float(np.std(px)) if len(px) else np.nan),
+                    "dispersion_y": (float(np.std(py)) if len(py) else np.nan),
+                }
+            )
+
+        return pd.DataFrame(rows)
+
+    required_arguments = {
+        "x": x,
+        "y": y,
+        "subject": subject,
+        "trial": trial,
+    }
+
+    missing_arguments = [
+        name
+        for name, value in required_arguments.items()
+        if (not isinstance(value, str) or not value)
+    ]
+
+    if missing_arguments:
+        raise ValueError("R-compatible scanpath geometry requires: " + ", ".join(missing_arguments))
+
+    for optional_name, value in {
+        "time": time,
+        "condition": condition,
+    }.items():
+        if value is not None and (
+            not isinstance(
+                value,
+                str,
+            )
+            or not value
+        ):
+            raise ValueError(f"{optional_name} must be None or a non-empty string")
+
+    required_columns = [
+        x,
+        y,
+        subject,
+        trial,
+    ]
+
+    if time is not None:
+        required_columns.append(time)
+
+    if condition is not None:
+        required_columns.append(condition)
+
+    missing_columns = [col for col in required_columns if col not in df.columns]
+
+    if missing_columns:
+        raise ValueError("Missing columns: " + ", ".join(missing_columns))
+
     rows = []
-    iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
-    for key, f in iterator:
-        if time_col and time_col in f:
-            f = f.sort_values(time_col)
-        x = finite_numeric(f[x_col]).to_numpy(float)
-        y = finite_numeric(f[y_col]).to_numpy(float)
-        ok = np.isfinite(x) & np.isfinite(y)
-        x = x[ok]
-        y = y[ok]
-        dist = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2)
-        base = (
-            {c: v for c, v in zip(groups, key if isinstance(key, tuple) else (key,), strict=False)}
-            if groups
-            else {}
-        )
-        rows.append(
-            {
-                **base,
-                "n_points": len(x),
-                "path_length": float(dist.sum()),
-                "mean_step": float(dist.mean()) if len(dist) else 0,
-                "dispersion_x": float(np.std(x)) if len(x) else np.nan,
-                "dispersion_y": float(np.std(y)) if len(y) else np.nan,
-            }
-        )
+
+    for _, part in df.groupby(
+        [subject, trial],
+        dropna=True,
+        sort=True,
+    ):
+        if time is not None:
+            part = part.sort_values(
+                time,
+                kind="stable",
+                na_position="last",
+            )
+
+        px = pd.to_numeric(
+            part[x],
+            errors="coerce",
+        ).to_numpy(float)
+
+        py = pd.to_numeric(
+            part[y],
+            errors="coerce",
+        ).to_numpy(float)
+
+        ok = np.isfinite(px) & np.isfinite(py)
+
+        px = px[ok]
+        py = py[ok]
+
+        n_points = len(px)
+
+        if n_points < 2:
+            scanpath_length = np.nan
+            straight_line_distance = np.nan
+            efficiency = np.nan
+
+        else:
+            step_distance = np.sqrt(np.diff(px) ** 2 + np.diff(py) ** 2)
+
+            scanpath_length = float(np.sum(step_distance))
+
+            straight_line_distance = float(np.sqrt((px[-1] - px[0]) ** 2 + (py[-1] - py[0]) ** 2))
+
+            efficiency = straight_line_distance / scanpath_length if scanpath_length > 0 else np.nan
+
+        if n_points:
+            centroid_x = float(np.mean(px))
+            centroid_y = float(np.mean(py))
+
+            spatial_dispersion = float(
+                np.mean(np.sqrt((px - centroid_x) ** 2 + (py - centroid_y) ** 2))
+            )
+
+            if not np.isfinite(spatial_dispersion):
+                spatial_dispersion = np.nan
+        else:
+            spatial_dispersion = np.nan
+
+        if n_points < 3:
+            convex_hull_area = np.nan
+        else:
+            convex_hull_area = float(
+                MultiPoint(
+                    np.column_stack(
+                        [
+                            px,
+                            py,
+                        ]
+                    )
+                ).convex_hull.area
+            )
+
+        row = {
+            "subject": part.iloc[0][subject],
+            "trial": part.iloc[0][trial],
+            "n_points": int(n_points),
+            "scanpath_length": scanpath_length,
+            "straight_line_distance": straight_line_distance,
+            "scanpath_efficiency": efficiency,
+            "convex_hull_area": convex_hull_area,
+            "spatial_dispersion": spatial_dispersion,
+        }
+
+        if condition is not None:
+            row["condition"] = part.iloc[0][condition]
+
+        rows.append(row)
+
     return pd.DataFrame(rows)
 
 
