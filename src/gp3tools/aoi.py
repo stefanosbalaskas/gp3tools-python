@@ -2902,52 +2902,647 @@ def _sequence_frame(
     return pd.DataFrame(rows), groups
 
 
-def prepare_gazepoint_aoi_sequences(
-    data, aoi_col=None, group_cols=None, time_col=None, collapse_repeats=True, **kwargs
-) -> pd.DataFrame:
-    out, _ = _sequence_frame(
-        data, aoi_col, group_cols, time_col, collapse_repeats=collapse_repeats, **kwargs
-    )
-    out["sequence_string"] = out.sequence.map(lambda x: " > ".join(map(str, x)))
-    out["sequence_length"] = out.sequence.map(len)
+_GP3_R_UNSET = object()
+_GP3_AOI_NON_VALUES = (
+    "non_aoi",
+    "none",
+    "background",
+    "outside",
+    "outside_aoi",
+    "missing",
+    "missing_aoi",
+)
+
+
+def _gp3_aoi_r_list(value, *, allow_none=True, unique=False, name="value"):
+    if value is None and allow_none:
+        return []
+    if isinstance(value, str):
+        out = [value]
+    else:
+        try:
+            out = list(value)
+        except TypeError as exc:
+            raise ValueError(f"{name} must be a character vector") from exc
+    if any(v is None or pd.isna(v) or not isinstance(v, str) or not v for v in out):
+        raise ValueError(f"{name} must contain non-missing non-empty strings")
+    if unique and len(set(out)) != len(out):
+        raise ValueError(f"{name} must contain unique column names")
     return out
 
 
-def summarise_gazepoint_aoi_entries(
-    data, aoi_col=None, group_cols=None, time_col=None
-) -> pd.DataFrame:
-    seq, groups = _sequence_frame(data, aoi_col, group_cols, time_col, collapse_repeats=True)
+def _gp3_aoi_r_scalar_label(value, name, *, allow_none=False):
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a non-missing character scalar")
+    return value
+
+
+def _gp3_aoi_r_resolve_column(df, value, candidates, *, name, allow_none=False):
+    value = _gp3_aoi_r_scalar_label(value, name, allow_none=allow_none)
+    if value is None:
+        value = next((candidate for candidate in candidates if candidate in df.columns), None)
+        if value is None:
+            raise ValueError(f"Could not automatically detect {name}")
+    if value not in df.columns:
+        raise ValueError(f"Missing required columns: {value}")
+    return value
+
+
+def _gp3_aoi_r_groupby(df, cols):
+    if cols:
+        return df.groupby(cols, dropna=False, sort=False)
+    return [(None, df)]
+
+
+def _gp3_aoi_r_entries(
+    data,
+    *,
+    aoi_col=None,
+    time_col="time",
+    group_cols=("subject", "MEDIA_ID", "trial_global"),
+    include_non_aoi=True,
+    non_aoi_values=_GP3_AOI_NON_VALUES,
+    missing_aoi_label="missing_aoi",
+):
+    df = ensure_dataframe(data, copy=False)
+    time_col = _gp3_aoi_r_scalar_label(time_col, "time_col")
+    groups = _gp3_aoi_r_list(group_cols, allow_none=False, unique=True, name="group_cols")
+    if not isinstance(include_non_aoi, (bool, np.bool_)):
+        raise ValueError("include_non_aoi must be TRUE or FALSE")
+    non_values = _gp3_aoi_r_list(non_aoi_values, allow_none=False, name="non_aoi_values")
+    missing_aoi_label = _gp3_aoi_r_scalar_label(missing_aoi_label, "missing_aoi_label")
+    aoi_col = _gp3_aoi_r_resolve_column(
+        df,
+        aoi_col,
+        ("aoi_current", "AOI", "aoi_state"),
+        name="aoi_col",
+        allow_none=True,
+    )
+    missing = [col for col in [*groups, time_col, aoi_col] if col not in df.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(dict.fromkeys(missing)))
+
+    work = df.copy()
+    work[".gp3_aoi_time"] = pd.to_numeric(work[time_col], errors="coerce")
+    state = work[aoi_col].astype("string").str.strip()
+    state = state.mask(state.isna() | state.eq(""), missing_aoi_label)
+    work[".gp3_aoi_state"] = state.astype(object)
+    work = work.loc[work[".gp3_aoi_time"].notna()].copy()
+    if work.empty:
+        raise ValueError("No non-missing time values remain after filtering")
+    sort_cols = [*groups, ".gp3_aoi_time"] if groups else [".gp3_aoi_time"]
+    work = work.sort_values(sort_cols, kind="stable", na_position="last").reset_index(drop=True)
+
+    pieces = []
+    for _, block in _gp3_aoi_r_groupby(work, groups):
+        block = block.copy()
+        times = block[".gp3_aoi_time"].to_numpy(dtype=float)
+        next_times = np.r_[times[1:], np.nan]
+        positive = np.where(
+            np.isfinite(next_times) & (next_times > times), next_times - times, np.nan
+        )
+        finite_pos = positive[np.isfinite(positive) & (positive > 0)]
+        default_dt = float(np.median(finite_pos)) if finite_pos.size else np.nan
+        sample_duration = np.where(np.isfinite(positive), positive, default_dt)
+        sample_duration = np.where(np.isfinite(sample_duration), sample_duration, 0.0)
+        block[".gp3_sample_duration_ms"] = sample_duration
+        changed = block[".gp3_aoi_state"].ne(block[".gp3_aoi_state"].shift(1)).to_numpy(copy=True)
+        if len(changed):
+            changed[0] = True
+        block[".gp3_entry_id"] = np.cumsum(changed).astype(int)
+        pieces.append(block)
+    work = pd.concat(pieces, ignore_index=True)
+
     rows = []
-    for _, r in seq.iterrows():
-        base = {c: r[c] for c in groups}
-        counts = Counter(r.sequence)
-        for a, n in counts.items():
-            rows.append({**base, "aoi": a, "n_entries": n})
-    return pd.DataFrame(rows)
+    entry_group_cols = [*groups, ".gp3_entry_id", ".gp3_aoi_state"]
+    for key, block in _gp3_aoi_r_groupby(work, entry_group_cols):
+        if not isinstance(key, tuple):
+            key = (key,)
+        base = dict(zip(entry_group_cols, key, strict=True))
+        t = block[".gp3_aoi_time"].to_numpy(dtype=float)
+        dur = block[".gp3_sample_duration_ms"].to_numpy(dtype=float)
+        rows.append(
+            {
+                **base,
+                "entry_start_time": float(np.min(t)),
+                "entry_end_time": float(np.max(t + dur)),
+                "entry_duration_ms": float(np.nansum(dur)),
+                "n_samples": int(len(block)),
+            }
+        )
+    entries = pd.DataFrame(rows)
+    entries["entry_id"] = entries[".gp3_entry_id"].astype(int)
+    entries["aoi_state"] = entries[".gp3_aoi_state"].astype(object)
+    entries = entries.drop(columns=[".gp3_entry_id", ".gp3_aoi_state"])
+    sort_cols = [*groups, "entry_start_time"] if groups else ["entry_start_time"]
+    entries = entries.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+
+    out_parts = []
+    bg = {str(v).strip().lower() for v in non_values}
+    for _, block in _gp3_aoi_r_groupby(entries, groups):
+        block = block.copy()
+        block["entry_order"] = np.arange(1, len(block) + 1, dtype=int)
+        block["previous_aoi_state"] = block["aoi_state"].shift(1)
+        block["next_aoi_state"] = block["aoi_state"].shift(-1)
+        block["is_non_aoi"] = block["aoi_state"].astype(str).str.strip().str.lower().isin(bg)
+        out_parts.append(block)
+    entries = pd.concat(out_parts, ignore_index=True)
+    if not include_non_aoi:
+        entries = entries.loc[~entries["is_non_aoi"]].reset_index(drop=True)
+    columns = [
+        *groups,
+        "entry_id",
+        "entry_order",
+        "aoi_state",
+        "previous_aoi_state",
+        "next_aoi_state",
+        "entry_start_time",
+        "entry_end_time",
+        "entry_duration_ms",
+        "n_samples",
+        "is_non_aoi",
+    ]
+    return entries.loc[:, columns]
+
+
+def _gp3_aoi_r_sequences(
+    data,
+    *,
+    aoi_col=None,
+    time_col="time",
+    group_cols=("subject", "MEDIA_ID", "trial_global"),
+    include_non_aoi=True,
+    non_aoi_values=_GP3_AOI_NON_VALUES,
+    missing_aoi_label="missing_aoi",
+    include_terminal=True,
+):
+    df = ensure_dataframe(data, copy=False)
+    groups = _gp3_aoi_r_list(group_cols, allow_none=False, unique=True, name="group_cols")
+    if not isinstance(include_non_aoi, (bool, np.bool_)):
+        raise ValueError("include_non_aoi must be TRUE or FALSE")
+    if not isinstance(include_terminal, (bool, np.bool_)):
+        raise ValueError("include_terminal must be TRUE or FALSE")
+    non_values = _gp3_aoi_r_list(non_aoi_values, allow_none=False, name="non_aoi_values")
+    missing_aoi_label = _gp3_aoi_r_scalar_label(missing_aoi_label, "missing_aoi_label")
+
+    has_entries = {
+        "aoi_state",
+        "entry_order",
+        "entry_start_time",
+        "entry_end_time",
+        "entry_duration_ms",
+        "n_samples",
+    }.issubset(df.columns)
+    if has_entries:
+        entries = df.copy()
+        required = [
+            *groups,
+            "aoi_state",
+            "entry_order",
+            "entry_start_time",
+            "entry_end_time",
+            "entry_duration_ms",
+            "n_samples",
+        ]
+        missing = [col for col in required if col not in entries.columns]
+        if missing:
+            raise ValueError("Missing required columns: " + ", ".join(missing))
+    else:
+        entries = _gp3_aoi_r_entries(
+            df,
+            aoi_col=aoi_col,
+            time_col=time_col,
+            group_cols=groups,
+            include_non_aoi=True,
+            non_aoi_values=non_values,
+            missing_aoi_label=missing_aoi_label,
+        )
+    if entries.empty:
+        raise ValueError("No AOI entries are available")
+
+    state = entries["aoi_state"].astype("string").str.strip()
+    entries["aoi_state"] = state.mask(state.isna() | state.eq(""), missing_aoi_label).astype(object)
+    for col in ["entry_start_time", "entry_end_time", "entry_duration_ms"]:
+        entries[col] = pd.to_numeric(entries[col], errors="coerce")
+    entries["n_samples"] = pd.to_numeric(entries["n_samples"], errors="coerce").astype("Int64")
+    entries = entries.loc[entries["entry_start_time"].notna()].copy()
+    if "entry_id" not in entries.columns:
+        sort_cols = [*groups, "entry_start_time"] if groups else ["entry_start_time"]
+        entries = entries.sort_values(sort_cols, kind="stable")
+        if groups:
+            entries["entry_id"] = entries.groupby(groups, dropna=False, sort=False).cumcount() + 1
+        else:
+            entries["entry_id"] = np.arange(1, len(entries) + 1)
+    bg = {str(v).strip().lower() for v in non_values}
+    fallback_non = entries["aoi_state"].astype(str).str.strip().str.lower().isin(bg)
+    if "is_non_aoi" not in entries.columns:
+        entries["is_non_aoi"] = fallback_non
+    else:
+        existing = entries["is_non_aoi"].astype("boolean")
+        entries["is_non_aoi"] = existing.fillna(
+            pd.Series(fallback_non, index=entries.index)
+        ).astype(bool)
+    if not include_non_aoi:
+        entries = entries.loc[~entries["is_non_aoi"]].copy()
+    if entries.empty:
+        raise ValueError("No AOI states remain after applying include_non_aoi")
+
+    sort_cols = (
+        [*groups, "entry_start_time", "entry_order"]
+        if groups
+        else ["entry_start_time", "entry_order"]
+    )
+    entries = entries.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+    parts = []
+    for _, block in _gp3_aoi_r_groupby(entries, groups):
+        block = block.copy()
+        block["state_order"] = np.arange(1, len(block) + 1, dtype=int)
+        block["previous_state"] = block["aoi_state"].shift(1)
+        block["next_state"] = block["aoi_state"].shift(-1)
+        block["transition_from"] = block["aoi_state"]
+        block["transition_to"] = block["next_state"]
+        block["dwell_before_transition_ms"] = block["entry_duration_ms"]
+        block["is_terminal_state"] = block["next_state"].isna()
+        block["is_self_transition"] = (~block["transition_to"].isna()) & block[
+            "transition_from"
+        ].eq(block["transition_to"])
+        trans = (~block["is_terminal_state"]).cumsum().astype("Int64")
+        trans.loc[block["is_terminal_state"]] = pd.NA
+        block["transition_order"] = trans
+        parts.append(block)
+    out = pd.concat(parts, ignore_index=True)
+    if not include_terminal:
+        out = out.loc[~out["is_terminal_state"]].reset_index(drop=True)
+    columns = [
+        *groups,
+        "entry_id",
+        "state_order",
+        "transition_order",
+        "aoi_state",
+        "previous_state",
+        "next_state",
+        "transition_from",
+        "transition_to",
+        "entry_start_time",
+        "entry_end_time",
+        "entry_duration_ms",
+        "dwell_before_transition_ms",
+        "n_samples",
+        "is_non_aoi",
+        "is_self_transition",
+        "is_terminal_state",
+    ]
+    return out.loc[:, columns]
+
+
+def _gp3_aoi_r_summary_group_rows(frame, groups):
+    return _gp3_aoi_r_groupby(frame, groups)
+
+
+def prepare_gazepoint_aoi_sequences(
+    data,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    collapse_repeats=True,
+    *,
+    include_non_aoi=_GP3_R_UNSET,
+    non_aoi_values=_GP3_R_UNSET,
+    missing_aoi_label=_GP3_R_UNSET,
+    include_terminal=_GP3_R_UNSET,
+    **kwargs,
+) -> pd.DataFrame:
+    r_mode = any(
+        value is not _GP3_R_UNSET
+        for value in (include_non_aoi, non_aoi_values, missing_aoi_label, include_terminal)
+    )
+    if not r_mode:
+        out, _ = _sequence_frame(
+            data,
+            aoi_col,
+            group_cols,
+            time_col,
+            collapse_repeats=collapse_repeats,
+            **kwargs,
+        )
+        out["sequence_string"] = out.sequence.map(lambda x: " > ".join(map(str, x)))
+        out["sequence_length"] = out.sequence.map(len)
+        return out
+
+    return _gp3_aoi_r_sequences(
+        data,
+        aoi_col=aoi_col,
+        time_col="time" if time_col is None else time_col,
+        group_cols=("subject", "MEDIA_ID", "trial_global") if group_cols is None else group_cols,
+        include_non_aoi=True if include_non_aoi is _GP3_R_UNSET else include_non_aoi,
+        non_aoi_values=_GP3_AOI_NON_VALUES if non_aoi_values is _GP3_R_UNSET else non_aoi_values,
+        missing_aoi_label="missing_aoi" if missing_aoi_label is _GP3_R_UNSET else missing_aoi_label,
+        include_terminal=True if include_terminal is _GP3_R_UNSET else include_terminal,
+    )
+
+
+def summarise_gazepoint_aoi_entries(
+    data,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    *,
+    include_non_aoi=_GP3_R_UNSET,
+    non_aoi_values=_GP3_R_UNSET,
+    missing_aoi_label=_GP3_R_UNSET,
+) -> pd.DataFrame:
+    r_mode = any(
+        value is not _GP3_R_UNSET for value in (include_non_aoi, non_aoi_values, missing_aoi_label)
+    )
+    if not r_mode:
+        seq, groups = _sequence_frame(data, aoi_col, group_cols, time_col, collapse_repeats=True)
+        rows = []
+        for _, row in seq.iterrows():
+            base = {column: row[column] for column in groups}
+            counts = Counter(row.sequence)
+            for aoi, count in counts.items():
+                rows.append({**base, "aoi": aoi, "n_entries": count})
+        return pd.DataFrame(rows)
+
+    return _gp3_aoi_r_entries(
+        data,
+        aoi_col=aoi_col,
+        time_col="time" if time_col is None else time_col,
+        group_cols=("subject", "MEDIA_ID", "trial_global") if group_cols is None else group_cols,
+        include_non_aoi=True if include_non_aoi is _GP3_R_UNSET else include_non_aoi,
+        non_aoi_values=_GP3_AOI_NON_VALUES if non_aoi_values is _GP3_R_UNSET else non_aoi_values,
+        missing_aoi_label="missing_aoi" if missing_aoi_label is _GP3_R_UNSET else missing_aoi_label,
+    )
 
 
 def summarise_gazepoint_aoi_transitions(
-    data, aoi_col=None, group_cols=None, time_col=None, include_self=False
+    data,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    include_self=False,
+    *,
+    include_non_aoi=_GP3_R_UNSET,
+    target_aoi_values=_GP3_R_UNSET,
+    distractor_aoi_values=_GP3_R_UNSET,
+    non_aoi_values=_GP3_R_UNSET,
+    missing_aoi_label=_GP3_R_UNSET,
 ) -> pd.DataFrame:
-    seq, groups = _sequence_frame(
-        data, aoi_col, group_cols, time_col, collapse_repeats=not include_self
+    r_mode = any(
+        value is not _GP3_R_UNSET
+        for value in (
+            include_non_aoi,
+            target_aoi_values,
+            distractor_aoi_values,
+            non_aoi_values,
+            missing_aoi_label,
+        )
     )
-    rows = []
-    for _, r in seq.iterrows():
-        base = {c: r[c] for c in groups}
-        s = r.sequence
-        for a, b in zip(s[:-1], s[1:], strict=False):
-            if include_self or a != b:
-                rows.append({**base, "from_aoi": a, "to_aoi": b})
-    if not rows:
-        return pd.DataFrame(columns=groups + ["from_aoi", "to_aoi", "n_transitions"])
-    return (
-        pd.DataFrame(rows)
-        .groupby(groups + ["from_aoi", "to_aoi"], dropna=False)
-        .size()
-        .rename("n_transitions")
-        .reset_index()
+    if not r_mode:
+        seq, groups = _sequence_frame(
+            data,
+            aoi_col,
+            group_cols,
+            time_col,
+            collapse_repeats=not include_self,
+        )
+        rows = []
+        for _, row in seq.iterrows():
+            base = {column: row[column] for column in groups}
+            values = row.sequence
+            for from_aoi, to_aoi in zip(values[:-1], values[1:], strict=False):
+                if include_self or from_aoi != to_aoi:
+                    rows.append({**base, "from_aoi": from_aoi, "to_aoi": to_aoi})
+        if not rows:
+            return pd.DataFrame(columns=groups + ["from_aoi", "to_aoi", "n_transitions"])
+        return (
+            pd.DataFrame(rows)
+            .groupby(groups + ["from_aoi", "to_aoi"], dropna=False)
+            .size()
+            .rename("n_transitions")
+            .reset_index()
+        )
+
+    groups = ("subject", "MEDIA_ID", "trial_global") if group_cols is None else group_cols
+    groups = _gp3_aoi_r_list(groups, allow_none=False, unique=True, name="group_cols")
+    include_non_aoi = True if include_non_aoi is _GP3_R_UNSET else include_non_aoi
+    target_aoi_values = None if target_aoi_values is _GP3_R_UNSET else target_aoi_values
+    distractor_aoi_values = None if distractor_aoi_values is _GP3_R_UNSET else distractor_aoi_values
+    non_aoi_values = _GP3_AOI_NON_VALUES if non_aoi_values is _GP3_R_UNSET else non_aoi_values
+    missing_aoi_label = "missing_aoi" if missing_aoi_label is _GP3_R_UNSET else missing_aoi_label
+    target_values = {
+        str(v).strip().lower() for v in _gp3_aoi_r_list(target_aoi_values, name="target_aoi_values")
+    }
+    distractor_values = {
+        str(v).strip().lower()
+        for v in _gp3_aoi_r_list(distractor_aoi_values, name="distractor_aoi_values")
+    }
+    background_values = {
+        str(v).strip().lower()
+        for v in _gp3_aoi_r_list(non_aoi_values, allow_none=False, name="non_aoi_values")
+    }
+    target_defined = bool(target_values)
+    distractor_defined = bool(distractor_values)
+
+    frame = ensure_dataframe(data, copy=False)
+    sequence_columns = {
+        "aoi_state",
+        "transition_from",
+        "transition_to",
+        "dwell_before_transition_ms",
+        "is_terminal_state",
+    }
+    if sequence_columns.issubset(frame.columns):
+        sequences = frame.copy()
+    else:
+        sequences = _gp3_aoi_r_sequences(
+            frame,
+            aoi_col=aoi_col,
+            time_col="time" if time_col is None else time_col,
+            group_cols=groups,
+            include_non_aoi=include_non_aoi,
+            non_aoi_values=non_aoi_values,
+            missing_aoi_label=missing_aoi_label,
+            include_terminal=True,
+        )
+    required = [
+        *groups,
+        "aoi_state",
+        "transition_from",
+        "transition_to",
+        "entry_duration_ms",
+        "dwell_before_transition_ms",
+        "is_non_aoi",
+        "is_terminal_state",
+    ]
+    missing = [col for col in required if col not in sequences.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+    if sequences.empty:
+        raise ValueError("No AOI sequence rows are available")
+
+    sequences = sequences.copy()
+    sequences["entry_duration_ms"] = pd.to_numeric(sequences["entry_duration_ms"], errors="coerce")
+    sequences["dwell_before_transition_ms"] = pd.to_numeric(
+        sequences["dwell_before_transition_ms"], errors="coerce"
     )
+    sequences["is_non_aoi"] = sequences["is_non_aoi"].astype("boolean").fillna(False).astype(bool)
+    sequences["is_terminal_state"] = (
+        sequences["is_terminal_state"].astype("boolean").fillna(False).astype(bool)
+    )
+
+    def classify(value):
+        if pd.isna(value):
+            return pd.NA
+        norm = str(value).strip().lower()
+        if target_defined and norm in target_values:
+            return "target"
+        if distractor_defined and norm in distractor_values:
+            return "distractor"
+        if norm in background_values:
+            return "background"
+        return "other"
+
+    state_rows = []
+    for key, block in _gp3_aoi_r_summary_group_rows(sequences, groups):
+        if not groups:
+            base = {}
+        else:
+            key = key if isinstance(key, tuple) else (key,)
+            base = dict(zip(groups, key, strict=True))
+        dwell = pd.to_numeric(block["entry_duration_ms"], errors="coerce")
+        state_rows.append(
+            {
+                **base,
+                "n_states": int(len(block)),
+                "n_aoi_states": int((~block["is_non_aoi"]).sum()),
+                "n_non_aoi_states": int(block["is_non_aoi"].sum()),
+                "total_state_dwell_ms": float(dwell.sum(skipna=True)),
+                "mean_state_dwell_ms": float(dwell.mean()) if dwell.notna().any() else np.nan,
+            }
+        )
+    state_summary = pd.DataFrame(state_rows)
+
+    transitions = sequences.loc[
+        (~sequences["is_terminal_state"]) & sequences["transition_to"].notna()
+    ].copy()
+    transition_rows = []
+    for key, block in _gp3_aoi_r_summary_group_rows(transitions, groups):
+        if not groups:
+            base = {}
+        else:
+            key = key if isinstance(key, tuple) else (key,)
+            base = dict(zip(groups, key, strict=True))
+        from_class = block["transition_from"].map(classify)
+        to_class = block["transition_to"].map(classify)
+        self_reentry = block["transition_from"].eq(block["transition_to"])
+        dwell = pd.to_numeric(block["dwell_before_transition_ms"], errors="coerce")
+        transition_rows.append(
+            {
+                **base,
+                "total_transitions": int(len(block)),
+                "self_reentries": int(self_reentry.fillna(False).sum()),
+                "target_to_distractor": int(
+                    ((from_class == "target") & (to_class == "distractor")).sum()
+                ),
+                "distractor_to_target": int(
+                    ((from_class == "distractor") & (to_class == "target")).sum()
+                ),
+                "background_to_target": int(
+                    ((from_class == "background") & (to_class == "target")).sum()
+                ),
+                "target_to_background": int(
+                    ((from_class == "target") & (to_class == "background")).sum()
+                ),
+                "background_to_distractor": int(
+                    ((from_class == "background") & (to_class == "distractor")).sum()
+                ),
+                "distractor_to_background": int(
+                    ((from_class == "distractor") & (to_class == "background")).sum()
+                ),
+                "target_to_target": int(((from_class == "target") & (to_class == "target")).sum()),
+                "distractor_to_distractor": int(
+                    ((from_class == "distractor") & (to_class == "distractor")).sum()
+                ),
+                "other_transitions": int(((from_class == "other") | (to_class == "other")).sum()),
+                "total_pre_transition_dwell_ms": float(dwell.sum(skipna=True)),
+                "mean_pre_transition_dwell_ms": float(dwell.mean())
+                if dwell.notna().any()
+                else np.nan,
+                "median_pre_transition_dwell_ms": float(dwell.median())
+                if dwell.notna().any()
+                else np.nan,
+                "max_pre_transition_dwell_ms": float(dwell.max())
+                if dwell.notna().any()
+                else np.nan,
+            }
+        )
+    transition_summary = pd.DataFrame(transition_rows)
+    if transition_summary.empty:
+        transition_summary = state_summary.loc[:, groups].copy() if groups else pd.DataFrame([{}])
+        zero_counts = [
+            "total_transitions",
+            "self_reentries",
+            "target_to_distractor",
+            "distractor_to_target",
+            "background_to_target",
+            "target_to_background",
+            "background_to_distractor",
+            "distractor_to_background",
+            "target_to_target",
+            "distractor_to_distractor",
+            "other_transitions",
+        ]
+        for col in zero_counts:
+            transition_summary[col] = 0
+        transition_summary["total_pre_transition_dwell_ms"] = 0.0
+        transition_summary["mean_pre_transition_dwell_ms"] = np.nan
+        transition_summary["median_pre_transition_dwell_ms"] = np.nan
+        transition_summary["max_pre_transition_dwell_ms"] = np.nan
+    out = (
+        state_summary.merge(transition_summary, on=groups, how="left")
+        if groups
+        else pd.concat(
+            [state_summary.reset_index(drop=True), transition_summary.reset_index(drop=True)],
+            axis=1,
+        )
+    )
+    count_cols = [
+        "total_transitions",
+        "self_reentries",
+        "target_to_distractor",
+        "distractor_to_target",
+        "background_to_target",
+        "target_to_background",
+        "background_to_distractor",
+        "distractor_to_background",
+        "target_to_target",
+        "distractor_to_distractor",
+        "other_transitions",
+    ]
+    for col in count_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+    out["total_pre_transition_dwell_ms"] = pd.to_numeric(
+        out["total_pre_transition_dwell_ms"], errors="coerce"
+    ).fillna(0.0)
+    out["target_aoi_defined"] = target_defined
+    out["distractor_aoi_defined"] = distractor_defined
+    statuses = []
+    for _, row in out.iterrows():
+        if row["total_transitions"] == 0:
+            statuses.append("no_transitions")
+        elif not target_defined and not distractor_defined:
+            statuses.append("no_target_or_distractor_defined")
+        elif not target_defined:
+            statuses.append("no_target_defined")
+        elif not distractor_defined:
+            statuses.append("no_distractor_defined")
+        else:
+            statuses.append("ok")
+    out["transition_feature_status"] = statuses
+    return out
 
 
 def compute_transition_matrix(
@@ -3139,35 +3734,527 @@ def compute_gazepoint_aoi_transition_matrix(
     time_col=None,
     normalize=False,
     include_self=True,
+    *,
+    by_cols=_GP3_R_UNSET,
+    include_non_aoi=_GP3_R_UNSET,
+    include_self_transitions=_GP3_R_UNSET,
+    states=_GP3_R_UNSET,
+    time_window=_GP3_R_UNSET,
+    non_aoi_values=_GP3_R_UNSET,
+    missing_aoi_label=_GP3_R_UNSET,
 ):
-    if data is None:
-        return compute_transition_matrix(sequence or [], normalize)
-    seq, groups = _sequence_frame(
-        data, aoi_col, group_cols, time_col, collapse_repeats=not include_self
+    r_mode = any(
+        value is not _GP3_R_UNSET
+        for value in (
+            by_cols,
+            include_non_aoi,
+            include_self_transitions,
+            states,
+            time_window,
+            non_aoi_values,
+            missing_aoi_label,
+        )
     )
-    if not groups:
-        return compute_transition_matrix(seq.iloc[0].sequence if len(seq) else [], normalize)
-    rows = []
-    for _, r in seq.iterrows():
-        m = compute_transition_matrix(r.sequence, normalize).stack().rename("value").reset_index()
-        for c in groups:
-            m[c] = r[c]
-        rows.append(m)
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if not r_mode:
+        if data is None:
+            return compute_transition_matrix(sequence or [], normalize)
+        seq, groups = _sequence_frame(
+            data,
+            aoi_col,
+            group_cols,
+            time_col,
+            collapse_repeats=not include_self,
+        )
+        if not groups:
+            return compute_transition_matrix(seq.iloc[0].sequence if len(seq) else [], normalize)
+        rows = []
+        for _, row in seq.iterrows():
+            matrix = (
+                compute_transition_matrix(row.sequence, normalize)
+                .stack()
+                .rename("value")
+                .reset_index()
+            )
+            for column in groups:
+                matrix[column] = row[column]
+            rows.append(matrix)
+        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+    if data is None:
+        raise ValueError("data must be supplied for R-compatible transition matrices")
+    groups = ("subject", "MEDIA_ID", "trial_global") if group_cols is None else group_cols
+    groups = _gp3_aoi_r_list(groups, allow_none=False, unique=True, name="group_cols")
+    by = None if by_cols is _GP3_R_UNSET else by_cols
+    by = _gp3_aoi_r_list(by, unique=True, name="by_cols")
+    matrix_groups = list(dict.fromkeys([*groups, *by]))
+    include_non_aoi = True if include_non_aoi is _GP3_R_UNSET else include_non_aoi
+    include_self_transitions = (
+        True if include_self_transitions is _GP3_R_UNSET else include_self_transitions
+    )
+    states_arg = None if states is _GP3_R_UNSET else states
+    time_window_arg = None if time_window is _GP3_R_UNSET else time_window
+    non_aoi_values = _GP3_AOI_NON_VALUES if non_aoi_values is _GP3_R_UNSET else non_aoi_values
+    missing_aoi_label = "missing_aoi" if missing_aoi_label is _GP3_R_UNSET else missing_aoi_label
+    if not isinstance(include_self_transitions, (bool, np.bool_)):
+        raise ValueError("include_self_transitions must be TRUE or FALSE")
+    if states_arg is not None:
+        states_arg = _gp3_aoi_r_list(states_arg, allow_none=False, unique=True, name="states")
+    if time_window_arg is not None:
+        try:
+            tw = np.asarray(list(time_window_arg), dtype=float)
+        except Exception as exc:
+            raise ValueError("time_window must be a finite numeric vector of length 2") from exc
+        if tw.shape != (2,) or not np.isfinite(tw).all():
+            raise ValueError("time_window must be a finite numeric vector of length 2")
+        time_window_arg = tw
+
+    frame = ensure_dataframe(data, copy=False)
+    sequence_columns = {
+        "aoi_state",
+        "transition_from",
+        "transition_to",
+        "entry_start_time",
+        "is_terminal_state",
+    }
+    if sequence_columns.issubset(frame.columns):
+        sequences = frame.copy()
+    else:
+        sequences = _gp3_aoi_r_sequences(
+            frame,
+            aoi_col=aoi_col,
+            time_col="time" if time_col is None else time_col,
+            group_cols=matrix_groups,
+            include_non_aoi=include_non_aoi,
+            non_aoi_values=non_aoi_values,
+            missing_aoi_label=missing_aoi_label,
+            include_terminal=True,
+        )
+    required = [
+        *matrix_groups,
+        "aoi_state",
+        "transition_from",
+        "transition_to",
+        "entry_start_time",
+        "is_terminal_state",
+    ]
+    missing = [col for col in required if col not in sequences.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+    if time_window_arg is not None:
+        start = pd.to_numeric(sequences["entry_start_time"], errors="coerce")
+        lo, hi = sorted(time_window_arg.tolist())
+        sequences = sequences.loc[(start >= lo) & (start <= hi)].copy()
+        if sequences.empty:
+            raise ValueError("No AOI sequence rows remain after applying time_window")
+    transitions = sequences.loc[
+        (~sequences["is_terminal_state"].astype("boolean").fillna(False))
+        & sequences["transition_from"].notna()
+        & sequences["transition_to"].notna()
+    ].copy()
+    if not include_self_transitions:
+        transitions = transitions.loc[
+            ~transitions["transition_from"].eq(transitions["transition_to"])
+        ].copy()
+    if states_arg is None:
+        values = []
+        for col in ["aoi_state", "transition_from", "transition_to"]:
+            for value in sequences[col].tolist():
+                if pd.notna(value) and str(value):
+                    if value not in values:
+                        values.append(value)
+        state_values = [str(v) for v in values]
+    else:
+        state_values = list(states_arg)
+    if not state_values:
+        raise ValueError("No AOI states are available for matrix construction")
+
+    if transitions.empty:
+        long_table = pd.DataFrame(columns=[*by, "from", "to", "n", "row_total", "prob"])
+    else:
+        tmp = transitions.copy()
+        tmp["from"] = tmp["transition_from"].astype(str)
+        tmp["to"] = tmp["transition_to"].astype(str)
+        count_cols = [*by, "from", "to"]
+        long_table = (
+            tmp.groupby(count_cols, dropna=False, sort=False).size().rename("n").reset_index()
+        )
+        denom_cols = [*by, "from"]
+        if denom_cols:
+            long_table["row_total"] = long_table.groupby(denom_cols, dropna=False, sort=False)[
+                "n"
+            ].transform("sum")
+        else:
+            long_table["row_total"] = long_table["n"].sum()
+        long_table["prob"] = long_table["n"] / long_table["row_total"]
+
+    def make_matrix(table, value_col):
+        matrix = pd.DataFrame(0.0, index=state_values, columns=state_values)
+        matrix.index.name = "from"
+        matrix.columns.name = "to"
+        for _, row in table.iterrows():
+            from_state = str(row["from"])
+            to_state = str(row["to"])
+            if from_state in matrix.index and to_state in matrix.columns:
+                matrix.loc[from_state, to_state] = row[value_col]
+        if value_col == "n":
+            matrix = matrix.astype(int)
+        return matrix
+
+    if not by:
+        count_matrix = make_matrix(long_table, "n")
+        probability_matrix = make_matrix(long_table, "prob")
+        count_matrices = None
+        probability_matrices = None
+    else:
+        count_matrix = None
+        probability_matrix = None
+        count_matrices = {}
+        probability_matrices = {}
+        keys = sequences.loc[:, by].drop_duplicates(ignore_index=True)
+        for _, key_row in keys.iterrows():
+            mask = pd.Series(True, index=long_table.index)
+            labels = []
+            for col in by:
+                value = key_row[col]
+                labels.append(f"{col}={'NA' if pd.isna(value) else value}")
+                mask &= long_table[col].isna() if pd.isna(value) else long_table[col].eq(value)
+            label = " | ".join(labels)
+            this_long = long_table.loc[mask].copy()
+            count_matrices[label] = make_matrix(this_long, "n")
+            probability_matrices[label] = make_matrix(this_long, "prob")
+    return {
+        "count_matrix": count_matrix,
+        "probability_matrix": probability_matrix,
+        "count_matrices": count_matrices,
+        "probability_matrices": probability_matrices,
+        "long_table": long_table,
+        "states": state_values,
+        "settings": {
+            "group_cols": groups,
+            "by_cols": by,
+            "include_non_aoi": bool(include_non_aoi),
+            "include_self_transitions": bool(include_self_transitions),
+            "time_window": None if time_window_arg is None else time_window_arg.tolist(),
+        },
+        "_gp3_class": "gp3_aoi_transition_matrix",
+    }
 
 
 def compute_gazepoint_time_varying_transition_matrix(
-    data, aoi_col=None, time_col=None, bin_width=500, group_cols=None, normalize=False
-) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    time_col = infer_column(df, "time", time_col, required=True)
-    t = finite_numeric(df[time_col])
-    df["_time_bin"] = (np.floor(t / bin_width) * bin_width).astype("Int64")
-    groups = normalize_group_cols(df, group_cols) + ["_time_bin"]
-    out = compute_gazepoint_aoi_transition_matrix(
-        df, aoi_col=aoi_col, group_cols=groups, time_col=time_col, normalize=normalize
+    data,
+    aoi_col=None,
+    time_col=None,
+    bin_width=500,
+    group_cols=None,
+    normalize=False,
+    *,
+    from_col=_GP3_R_UNSET,
+    to_col=_GP3_R_UNSET,
+    window_col=_GP3_R_UNSET,
+    window_size_ms=_GP3_R_UNSET,
+    by_cols=_GP3_R_UNSET,
+    count_col=_GP3_R_UNSET,
+    states=_GP3_R_UNSET,
+    complete_states=_GP3_R_UNSET,
+    drop_self_transitions=_GP3_R_UNSET,
+    normalise=_GP3_R_UNSET,
+    name=_GP3_R_UNSET,
+):
+    r_mode = any(
+        value is not _GP3_R_UNSET
+        for value in (
+            from_col,
+            to_col,
+            window_col,
+            window_size_ms,
+            by_cols,
+            count_col,
+            states,
+            complete_states,
+            drop_self_transitions,
+            normalise,
+            name,
+        )
     )
-    return out.rename(columns={"_time_bin": "time_bin"})
+    if not r_mode:
+        df = ensure_dataframe(data)
+        time_col = infer_column(df, "time", time_col, required=True)
+        time_values = finite_numeric(df[time_col])
+        df["_time_bin"] = (np.floor(time_values / bin_width) * bin_width).astype("Int64")
+        groups = normalize_group_cols(df, group_cols) + ["_time_bin"]
+        out = compute_gazepoint_aoi_transition_matrix(
+            df,
+            aoi_col=aoi_col,
+            group_cols=groups,
+            time_col=time_col,
+            normalize=normalize,
+        )
+        return out.rename(columns={"_time_bin": "time_bin"})
+
+    df = ensure_dataframe(data, copy=False)
+    if df.empty:
+        raise ValueError("data must contain at least one row")
+
+    def resolve(value, candidates, arg, required=True):
+        if value is not _GP3_R_UNSET and value is not None:
+            value = _gp3_aoi_r_scalar_label(value, arg)
+            if value not in df.columns:
+                raise ValueError(f"{arg} must be present in data")
+            return value
+        found = next((candidate for candidate in candidates if candidate in df.columns), None)
+        if found is None and required:
+            raise ValueError(f"{arg} could not be detected and must be supplied")
+        return found
+
+    from_resolved = resolve(
+        from_col,
+        ("from_aoi", "from_state", "from", "origin", "previous_aoi", "previous_state", "AOI_from"),
+        "from_col",
+    )
+    to_resolved = resolve(
+        to_col,
+        ("to_aoi", "to_state", "to", "destination", "next_aoi", "next_state", "AOI_to"),
+        "to_col",
+    )
+    window_resolved = None
+    if window_col is not _GP3_R_UNSET and window_col is not None:
+        window_resolved = resolve(window_col, (), "window_col")
+    time_resolved = None
+    if time_col is not None:
+        time_resolved = resolve(time_col, (), "time_col")
+    if window_resolved is None:
+        time_resolved = resolve(
+            time_resolved if time_resolved is not None else _GP3_R_UNSET,
+            (
+                "time",
+                "time_ms",
+                "timestamp",
+                "TIMESTAMP",
+                "TIME",
+                "sample_time",
+                "transition_time",
+                "transition_start_time",
+            ),
+            "time_col",
+        )
+        width = None if window_size_ms is _GP3_R_UNSET else window_size_ms
+        if (
+            isinstance(width, (bool, np.bool_))
+            or not isinstance(width, (int, float, np.integer, np.floating))
+            or not np.isfinite(width)
+            or width <= 0
+        ):
+            raise ValueError("window_size_ms must be a finite positive number")
+        width = float(width)
+    else:
+        width = None if window_size_ms is _GP3_R_UNSET else window_size_ms
+
+    by = (
+        []
+        if by_cols is _GP3_R_UNSET or by_cols is None
+        else _gp3_aoi_r_list(by_cols, allow_none=False, name="by_cols")
+    )
+    missing_by = [col for col in by if col not in df.columns]
+    if missing_by:
+        raise ValueError("All by_cols must be present in data")
+    count_resolved = None
+    if count_col is not _GP3_R_UNSET and count_col is not None:
+        count_resolved = resolve(count_col, (), "count_col")
+    states_arg = None if states is _GP3_R_UNSET else states
+    complete = True if complete_states is _GP3_R_UNSET else complete_states
+    drop_self = False if drop_self_transitions is _GP3_R_UNSET else drop_self_transitions
+    norm = "row" if normalise is _GP3_R_UNSET else normalise
+    object_name = "gazepoint_time_varying_transition_matrix" if name is _GP3_R_UNSET else name
+    if not isinstance(complete, (bool, np.bool_)):
+        raise ValueError("complete_states must be TRUE or FALSE")
+    if not isinstance(drop_self, (bool, np.bool_)):
+        raise ValueError("drop_self_transitions must be TRUE or FALSE")
+    if norm not in {"row", "global", "none"}:
+        raise ValueError("normalise must be one of: row, global, none")
+    object_name = _gp3_aoi_r_scalar_label(object_name, "name")
+
+    tmp = df.copy()
+    tmp[".gp3_from"] = tmp[from_resolved].astype("string")
+    tmp[".gp3_to"] = tmp[to_resolved].astype("string")
+    tmp[".gp3_from"] = tmp[".gp3_from"].mask(tmp[".gp3_from"].isna() | tmp[".gp3_from"].eq(""))
+    tmp[".gp3_to"] = tmp[".gp3_to"].mask(tmp[".gp3_to"].isna() | tmp[".gp3_to"].eq(""))
+    tmp = tmp.loc[tmp[".gp3_from"].notna() & tmp[".gp3_to"].notna()].copy()
+    if tmp.empty:
+        raise ValueError("No valid non-missing transitions were found")
+    if states_arg is None:
+        state_values = sorted(set(tmp[".gp3_from"].astype(str)) | set(tmp[".gp3_to"].astype(str)))
+    else:
+        state_values = list(
+            dict.fromkeys(_gp3_aoi_r_list(states_arg, allow_none=False, name="states"))
+        )
+    tmp = tmp.loc[tmp[".gp3_from"].isin(state_values) & tmp[".gp3_to"].isin(state_values)].copy()
+    if drop_self:
+        tmp = tmp.loc[~tmp[".gp3_from"].eq(tmp[".gp3_to"])].copy()
+    if tmp.empty:
+        raise ValueError("No transitions remain after applying states and drop_self_transitions")
+    if count_resolved is None:
+        tmp[".gp3_transition_count"] = 1.0
+    else:
+        counts = pd.to_numeric(tmp[count_resolved], errors="coerce")
+        if counts.isna().any() or (~np.isfinite(counts)).any() or (counts < 0).any():
+            raise ValueError("count_col must contain finite non-negative values")
+        tmp[".gp3_transition_count"] = counts.to_numpy(float)
+    if window_resolved is not None:
+        labels = tmp[window_resolved].astype("string")
+        tmp[".gp3_time_window"] = labels.mask(
+            labels.isna() | labels.eq(""), "missing_window"
+        ).astype(object)
+        tmp[".gp3_time_window_start"] = np.nan
+        tmp[".gp3_time_window_end"] = np.nan
+    else:
+        time_values = pd.to_numeric(tmp[time_resolved], errors="coerce")
+        if time_values.isna().any() or (~np.isfinite(time_values)).any():
+            raise ValueError(
+                "time_col must contain finite numeric values when constructing time windows"
+            )
+        min_time = float(time_values.min())
+        idx = np.floor((time_values - min_time) / width)
+        tmp[".gp3_time_window_start"] = min_time + idx * width
+        tmp[".gp3_time_window_end"] = tmp[".gp3_time_window_start"] + width
+        tmp[".gp3_time_window"] = (
+            tmp[".gp3_time_window_start"].map(lambda v: f"{v:g}")
+            + "-"
+            + tmp[".gp3_time_window_end"].map(lambda v: f"{v:g}")
+        )
+
+    window_cols = [*by, ".gp3_time_window", ".gp3_time_window_start", ".gp3_time_window_end"]
+    count_groups = [*window_cols, ".gp3_from", ".gp3_to"]
+    matrix_long = (
+        tmp.groupby(count_groups, dropna=False, sort=False)
+        .agg(
+            transition_count=(".gp3_transition_count", "sum"),
+            n_transition_rows=(".gp3_transition_count", "size"),
+        )
+        .reset_index()
+    )
+    if complete:
+        windows = tmp.loc[:, window_cols].drop_duplicates(ignore_index=True)
+        pairs = pd.MultiIndex.from_product(
+            [state_values, state_values], names=[".gp3_from", ".gp3_to"]
+        ).to_frame(index=False)
+        if drop_self:
+            pairs = pairs.loc[~pairs[".gp3_from"].eq(pairs[".gp3_to"])].reset_index(drop=True)
+        windows["_key"] = 1
+        pairs["_key"] = 1
+        grid = windows.merge(pairs, on="_key", how="outer").drop(columns="_key")
+        matrix_long = grid.merge(matrix_long, on=count_groups, how="left")
+        matrix_long["transition_count"] = matrix_long["transition_count"].fillna(0.0)
+        matrix_long["n_transition_rows"] = matrix_long["n_transition_rows"].fillna(0).astype(int)
+    if norm == "row":
+        denom_groups = [*window_cols, ".gp3_from"]
+        matrix_long["transition_denominator"] = matrix_long.groupby(
+            denom_groups, dropna=False, sort=False
+        )["transition_count"].transform("sum")
+        matrix_long["transition_probability"] = np.where(
+            matrix_long["transition_denominator"] > 0,
+            matrix_long["transition_count"] / matrix_long["transition_denominator"],
+            np.nan,
+        )
+    elif norm == "global":
+        matrix_long["transition_denominator"] = matrix_long.groupby(
+            window_cols, dropna=False, sort=False
+        )["transition_count"].transform("sum")
+        matrix_long["transition_probability"] = np.where(
+            matrix_long["transition_denominator"] > 0,
+            matrix_long["transition_count"] / matrix_long["transition_denominator"],
+            np.nan,
+        )
+    else:
+        matrix_long["transition_denominator"] = np.nan
+        matrix_long["transition_probability"] = np.nan
+
+    count_wide = matrix_long.pivot_table(
+        index=[*window_cols, ".gp3_from"],
+        columns=".gp3_to",
+        values="transition_count",
+        aggfunc="first",
+        fill_value=0,
+        dropna=False,
+    ).reset_index()
+    count_wide.columns.name = None
+    probability_wide = matrix_long.pivot_table(
+        index=[*window_cols, ".gp3_from"],
+        columns=".gp3_to",
+        values="transition_probability",
+        aggfunc="first",
+        dropna=False,
+    ).reset_index()
+    probability_wide.columns.name = None
+    time_windows = matrix_long.loc[:, window_cols].drop_duplicates(ignore_index=True)
+    time_windows = time_windows.sort_values(
+        [".gp3_time_window_start", ".gp3_time_window"], kind="stable", na_position="last"
+    ).reset_index(drop=True)
+    overview = pd.DataFrame(
+        [
+            {
+                "object_name": object_name,
+                "n_input_rows": int(len(df)),
+                "n_rows_used": int(len(tmp)),
+                "n_states": int(len(state_values)),
+                "n_time_windows": int(matrix_long[".gp3_time_window"].nunique(dropna=False)),
+                "n_by_groups": int(tmp.loc[:, by].drop_duplicates().shape[0]) if by else 1,
+                "n_matrix_rows": int(len(matrix_long)),
+                "total_transition_count": float(matrix_long["transition_count"].sum()),
+                "normalise": norm,
+                "complete_states": bool(complete),
+                "drop_self_transitions": bool(drop_self),
+            }
+        ]
+    )
+
+    def collapse(value):
+        if value is None or value is _GP3_R_UNSET:
+            return pd.NA
+        if isinstance(value, (list, tuple, set)):
+            return ", ".join(map(str, value)) if value else pd.NA
+        return str(value)
+
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "from_col",
+                "to_col",
+                "time_col",
+                "window_col",
+                "window_size_ms",
+                "by_cols",
+                "count_col",
+                "states",
+                "complete_states",
+                "drop_self_transitions",
+                "normalise",
+                "name",
+            ],
+            "value": [
+                from_resolved,
+                to_resolved,
+                collapse(time_resolved),
+                collapse(window_resolved),
+                collapse(width),
+                collapse(by),
+                collapse(count_resolved),
+                collapse(state_values),
+                str(bool(complete)).upper(),
+                str(bool(drop_self)).upper(),
+                norm,
+                object_name,
+            ],
+        }
+    )
+    return {
+        "overview": overview,
+        "time_windows": time_windows,
+        "matrix_long": matrix_long.reset_index(drop=True),
+        "count_wide": count_wide,
+        "probability_wide": probability_wide,
+        "settings": settings,
+        "_gp3_class": "gp3_time_varying_transition_matrix",
+    }
 
 
 def compute_gazepoint_aoi_entropy(
@@ -4631,32 +5718,471 @@ def flag_gazepoint_sequence_anomalies(
 
 
 def summarise_gazepoint_aoi_trial_features(
-    data, aoi_col=None, trial_col=None, group_cols=None
+    data,
+    aoi_col=None,
+    trial_col=None,
+    group_cols=None,
+    *,
+    time_col="time",
+    include_non_aoi=True,
+    target_aoi_values=None,
+    distractor_aoi_values=None,
+    non_aoi_values=_GP3_AOI_NON_VALUES,
+    missing_aoi_label="missing_aoi",
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    trial_col = infer_column(df, "trial", trial_col, required=True)
-    groups = normalize_group_cols(df, group_cols) + [trial_col]
-    s = summarise_aoi_samples(df, aoi_col=aoi_col, group_cols=groups)
-    return s
+    if trial_col is not None:
+        df = ensure_dataframe(data, copy=False)
+        trial_col = infer_column(df, "trial", trial_col, required=True)
+        groups = normalize_group_cols(df, group_cols) + [trial_col]
+        return summarise_aoi_samples(df, aoi_col=aoi_col, group_cols=groups)
+
+    groups = ("subject", "MEDIA_ID", "trial_global") if group_cols is None else group_cols
+    groups = _gp3_aoi_r_list(groups, allow_none=False, unique=True, name="group_cols")
+    frame = ensure_dataframe(data, copy=False)
+    entry_columns = {
+        "aoi_state",
+        "entry_start_time",
+        "entry_end_time",
+        "entry_duration_ms",
+        "n_samples",
+    }
+    if entry_columns.issubset(frame.columns):
+        entries = frame.copy()
+        missing = [col for col in [*groups, *entry_columns] if col not in entries.columns]
+        if missing:
+            raise ValueError("Missing required columns: " + ", ".join(missing))
+    else:
+        entries = _gp3_aoi_r_entries(
+            frame,
+            aoi_col=aoi_col,
+            time_col=time_col,
+            group_cols=groups,
+            include_non_aoi=True,
+            non_aoi_values=non_aoi_values,
+            missing_aoi_label=missing_aoi_label,
+        )
+    if entries.empty:
+        raise ValueError("No AOI entries are available")
+    target_values = {
+        str(v).strip().lower() for v in _gp3_aoi_r_list(target_aoi_values, name="target_aoi_values")
+    }
+    distractor_values = {
+        str(v).strip().lower()
+        for v in _gp3_aoi_r_list(distractor_aoi_values, name="distractor_aoi_values")
+    }
+    background_values = {
+        str(v).strip().lower()
+        for v in _gp3_aoi_r_list(non_aoi_values, allow_none=False, name="non_aoi_values")
+    }
+    target_defined = bool(target_values)
+    distractor_defined = bool(distractor_values)
+    entries = entries.copy()
+    state = entries["aoi_state"].astype("string").str.strip()
+    entries["aoi_state"] = state.mask(state.isna() | state.eq(""), missing_aoi_label).astype(object)
+    for col in ["entry_start_time", "entry_end_time", "entry_duration_ms"]:
+        entries[col] = pd.to_numeric(entries[col], errors="coerce")
+    entries["n_samples"] = pd.to_numeric(entries["n_samples"], errors="coerce")
+    entries = entries.loc[entries["entry_start_time"].notna()].copy()
+    fallback_non = entries["aoi_state"].astype(str).str.strip().str.lower().isin(background_values)
+    if "is_non_aoi" not in entries:
+        entries["is_non_aoi"] = fallback_non
+    else:
+        entries["is_non_aoi"] = (
+            entries["is_non_aoi"]
+            .astype("boolean")
+            .fillna(pd.Series(fallback_non, index=entries.index))
+            .astype(bool)
+        )
+    if not include_non_aoi:
+        entries = entries.loc[~entries["is_non_aoi"]].copy()
+    if entries.empty:
+        raise ValueError("No AOI entries remain after applying include_non_aoi")
+
+    def classify(row):
+        if row["is_non_aoi"]:
+            return "background"
+        norm = str(row["aoi_state"]).strip().lower()
+        if target_defined and norm in target_values:
+            return "target"
+        if distractor_defined and norm in distractor_values:
+            return "distractor"
+        return "other_aoi"
+
+    entries["state_class"] = entries.apply(classify, axis=1)
+    sort_cols = [*groups, "entry_start_time"] if groups else ["entry_start_time"]
+    entries = entries.sort_values(sort_cols, kind="stable")
+
+    rows = []
+    for key, block in _gp3_aoi_r_summary_group_rows(entries, groups):
+        base = {}
+        if groups:
+            key = key if isinstance(key, tuple) else (key,)
+            base = dict(zip(groups, key, strict=True))
+        duration = pd.to_numeric(block["entry_duration_ms"], errors="coerce")
+        starts = pd.to_numeric(block["entry_start_time"], errors="coerce")
+        ends = pd.to_numeric(block["entry_end_time"], errors="coerce")
+        is_aoi = ~block["is_non_aoi"]
+        target = block["state_class"].eq("target")
+        distractor = block["state_class"].eq("distractor")
+        other = block["state_class"].eq("other_aoi")
+
+        def ssum(mask, duration=duration):
+            return float(duration.loc[mask].sum(skipna=True))
+
+        def smean(mask, duration=duration):
+            values = duration.loc[mask].dropna()
+            return float(values.mean()) if len(values) else np.nan
+
+        def smedian(mask, duration=duration):
+            values = duration.loc[mask].dropna()
+            return float(values.median()) if len(values) else np.nan
+
+        def smax(mask, duration=duration):
+            values = duration.loc[mask].dropna()
+            return float(values.max()) if len(values) else np.nan
+
+        def smin_time(mask, starts=starts):
+            values = starts.loc[mask].dropna()
+            return float(values.min()) if len(values) else np.nan
+
+        aoi_states = block.loc[is_aoi, "aoi_state"].astype(str)
+        first_aoi = block.loc[is_aoi].sort_values("entry_start_time", kind="stable")
+        last_aoi = block.loc[is_aoi].sort_values("entry_start_time", kind="stable", ascending=False)
+        total_dwell = float(duration.sum(skipna=True))
+        aoi_dwell = ssum(is_aoi)
+        target_entries = int(target.sum())
+        distractor_entries = int(distractor.sum())
+        row = {
+            **base,
+            "trial_start_time": float(starts.min()) if starts.notna().any() else np.nan,
+            "trial_end_time": float(ends.max()) if ends.notna().any() else np.nan,
+            "n_entries": int(len(block)),
+            "n_samples_in_entries": float(
+                pd.to_numeric(block["n_samples"], errors="coerce").sum(skipna=True)
+            ),
+            "n_aoi_entries": int(is_aoi.sum()),
+            "n_non_aoi_entries": int(block["is_non_aoi"].sum()),
+            "n_unique_aoi_states": int(aoi_states[aoi_states.ne("")].nunique()),
+            "total_entry_dwell_ms": total_dwell,
+            "total_aoi_dwell_ms": aoi_dwell,
+            "total_non_aoi_dwell_ms": ssum(block["is_non_aoi"]),
+            "mean_entry_duration_ms": float(duration.mean()) if duration.notna().any() else np.nan,
+            "median_entry_duration_ms": float(duration.median())
+            if duration.notna().any()
+            else np.nan,
+            "max_entry_duration_ms": float(duration.max()) if duration.notna().any() else np.nan,
+            "mean_aoi_entry_duration_ms": smean(is_aoi),
+            "median_aoi_entry_duration_ms": smedian(is_aoi),
+            "max_aoi_entry_duration_ms": smax(is_aoi),
+            "first_aoi_state": first_aoi["aoi_state"].iloc[0] if len(first_aoi) else pd.NA,
+            "last_aoi_state": last_aoi["aoi_state"].iloc[0] if len(last_aoi) else pd.NA,
+            "first_aoi_time_ms": smin_time(is_aoi),
+            "last_aoi_time_ms": float(starts.loc[is_aoi].max())
+            if starts.loc[is_aoi].notna().any()
+            else np.nan,
+            "target_entries": target_entries,
+            "target_revisits": max(target_entries - 1, 0),
+            "target_dwell_ms": ssum(target),
+            "target_ttff_ms": smin_time(target),
+            "mean_target_entry_duration_ms": smean(target),
+            "distractor_entries": distractor_entries,
+            "distractor_revisits": max(distractor_entries - 1, 0),
+            "distractor_dwell_ms": ssum(distractor),
+            "distractor_ttff_ms": smin_time(distractor),
+            "mean_distractor_entry_duration_ms": smean(distractor),
+            "other_aoi_entries": int(other.sum()),
+            "other_aoi_dwell_ms": ssum(other),
+        }
+        row["trial_duration_ms"] = row["trial_end_time"] - row["trial_start_time"]
+        row["aoi_dwell_prop"] = (
+            row["total_aoi_dwell_ms"] / total_dwell if total_dwell > 0 else np.nan
+        )
+        row["non_aoi_dwell_prop"] = (
+            row["total_non_aoi_dwell_ms"] / total_dwell if total_dwell > 0 else np.nan
+        )
+        row["target_dwell_prop_of_aoi"] = (
+            row["target_dwell_ms"] / aoi_dwell if aoi_dwell > 0 else np.nan
+        )
+        row["distractor_dwell_prop_of_aoi"] = (
+            row["distractor_dwell_ms"] / aoi_dwell if aoi_dwell > 0 else np.nan
+        )
+        row["target_aoi_defined"] = target_defined
+        row["distractor_aoi_defined"] = distractor_defined
+        if row["n_aoi_entries"] == 0:
+            row["aoi_trial_feature_status"] = "no_aoi_entries"
+        elif not target_defined and not distractor_defined:
+            row["aoi_trial_feature_status"] = "no_target_or_distractor_defined"
+        elif target_defined and target_entries == 0:
+            row["aoi_trial_feature_status"] = "target_not_observed"
+        elif distractor_defined and distractor_entries == 0:
+            row["aoi_trial_feature_status"] = "distractor_not_observed"
+        else:
+            row["aoi_trial_feature_status"] = "ok"
+        rows.append(row)
+    features = pd.DataFrame(rows)
+    transitions = summarise_gazepoint_aoi_transitions(
+        entries,
+        group_cols=groups,
+        include_non_aoi=True,
+        target_aoi_values=target_aoi_values,
+        distractor_aoi_values=distractor_aoi_values,
+        non_aoi_values=non_aoi_values,
+        missing_aoi_label=missing_aoi_label,
+    )
+    keep = [
+        *groups,
+        "total_transitions",
+        "self_reentries",
+        "target_to_distractor",
+        "distractor_to_target",
+        "background_to_target",
+        "target_to_background",
+        "background_to_distractor",
+        "distractor_to_background",
+        "target_to_target",
+        "distractor_to_distractor",
+        "other_transitions",
+        "mean_pre_transition_dwell_ms",
+        "transition_feature_status",
+    ]
+    transitions = transitions.loc[:, keep]
+    return (
+        features.merge(transitions, on=groups, how="left")
+        if groups
+        else pd.concat(
+            [features.reset_index(drop=True), transitions.reset_index(drop=True)], axis=1
+        )
+    )
 
 
 def summarise_gazepoint_aoi_windows(
-    data, aoi_col=None, time_col=None, windows=None, group_cols=None
+    data,
+    aoi_col=None,
+    time_col=None,
+    windows=None,
+    group_cols=None,
+    *,
+    subject_col="subject",
+    condition_col="condition",
+    target_aoi_values=None,
+    distractor_aoi_values=None,
+    non_aoi_values=_GP3_AOI_NON_VALUES,
+    window_label_col="window_label",
+    window_start_col="window_start_ms",
+    window_end_col="window_end_ms",
+    include_right_endpoint=False,
+    missing_condition_label="all_data",
+    missing_aoi_label="missing_aoi",
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    time_col = infer_column(df, "time", time_col, required=True)
-    t = finite_numeric(df[time_col])
-    windows = windows or {"window": (float(t.min()), float(t.max()))}
-    rows = []
-    for name, (lo, hi) in windows.items() if isinstance(windows, dict) else windows:
-        tmp = summarise_aoi_samples(
-            df.loc[t.between(lo, hi)], aoi_col=aoi_col, group_cols=group_cols
+    if isinstance(windows, dict):
+        df = ensure_dataframe(data, copy=False)
+        time_col = infer_column(df, "time", time_col, required=True)
+        t = finite_numeric(df[time_col])
+        rows = []
+        for name, (lo, hi) in windows.items():
+            tmp = summarise_aoi_samples(
+                df.loc[t.between(lo, hi)],
+                aoi_col=aoi_col,
+                group_cols=group_cols,
+            )
+            tmp["window"] = name
+            tmp["window_start"] = lo
+            tmp["window_end"] = hi
+            rows.append(tmp)
+        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+    df = ensure_dataframe(data, copy=False).copy()
+    if windows is None:
+        raise ValueError("windows must be a numeric vector or a data frame")
+    time_col = "time" if time_col is None else _gp3_aoi_r_scalar_label(time_col, "time_col")
+    subject_col = _gp3_aoi_r_scalar_label(subject_col, "subject_col")
+    if condition_col is not None:
+        condition_col = _gp3_aoi_r_scalar_label(condition_col, "condition_col")
+    aoi_col = _gp3_aoi_r_resolve_column(
+        df, aoi_col, ("aoi_current", "AOI", "aoi_state"), name="aoi_col", allow_none=True
+    )
+    required = [time_col, aoi_col, subject_col]
+    if condition_col is not None and condition_col in df.columns:
+        required.append(condition_col)
+    if group_cols is not None:
+        required.extend(_gp3_aoi_r_list(group_cols, allow_none=False, name="group_cols"))
+    missing = [col for col in dict.fromkeys(required) if col not in df.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+    if group_cols is None:
+        defaults = [subject_col, condition_col, "MEDIA_ID", "trial_global", "trial"]
+        groups = list(
+            dict.fromkeys([col for col in defaults if col is not None and col in df.columns])
         )
-        tmp["window"] = name
-        tmp["window_start"] = lo
-        tmp["window_end"] = hi
-        rows.append(tmp)
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+        if subject_col not in groups:
+            groups.insert(0, subject_col)
+    else:
+        groups = list(
+            dict.fromkeys(_gp3_aoi_r_list(group_cols, allow_none=False, name="group_cols"))
+        )
+    if condition_col is not None:
+        if condition_col not in df.columns:
+            df[condition_col] = missing_condition_label
+        if condition_col not in groups:
+            groups.append(condition_col)
+    if not groups:
+        raise ValueError("No grouping columns could be detected")
+    if not isinstance(include_right_endpoint, (bool, np.bool_)):
+        raise ValueError("include_right_endpoint must be TRUE or FALSE")
+
+    if isinstance(windows, pd.DataFrame):
+        for col in [window_label_col, window_start_col, window_end_col]:
+            if col not in windows.columns:
+                raise ValueError("Missing required window columns: " + col)
+        window_table = pd.DataFrame(
+            {
+                "window_label": windows[window_label_col].astype("string"),
+                "window_start_ms": pd.to_numeric(windows[window_start_col], errors="coerce"),
+                "window_end_ms": pd.to_numeric(windows[window_end_col], errors="coerce"),
+            }
+        )
+    else:
+        try:
+            breaks = np.asarray(list(windows), dtype=float)
+        except Exception as exc:
+            raise ValueError("windows must be a numeric vector or a data frame") from exc
+        if breaks.size < 2 or not np.isfinite(breaks).all():
+            raise ValueError("windows must contain at least two finite numeric breakpoints")
+        breaks = np.unique(np.sort(breaks))
+        if breaks.size < 2:
+            raise ValueError("windows must contain at least two distinct breakpoints")
+        starts, ends = breaks[:-1], breaks[1:]
+        window_table = pd.DataFrame(
+            {
+                "window_label": [f"{a:g}_{b:g}ms" for a, b in zip(starts, ends, strict=True)],
+                "window_start_ms": starts,
+                "window_end_ms": ends,
+            }
+        )
+    if (
+        window_table["window_label"].isna().any()
+        or window_table["window_label"].astype(str).eq("").any()
+    ):
+        raise ValueError("Window labels must be non-missing and non-empty")
+    if not np.isfinite(window_table[["window_start_ms", "window_end_ms"]].to_numpy(float)).all():
+        raise ValueError("Window start and end values must be finite")
+    if (window_table["window_end_ms"] <= window_table["window_start_ms"]).any():
+        raise ValueError("Each AOI window must have window_end_ms greater than window_start_ms")
+
+    df[".gp3_time"] = pd.to_numeric(df[time_col], errors="coerce")
+    state = df[aoi_col].astype("string").str.strip()
+    df[".gp3_aoi"] = state.mask(state.isna() | state.eq(""), missing_aoi_label).astype(object)
+    subject = df[subject_col].astype("string").str.strip()
+    df[subject_col] = subject.mask(subject.isna() | subject.eq(""), "unknown_subject").astype(
+        object
+    )
+    if condition_col is not None:
+        condition = df[condition_col].astype("string").str.strip()
+        df[condition_col] = condition.mask(
+            condition.isna() | condition.eq(""), missing_condition_label
+        ).astype(object)
+    df = df.loc[np.isfinite(df[".gp3_time"])].copy()
+    if df.empty:
+        raise ValueError("No rows contain finite time values")
+    indices = np.full(len(df), -1, dtype=int)
+    times = df[".gp3_time"].to_numpy(float)
+    for i, row in window_table.iterrows():
+        if include_right_endpoint:
+            inside = (times >= row["window_start_ms"]) & (times <= row["window_end_ms"])
+        else:
+            inside = (times >= row["window_start_ms"]) & (times < row["window_end_ms"])
+        indices[(indices < 0) & inside] = i
+    df[".gp3_window_index"] = indices
+    df = df.loc[df[".gp3_window_index"] >= 0].copy()
+    if df.empty:
+        raise ValueError("No rows fall inside the supplied AOI windows")
+    idx = df[".gp3_window_index"].astype(int).to_numpy()
+    df["window_label"] = window_table.iloc[idx]["window_label"].to_numpy()
+    df["window_start_ms"] = window_table.iloc[idx]["window_start_ms"].to_numpy()
+    df["window_end_ms"] = window_table.iloc[idx]["window_end_ms"].to_numpy()
+    target_values = set([] if target_aoi_values is None else map(str, target_aoi_values))
+    distractor_values = set(
+        [] if distractor_aoi_values is None else map(str, distractor_aoi_values)
+    )
+    non_values = set(map(str, non_aoi_values))
+    df[".gp3_is_target"] = df[".gp3_aoi"].isin(target_values)
+    df[".gp3_is_distractor"] = df[".gp3_aoi"].isin(distractor_values)
+    df[".gp3_is_non_aoi"] = df[".gp3_aoi"].isin(non_values)
+    df[".gp3_is_missing_aoi"] = df[".gp3_aoi"].eq(missing_aoi_label) | df[".gp3_aoi"].isin(
+        ["missing", "missing_aoi"]
+    )
+    df[".gp3_is_other_aoi"] = ~(
+        df[".gp3_is_target"]
+        | df[".gp3_is_distractor"]
+        | df[".gp3_is_non_aoi"]
+        | df[".gp3_is_missing_aoi"]
+    )
+    rows = []
+    group_all = [*groups, "window_label", "window_start_ms", "window_end_ms"]
+    for key, block in df.groupby(group_all, dropna=False, sort=False):
+        key = key if isinstance(key, tuple) else (key,)
+        base = dict(zip(group_all, key, strict=True))
+        n_window = len(block)
+        n_target = int(block[".gp3_is_target"].sum())
+        n_distractor = int(block[".gp3_is_distractor"].sum())
+        n_non = int(block[".gp3_is_non_aoi"].sum())
+        n_missing = int(block[".gp3_is_missing_aoi"].sum())
+        n_other = int(block[".gp3_is_other_aoi"].sum())
+        n_aoi = n_target + n_distractor + n_other
+        valid = n_window - n_missing
+        rows.append(
+            {
+                **base,
+                "n_window_samples": n_window,
+                "n_target_samples": n_target,
+                "n_distractor_samples": n_distractor,
+                "n_non_aoi_samples": n_non,
+                "n_missing_aoi_samples": n_missing,
+                "n_other_aoi_samples": n_other,
+                "n_unique_aoi_states": int(block[".gp3_aoi"].nunique(dropna=False)),
+                "first_aoi_state": block[".gp3_aoi"].iloc[0],
+                "last_aoi_state": block[".gp3_aoi"].iloc[-1],
+                "n_aoi_samples": n_aoi,
+                "n_valid_denominator_samples": valid,
+                "target_sample_prop_all": n_target / n_window if n_window > 0 else np.nan,
+                "target_sample_prop_valid": n_target / valid if valid > 0 else np.nan,
+                "target_sample_prop_aoi": n_target / n_aoi if n_aoi > 0 else np.nan,
+                "distractor_sample_prop_all": n_distractor / n_window if n_window > 0 else np.nan,
+                "valid_denominator_prop": valid / n_window if n_window > 0 else np.nan,
+                "target_aoi_defined": bool(target_values),
+                "distractor_aoi_defined": bool(distractor_values),
+                "aoi_window_status": (
+                    "no_target_aoi_defined"
+                    if not target_values
+                    else "zero_valid_denominator"
+                    if valid == 0
+                    else "target_not_observed"
+                    if n_target == 0
+                    else "target_only"
+                    if n_target == valid
+                    else "ok"
+                ),
+            }
+        )
+    summary = pd.DataFrame(rows)
+    summary = summary.sort_values([*groups, "window_start_ms"], kind="stable").reset_index(
+        drop=True
+    )
+    summary.attrs["gp3_class"] = "gp3_aoi_window_summary"
+    summary.attrs["settings"] = {
+        "time_col": time_col,
+        "aoi_col": aoi_col,
+        "subject_col": subject_col,
+        "condition_col": condition_col,
+        "group_cols": groups,
+        "target_aoi_values": target_aoi_values,
+        "distractor_aoi_values": distractor_aoi_values,
+        "non_aoi_values": list(non_aoi_values),
+        "include_right_endpoint": bool(include_right_endpoint),
+        "missing_condition_label": missing_condition_label,
+        "missing_aoi_label": missing_aoi_label,
+    }
+    return summary
 
 
 def transform_gazepoint_aoi_empirical_logit(
