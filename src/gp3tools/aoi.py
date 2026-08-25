@@ -20,6 +20,7 @@ from ._utils import (
     normalize_group_cols,
     ordered_unique,
 )
+from .io import standardise_gazepoint_names
 
 
 def add_gazepoint_aoi(
@@ -578,17 +579,185 @@ def summarise_gazepoint_aoi_transitions(
     )
 
 
-def compute_transition_matrix(sequence, normalize=False) -> pd.DataFrame:
-    s = list(sequence)
-    states = ordered_unique(s)
-    mat = pd.DataFrame(0.0, index=states, columns=states)
-    for a, b in zip(s[:-1], s[1:], strict=False):
-        mat.loc[a, b] += 1
-    if normalize:
-        mat = mat.div(mat.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    mat.index.name = "from_aoi"
-    mat.columns.name = "to_aoi"
-    return mat
+def compute_transition_matrix(
+    sequence=None,
+    normalize=False,
+    *,
+    data=None,
+    group_cols="MEDIA_ID",
+    aoi_col="AOI",
+    time_col="TIME",
+    collapse_repeats=True,
+) -> pd.DataFrame:
+    """Compute AOI transitions.
+
+    A sequence input retains the historical Python square-matrix
+    interface. A DataFrame, either positionally or via ``data=``,
+    activates the R gp3tools v2.3.0 long-table interface.
+    """
+    if data is not None and sequence is not None:
+        raise TypeError("supply either sequence or data, not both")
+
+    r_data = (
+        data
+        if data is not None
+        else (
+            sequence
+            if isinstance(
+                sequence,
+                pd.DataFrame,
+            )
+            else None
+        )
+    )
+
+    if r_data is None:
+        values = list([] if sequence is None else sequence)
+
+        states = ordered_unique(values)
+
+        matrix = pd.DataFrame(
+            0.0,
+            index=states,
+            columns=states,
+        )
+
+        for from_aoi, to_aoi in zip(
+            values[:-1],
+            values[1:],
+            strict=False,
+        ):
+            matrix.loc[
+                from_aoi,
+                to_aoi,
+            ] += 1
+
+        if normalize:
+            matrix = matrix.div(
+                matrix.sum(axis=1).replace(
+                    0,
+                    np.nan,
+                ),
+                axis=0,
+            ).fillna(0)
+
+        matrix.index.name = "from_aoi"
+        matrix.columns.name = "to_aoi"
+
+        return matrix
+
+    frame = standardise_gazepoint_names(r_data)
+
+    if isinstance(
+        group_cols,
+        str,
+    ):
+        groups = [group_cols]
+
+    else:
+        try:
+            groups = list(group_cols)
+        except TypeError as exc:
+            raise ValueError("group_cols must be a string or sequence of strings") from exc
+
+        if not all(
+            isinstance(
+                col,
+                str,
+            )
+            for col in groups
+        ):
+            raise ValueError("group_cols must contain strings")
+
+    needed = [
+        *groups,
+        aoi_col,
+        time_col,
+    ]
+
+    missing = [col for col in needed if col not in frame.columns]
+
+    if missing:
+        raise ValueError("Missing columns: " + ", ".join(missing))
+
+    visits = frame.sort_values(
+        [
+            *groups,
+            time_col,
+        ]
+        if groups
+        else [time_col],
+        kind="stable",
+        na_position="last",
+    )
+
+    visits = visits.loc[visits[aoi_col].notna() & visits[aoi_col].ne("")].copy()
+
+    if collapse_repeats:
+        if groups:
+            previous = visits.groupby(
+                groups,
+                dropna=False,
+                sort=False,
+            )[aoi_col].shift(1)
+        else:
+            previous = visits[aoi_col].shift(1)
+
+        visits = visits.loc[previous.isna() | visits[aoi_col].ne(previous)].copy()
+
+    visits["from"] = visits[aoi_col]
+
+    if groups:
+        visits["to"] = visits.groupby(
+            groups,
+            dropna=False,
+            sort=False,
+        )[aoi_col].shift(-1)
+    else:
+        visits["to"] = visits[aoi_col].shift(-1)
+
+    visits = visits.loc[visits["to"].notna()]
+
+    output_columns = [
+        *groups,
+        "from",
+        "to",
+        "n",
+        "prob",
+    ]
+
+    if not len(visits):
+        return pd.DataFrame(columns=output_columns)
+
+    count_groups = [
+        *groups,
+        "from",
+        "to",
+    ]
+
+    result = (
+        visits.groupby(
+            count_groups,
+            dropna=False,
+            sort=True,
+        )
+        .size()
+        .rename("n")
+        .reset_index()
+    )
+
+    probability_groups = [
+        *groups,
+        "from",
+    ]
+
+    result["prob"] = result["n"] / result.groupby(
+        probability_groups,
+        dropna=False,
+        sort=False,
+    )["n"].transform("sum")
+
+    return result[output_columns].reset_index(drop=True)
 
 
 def compute_gazepoint_aoi_transition_matrix(
