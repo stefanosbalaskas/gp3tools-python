@@ -1920,39 +1920,275 @@ def audit_gazepoint_pupil_gaps(
     return pd.DataFrame(rows)
 
 
+def _gp3_r_first_present(data, candidates):
+    for candidate in candidates:
+        if candidate in data.columns:
+            return candidate
+    return None
+
+
+def _gp3_r_bool(values):
+    series = pd.Series(values, copy=False)
+    if pd.api.types.is_bool_dtype(series.dtype):
+        return series.fillna(False).astype(bool)
+    if pd.api.types.is_numeric_dtype(series.dtype):
+        numeric = pd.to_numeric(series, errors="coerce")
+        return numeric.notna() & numeric.ne(0)
+    text = series.astype("string").str.strip().str.lower()
+    return text.isin(["true", "t", "1", "yes", "y"])
+
+
+def _gp3_r_group_parts(data, group_cols):
+    if not group_cols:
+        return [((), data)]
+    grouper = group_cols[0] if len(group_cols) == 1 else group_cols
+    return data.groupby(grouper, dropna=False, sort=False)
+
+
+def _gp3_r_group_row(group_cols, key):
+    if not group_cols:
+        return {}
+    if len(group_cols) == 1:
+        key = (key,)
+    return dict(zip(group_cols, key, strict=True))
+
+
 def audit_gazepoint_pupil_baseline(
-    data, pupil_col=None, time_col=None, baseline=(-200, 0), group_cols=None
+    data,
+    pupil_col=None,
+    time_col=None,
+    baseline=(-200, 0),
+    group_cols=None,
+    *,
+    baseline_n_col=None,
+    baseline_status_col=None,
+    baseline_available_col=None,
+    baseline_used_col=None,
+    baseline_window_start_col=None,
+    baseline_window_end_col=None,
+    baseline_flag_col=None,
+    interpolated_col=None,
+    artifact_col=None,
+    artifact_reason_col=None,
+    min_baseline_samples=None,
+    max_missing_pct=None,
+    max_interpolated_pct=None,
+    max_artifact_pct=None,
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    time_col = infer_column(df, "time", time_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
-    work = df.loc[finite_numeric(df[time_col]).between(*baseline)].copy()
-    x = finite_numeric(work[pupil_col])
-    work["_p"] = x
-    if groups:
-        return (
-            work.groupby(groups, dropna=False)
-            .agg(
-                n_baseline=("_p", "size"),
-                n_valid=("_p", "count"),
-                baseline_mean=("_p", "mean"),
-                baseline_sd=("_p", "std"),
-            )
-            .reset_index()
-            .assign(missing_prop=lambda z: 1 - z.n_valid / z.n_baseline)
+    """Audit pupil baselines using legacy or R v2.3.0 semantics."""
+    r_mode = any(
+        value is not None
+        for value in (
+            baseline_n_col,
+            baseline_status_col,
+            baseline_available_col,
+            baseline_used_col,
+            baseline_window_start_col,
+            baseline_window_end_col,
+            baseline_flag_col,
+            interpolated_col,
+            artifact_col,
+            artifact_reason_col,
+            min_baseline_samples,
+            max_missing_pct,
+            max_interpolated_pct,
+            max_artifact_pct,
         )
-    return pd.DataFrame(
-        [
-            {
-                "n_baseline": len(work),
-                "n_valid": int(x.notna().sum()),
-                "baseline_mean": float(x.mean()),
-                "baseline_sd": float(x.std()),
-                "missing_prop": float(x.isna().mean()),
-            }
-        ]
     )
+
+    if not r_mode:
+        df = ensure_dataframe(data, copy=False)
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        time_col = infer_column(df, "time", time_col, required=True)
+        groups = normalize_group_cols(df, group_cols)
+        work = df.loc[finite_numeric(df[time_col]).between(*baseline)].copy()
+        x = finite_numeric(work[pupil_col])
+        work["_p"] = x
+        if groups:
+            return (
+                work.groupby(groups, dropna=False)
+                .agg(
+                    n_baseline=("_p", "size"),
+                    n_valid=("_p", "count"),
+                    baseline_mean=("_p", "mean"),
+                    baseline_sd=("_p", "std"),
+                )
+                .reset_index()
+                .assign(missing_prop=lambda z: 1 - z.n_valid / z.n_baseline)
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "n_baseline": len(work),
+                    "n_valid": int(x.notna().sum()),
+                    "baseline_mean": float(x.mean()),
+                    "baseline_sd": float(x.std()),
+                    "missing_prop": float(x.isna().mean()),
+                }
+            ]
+        )
+
+    df = ensure_dataframe(data, copy=False)
+    groups = (
+        ["subject", "media_id"]
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    if len(groups) != len(set(groups)) or any(not isinstance(c, str) or not c for c in groups):
+        raise ValueError("group_cols must contain unique non-empty column names")
+
+    time_col = "time" if time_col is None else time_col
+    pupil_col = "pupil_interpolated" if pupil_col is None else pupil_col
+    baseline_n_col = "pupil_baseline_n" if baseline_n_col is None else baseline_n_col
+    baseline_status_col = (
+        "pupil_baseline_status" if baseline_status_col is None else baseline_status_col
+    )
+    baseline_available_col = (
+        "pupil_baseline_available" if baseline_available_col is None else baseline_available_col
+    )
+    baseline_used_col = "pupil_baseline_used" if baseline_used_col is None else baseline_used_col
+    baseline_window_start_col = (
+        "pupil_baseline_window_start"
+        if baseline_window_start_col is None
+        else baseline_window_start_col
+    )
+    baseline_window_end_col = (
+        "pupil_baseline_window_end" if baseline_window_end_col is None else baseline_window_end_col
+    )
+    interpolated_col = "pupil_was_interpolated" if interpolated_col is None else interpolated_col
+    min_baseline_samples = 1 if min_baseline_samples is None else float(min_baseline_samples)
+    max_missing_pct = 50 if max_missing_pct is None else float(max_missing_pct)
+    max_interpolated_pct = 50 if max_interpolated_pct is None else float(max_interpolated_pct)
+    max_artifact_pct = 50 if max_artifact_pct is None else float(max_artifact_pct)
+
+    if artifact_col is None:
+        artifact_col = _gp3_r_first_present(
+            df, ["pupil_artifact_flag", "pupil_flag_invalid", "artifact_flag"]
+        )
+    if artifact_reason_col is None:
+        artifact_reason_col = _gp3_r_first_present(
+            df, ["pupil_artifact_reason", "pupil_flag_reason", "artifact_reason"]
+        )
+
+    required = groups + [
+        time_col,
+        pupil_col,
+        baseline_n_col,
+        baseline_status_col,
+        baseline_available_col,
+        baseline_used_col,
+        baseline_window_start_col,
+        baseline_window_end_col,
+        interpolated_col,
+    ]
+    for optional in (baseline_flag_col, artifact_col, artifact_reason_col):
+        if optional is not None:
+            required.append(optional)
+    missing = [c for c in dict.fromkeys(required) if c not in df.columns]
+    if missing:
+        raise KeyError("Missing required columns: " + ", ".join(missing))
+
+    work = df.copy()
+    time = pd.to_numeric(work[time_col], errors="coerce")
+    start = pd.to_numeric(work[baseline_window_start_col], errors="coerce")
+    end = pd.to_numeric(work[baseline_window_end_col], errors="coerce")
+    if baseline_flag_col is None:
+        is_baseline = time.notna() & start.notna() & end.notna() & time.ge(start) & time.le(end)
+    else:
+        is_baseline = _gp3_r_bool(work[baseline_flag_col])
+    work["_gp3_is_baseline"] = is_baseline
+    work["_gp3_pupil"] = pd.to_numeric(work[pupil_col], errors="coerce")
+    work["_gp3_n"] = pd.to_numeric(work[baseline_n_col], errors="coerce")
+    work["_gp3_status"] = work[baseline_status_col].astype("string")
+    work["_gp3_available"] = _gp3_r_bool(work[baseline_available_col])
+    work["_gp3_used"] = _gp3_r_bool(work[baseline_used_col])
+    work["_gp3_interp"] = _gp3_r_bool(work[interpolated_col])
+    if artifact_col is not None:
+        work["_gp3_artifact"] = _gp3_r_bool(work[artifact_col])
+    elif artifact_reason_col is not None:
+        reason = work[artifact_reason_col].astype("string")
+        work["_gp3_artifact"] = reason.notna() & reason.ne("") & reason.ne("valid")
+    else:
+        work["_gp3_artifact"] = pd.Series(pd.NA, index=work.index, dtype="boolean")
+
+    def first_nonmissing(series):
+        values = series.dropna()
+        return values.iloc[0] if len(values) else np.nan
+
+    rows = []
+    for key, part in _gp3_r_group_parts(work, groups):
+        row = _gp3_r_group_row(groups, key)
+        baseline_mask = part["_gp3_is_baseline"].fillna(False).astype(bool)
+        baseline_part = part.loc[baseline_mask]
+        n_rows = len(part)
+        n_baseline_rows = len(baseline_part)
+        n_valid = int(baseline_part["_gp3_pupil"].notna().sum())
+        n_missing = int(baseline_part["_gp3_pupil"].isna().sum())
+        n_interp = int(baseline_part["_gp3_interp"].fillna(False).sum())
+        artifact_values = baseline_part["_gp3_artifact"]
+        n_artifact = int(artifact_values.fillna(False).sum()) if len(artifact_values) else 0
+        n_values = part["_gp3_n"].dropna()
+        status = first_nonmissing(part["_gp3_status"])
+        available = first_nonmissing(part["_gp3_available"])
+        used = first_nonmissing(part["_gp3_used"])
+        baseline_n_min = float(n_values.min()) if len(n_values) else np.nan
+        baseline_n_mean = float(n_values.mean()) if len(n_values) else np.nan
+        baseline_n_max = float(n_values.max()) if len(n_values) else np.nan
+        missing_pct = 100 * n_missing / n_baseline_rows if n_baseline_rows else np.nan
+        interp_pct = 100 * n_interp / n_baseline_rows if n_baseline_rows else np.nan
+        artifact_pct = 100 * n_artifact / n_baseline_rows if n_baseline_rows else np.nan
+        available_bool = bool(available) if not pd.isna(available) else False
+        no_baseline = (
+            status == "no_baseline"
+            or not available_bool
+            or (np.isfinite(baseline_n_max) and baseline_n_max < min_baseline_samples)
+        )
+        low_quality = (
+            no_baseline
+            or not np.isfinite(baseline_n_max)
+            or baseline_n_max < min_baseline_samples
+            or (np.isfinite(missing_pct) and missing_pct > max_missing_pct)
+            or (np.isfinite(interp_pct) and interp_pct > max_interpolated_pct)
+            or (np.isfinite(artifact_pct) and artifact_pct > max_artifact_pct)
+        )
+        if no_baseline:
+            reason = "no_baseline"
+        elif not np.isfinite(baseline_n_max):
+            reason = "missing_baseline_n"
+        elif baseline_n_max < min_baseline_samples:
+            reason = "too_few_baseline_samples"
+        elif np.isfinite(missing_pct) and missing_pct > max_missing_pct:
+            reason = "high_baseline_missing_pct"
+        elif np.isfinite(interp_pct) and interp_pct > max_interpolated_pct:
+            reason = "high_baseline_interpolated_pct"
+        elif np.isfinite(artifact_pct) and artifact_pct > max_artifact_pct:
+            reason = "high_baseline_artifact_pct"
+        else:
+            reason = "ok"
+        row.update(
+            n_rows=n_rows,
+            n_baseline_rows=n_baseline_rows,
+            n_baseline_valid_samples=n_valid,
+            n_baseline_missing_samples=n_missing,
+            n_baseline_interpolated_samples=n_interp,
+            n_baseline_artifact_samples=n_artifact,
+            baseline_missing_pct=missing_pct,
+            baseline_interpolated_pct=interp_pct,
+            baseline_artifact_pct=artifact_pct,
+            baseline_n_min=baseline_n_min,
+            baseline_n_mean=baseline_n_mean,
+            baseline_n_max=baseline_n_max,
+            baseline_status=status,
+            baseline_available=available,
+            baseline_used=used,
+            n_no_baseline_rows=int(part["_gp3_status"].eq("no_baseline").sum()),
+            n_missing_pupil_baseline_rows=int(part["_gp3_status"].eq("missing_pupil").sum()),
+            no_baseline_case=bool(no_baseline),
+            low_quality_baseline_flag=bool(low_quality),
+            baseline_quality_reason=reason,
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def audit_gazepoint_pupil_drift(
@@ -2007,22 +2243,141 @@ def audit_gazepoint_pupil_reliability(
     )
 
 
-def audit_gazepoint_pupil_imbalance(data, pupil_col=None, condition_col=None) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    condition_col = infer_column(df, "condition", condition_col, required=True)
-    work = df.copy()
-    work["_p"] = finite_numeric(work[pupil_col])
-    return (
-        work.groupby(condition_col, dropna=False)
-        .agg(
-            n=("_p", "size"),
-            n_valid=("_p", "count"),
-            mean_pupil=("_p", "mean"),
-            sd_pupil=("_p", "std"),
-        )
-        .reset_index()
+def audit_gazepoint_pupil_imbalance(
+    data,
+    pupil_col=None,
+    condition_col=None,
+    *,
+    group_cols=None,
+    interpolated_col="pupil_was_interpolated",
+    interpolation_status_col="pupil_interpolation_status",
+    artifact_col=None,
+    artifact_reason_col=None,
+    min_group_n=1,
+    max_valid_pct_diff=10,
+    max_artifact_pct_diff=10,
+    max_missing_pct_diff=10,
+    max_interpolated_pct_diff=10,
+) -> pd.DataFrame:
+    """Audit pupil preprocessing balance using legacy or R v2.3.0 semantics."""
+    r_mode = (
+        group_cols is not None
+        or interpolated_col != "pupil_was_interpolated"
+        or interpolation_status_col != "pupil_interpolation_status"
+        or artifact_col is not None
+        or artifact_reason_col is not None
+        or min_group_n != 1
+        or max_valid_pct_diff != 10
+        or max_artifact_pct_diff != 10
+        or max_missing_pct_diff != 10
+        or max_interpolated_pct_diff != 10
     )
+    if not r_mode:
+        df = ensure_dataframe(data, copy=False)
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        condition_col = infer_column(df, "condition", condition_col, required=True)
+        work = df.copy()
+        work["_p"] = finite_numeric(work[pupil_col])
+        return (
+            work.groupby(condition_col, dropna=False)
+            .agg(
+                n=("_p", "size"),
+                n_valid=("_p", "count"),
+                mean_pupil=("_p", "mean"),
+                sd_pupil=("_p", "std"),
+            )
+            .reset_index()
+        )
+
+    df = ensure_dataframe(data, copy=False)
+    groups = (
+        ["condition"]
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    if len(groups) != len(set(groups)) or any(not isinstance(c, str) or not c for c in groups):
+        raise ValueError("group_cols must contain unique non-empty column names")
+    pupil_col = "pupil_interpolated" if pupil_col is None else pupil_col
+    if artifact_col is None:
+        artifact_col = _gp3_r_first_present(
+            df, ["pupil_artifact_flag", "pupil_flag_invalid", "artifact_flag"]
+        )
+    if artifact_reason_col is None:
+        artifact_reason_col = _gp3_r_first_present(
+            df, ["pupil_artifact_reason", "pupil_flag_reason", "artifact_reason"]
+        )
+    required = groups + [pupil_col, interpolated_col, interpolation_status_col]
+    for optional in (artifact_col, artifact_reason_col):
+        if optional is not None:
+            required.append(optional)
+    missing = [c for c in dict.fromkeys(required) if c not in df.columns]
+    if missing:
+        raise KeyError("Missing required columns: " + ", ".join(missing))
+
+    work = df.copy()
+    work["_gp3_pupil"] = pd.to_numeric(work[pupil_col], errors="coerce")
+    work["_gp3_interp"] = _gp3_r_bool(work[interpolated_col])
+    work["_gp3_status"] = work[interpolation_status_col].astype("string")
+    if artifact_col is not None:
+        work["_gp3_artifact"] = _gp3_r_bool(work[artifact_col])
+    elif artifact_reason_col is not None:
+        reason = work[artifact_reason_col].astype("string")
+        work["_gp3_artifact"] = reason.notna() & reason.ne("") & reason.ne("valid")
+    else:
+        work["_gp3_artifact"] = False
+
+    rows = []
+    for key, part in _gp3_r_group_parts(work, groups):
+        row = _gp3_r_group_row(groups, key)
+        n_rows = len(part)
+        n_valid = int(part["_gp3_pupil"].notna().sum())
+        n_interp = int(part["_gp3_interp"].sum())
+        n_artifact = int(part["_gp3_artifact"].sum())
+        n_missing = int(part["_gp3_pupil"].isna().sum())
+        row.update(
+            n_rows=n_rows,
+            n_valid_samples=n_valid,
+            n_interpolated_samples=n_interp,
+            n_artifact_samples=n_artifact,
+            n_remaining_missing_samples=n_missing,
+            n_observed_samples=int(part["_gp3_status"].eq("observed").sum()),
+            n_missing_edge_gap_samples=int(part["_gp3_status"].eq("missing_edge_gap").sum()),
+            n_missing_long_gap_samples=int(part["_gp3_status"].eq("missing_long_gap").sum()),
+            valid_sample_pct=100 * n_valid / n_rows if n_rows else np.nan,
+            interpolated_sample_pct=100 * n_interp / n_rows if n_rows else np.nan,
+            artifact_sample_pct=100 * n_artifact / n_rows if n_rows else np.nan,
+            remaining_missing_sample_pct=100 * n_missing / n_rows if n_rows else np.nan,
+        )
+        rows.append(row)
+    out = pd.DataFrame(rows)
+
+    def value_range(column):
+        values = pd.to_numeric(out[column], errors="coerce").dropna()
+        return float(values.max() - values.min()) if len(values) else np.nan
+
+    valid_range = value_range("valid_sample_pct")
+    artifact_range = value_range("artifact_sample_pct")
+    missing_range = value_range("remaining_missing_sample_pct")
+    interp_range = value_range("interpolated_sample_pct")
+    reasons = []
+    if np.isfinite(valid_range) and valid_range > max_valid_pct_diff:
+        reasons.append("valid_pct_diff")
+    if np.isfinite(artifact_range) and artifact_range > max_artifact_pct_diff:
+        reasons.append("artifact_pct_diff")
+    if np.isfinite(missing_range) and missing_range > max_missing_pct_diff:
+        reasons.append("missing_pct_diff")
+    if np.isfinite(interp_range) and interp_range > max_interpolated_pct_diff:
+        reasons.append("interpolated_pct_diff")
+    if bool((out["n_rows"] < min_group_n).any()):
+        reasons.append("small_group_n")
+    warning = bool(reasons)
+    out["valid_sample_pct_range"] = valid_range
+    out["artifact_sample_pct_range"] = artifact_range
+    out["remaining_missing_sample_pct_range"] = missing_range
+    out["interpolated_sample_pct_range"] = interp_range
+    out["preprocessing_imbalance_warning"] = warning
+    out["preprocessing_imbalance_reason"] = ";".join(reasons) if reasons else "ok"
+    return out
 
 
 def audit_gazepoint_pupil_overlap_risk(
@@ -2640,49 +2995,475 @@ def summarise_gazepoint_pupil(
 
 
 def summarise_gazepoint_pupil_windows(
-    data, pupil_col=None, time_col=None, windows=None, group_cols=None
+    data,
+    pupil_col=None,
+    time_col=None,
+    windows=None,
+    group_cols=None,
+    *,
+    include_window_end=False,
+    min_valid_samples=1,
 ) -> pd.DataFrame:
+    """Summarise pupil windows using legacy or R v2.3.0 semantics."""
+    numeric_windows = (
+        isinstance(windows, (list, tuple, np.ndarray, pd.Series))
+        and len(windows) >= 2
+        and all(np.isscalar(v) for v in windows)
+    )
+    r_mode = (
+        isinstance(windows, pd.DataFrame)
+        or numeric_windows
+        or include_window_end
+        or min_valid_samples != 1
+    )
+    if not r_mode:
+        df = ensure_dataframe(data, copy=False)
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        time_col = infer_column(df, "time", time_col, required=True)
+        if windows is None:
+            windows = {
+                "window": (
+                    float(finite_numeric(df[time_col]).min()),
+                    float(finite_numeric(df[time_col]).max()),
+                )
+            }
+        rows = []
+        iterator = windows.items() if isinstance(windows, dict) else windows
+        for name, (lo, hi) in iterator:
+            sub = df.loc[finite_numeric(df[time_col]).between(lo, hi)].copy()
+            tmp = summarise_gazepoint_pupil(sub, pupil_col=pupil_col, group_cols=group_cols)
+            tmp.insert(len(tmp.columns) if len(tmp.columns) else 0, "window", name)
+            tmp["window_start"] = lo
+            tmp["window_end"] = hi
+            rows.append(tmp)
+        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
     df = ensure_dataframe(data, copy=False)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    time_col = infer_column(df, "time", time_col, required=True)
-    if windows is None:
-        windows = {
-            "window": (
-                float(finite_numeric(df[time_col]).min()),
-                float(finite_numeric(df[time_col]).max()),
-            )
-        }
+    if min_valid_samples < 1:
+        raise ValueError("min_valid_samples must be greater than or equal to 1")
+    groups = (
+        ["subject", "media_id"]
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+
+    def detect(candidates):
+        return _gp3_r_first_present(df, candidates)
+
+    pupil_source = pupil_col or detect(
+        [
+            "pupil_smoothed",
+            "pupil_baseline_corrected",
+            "pupil_baseline_percent_change",
+            "pupil_interpolated",
+            "pupil_for_preprocessing",
+            "mean_pupil",
+            "pupil",
+            "pupil_raw",
+            "left_pupil",
+            "right_pupil",
+        ]
+    )
+    time_source = time_col or detect(
+        [
+            "time_relative_ms",
+            "relative_time_ms",
+            "event_time_ms",
+            "time_ms",
+            "time",
+            "time_orig",
+            "time_orig_ms",
+        ]
+    )
+    if pupil_source is None or pupil_source not in df.columns:
+        raise KeyError("No pupil column was found")
+    if time_source is None or time_source not in df.columns:
+        raise KeyError("No time column was found")
+
+    role_sources = {
+        "subject": detect(["subject", "pID", "participant"]),
+        "media_id": detect(["media_id", "MEDIA_ID"]),
+        "trial": detect(["trial"]),
+        "trial_global": detect(["trial_global"]),
+    }
+    missing_roles = [g for g in groups if g in role_sources and role_sources[g] is None]
+    missing_other = [g for g in groups if g not in role_sources and g not in df.columns]
+    if missing_roles or missing_other:
+        raise KeyError("Missing grouping columns: " + ", ".join(missing_roles + missing_other))
+
+    def fmt(value):
+        value = float(value)
+        return str(int(value)) if value.is_integer() else format(value, "g")
+
+    if numeric_windows:
+        breaks = np.asarray(windows, dtype=float)
+        if not np.isfinite(breaks).all() or len(breaks) < 2 or not np.all(np.diff(breaks) > 0):
+            raise ValueError("Numeric windows must contain strictly increasing finite breakpoints")
+        window_tbl = pd.DataFrame(
+            {
+                "window_label": [
+                    f"{fmt(a)}_{fmt(b)}ms" for a, b in zip(breaks[:-1], breaks[1:], strict=True)
+                ],
+                "window_start_ms": breaks[:-1],
+                "window_end_ms": breaks[1:],
+            }
+        )
+    elif isinstance(windows, pd.DataFrame):
+
+        def first_col(candidates):
+            for c in candidates:
+                if c in windows.columns:
+                    return c
+            return None
+
+        start_col = first_col(["window_start_ms", "window_start", "start_ms", "start"])
+        end_col = first_col(["window_end_ms", "window_end", "end_ms", "end"])
+        label_col = first_col(["window_label", "label", "window"])
+        if start_col is None or end_col is None:
+            raise KeyError("Window data must contain start and end columns")
+        starts = pd.to_numeric(windows[start_col], errors="coerce")
+        ends = pd.to_numeric(windows[end_col], errors="coerce")
+        if starts.isna().any() or ends.isna().any():
+            raise ValueError("Window start and end values must be numeric and non-missing")
+        labels = (
+            windows[label_col].astype("string")
+            if label_col
+            else pd.Series([f"{fmt(a)}_{fmt(b)}ms" for a, b in zip(starts, ends, strict=True)])
+        )
+        window_tbl = pd.DataFrame(
+            {
+                "window_label": labels.astype(str),
+                "window_start_ms": starts.astype(float),
+                "window_end_ms": ends.astype(float),
+            }
+        )
+    else:
+        breaks = np.asarray([0, 500, 1000, 2000], dtype=float)
+        window_tbl = pd.DataFrame(
+            {
+                "window_label": [
+                    f"{fmt(a)}_{fmt(b)}ms" for a, b in zip(breaks[:-1], breaks[1:], strict=True)
+                ],
+                "window_start_ms": breaks[:-1],
+                "window_end_ms": breaks[1:],
+            }
+        )
+    if (
+        len(window_tbl) == 0
+        or bool((window_tbl["window_end_ms"] < window_tbl["window_start_ms"]).any())
+        or bool(window_tbl["window_label"].eq("").any())
+    ):
+        raise ValueError("Invalid window definitions")
+
+    work = pd.DataFrame(index=df.index)
+    for role, source_col in role_sources.items():
+        work[role] = (
+            df[source_col].astype("string")
+            if source_col is not None
+            else pd.Series(pd.NA, index=df.index, dtype="string")
+        )
+    for g in groups:
+        if g not in role_sources:
+            work[g] = df[g]
+    work["time_ms"] = pd.to_numeric(df[time_source], errors="coerce")
+    work["pupil_value"] = pd.to_numeric(df[pupil_source], errors="coerce")
+    work = work.loc[np.isfinite(work["time_ms"].to_numpy(float))].copy()
+
     rows = []
-    for name, (lo, hi) in windows.items() if isinstance(windows, dict) else windows:
-        sub = df.loc[finite_numeric(df[time_col]).between(lo, hi)].copy()
-        tmp = summarise_gazepoint_pupil(sub, pupil_col=pupil_col, group_cols=group_cols)
-        tmp.insert(len(tmp.columns) if len(tmp.columns) else 0, "window", name)
-        tmp["window_start"] = lo
-        tmp["window_end"] = hi
-        rows.append(tmp)
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    grouping = groups + ["window_label", "window_start_ms", "window_end_ms"]
+    pieces = []
+    for window in window_tbl.itertuples(index=False):
+        if include_window_end:
+            mask = work["time_ms"].ge(window.window_start_ms) & work["time_ms"].le(
+                window.window_end_ms
+            )
+        else:
+            mask = work["time_ms"].ge(window.window_start_ms) & work["time_ms"].lt(
+                window.window_end_ms
+            )
+        part = work.loc[mask].copy()
+        if len(part):
+            part["window_label"] = window.window_label
+            part["window_start_ms"] = float(window.window_start_ms)
+            part["window_end_ms"] = float(window.window_end_ms)
+            pieces.append(part)
+    if not pieces:
+        columns = groups + [
+            "window_label",
+            "window_start_ms",
+            "window_end_ms",
+            "n_samples",
+            "n_valid_pupil",
+            "n_missing_pupil",
+            "valid_pupil_pct",
+            "missing_pupil_pct",
+            "mean_pupil",
+            "sd_pupil",
+            "median_pupil",
+            "min_pupil",
+            "max_pupil",
+            "q25_pupil",
+            "q75_pupil",
+            "pupil_auc",
+            "pupil_time_span_ms",
+            "pupil_window_status",
+            "pupil_window_pupil_column",
+            "pupil_window_time_column",
+            "pupil_window_min_valid_samples",
+            "pupil_window_include_end",
+        ]
+        return pd.DataFrame(columns=columns)
+    windowed = pd.concat(pieces, ignore_index=True)
+
+    grouper = grouping[0] if len(grouping) == 1 else grouping
+    for key, part in windowed.groupby(grouper, dropna=False, sort=False):
+        if len(grouping) == 1:
+            key = (key,)
+        row = dict(zip(grouping, key, strict=True))
+        values = pd.to_numeric(part["pupil_value"], errors="coerce").to_numpy(float)
+        times = pd.to_numeric(part["time_ms"], errors="coerce").to_numpy(float)
+        valid = np.isfinite(values)
+        n = len(values)
+        nv = int(valid.sum())
+        nm = n - nv
+        finite_values = values[valid]
+        both = np.isfinite(times) & np.isfinite(values)
+        if both.sum() >= 2:
+            order = np.argsort(times[both], kind="stable")
+            tt = times[both][order]
+            yy = values[both][order]
+            auc = float(np.sum(np.diff(tt) * (yy[:-1] + yy[1:]) / 2))
+            span = float(tt.max() - tt.min())
+        else:
+            auc = np.nan
+            span = np.nan
+        row.update(
+            n_samples=n,
+            n_valid_pupil=nv,
+            n_missing_pupil=nm,
+            valid_pupil_pct=100 * nv / n if n else np.nan,
+            missing_pupil_pct=100 * nm / n if n else np.nan,
+            mean_pupil=float(np.mean(finite_values)) if nv else np.nan,
+            sd_pupil=float(np.std(finite_values, ddof=1)) if nv >= 2 else np.nan,
+            median_pupil=float(np.median(finite_values)) if nv else np.nan,
+            min_pupil=float(np.min(finite_values)) if nv else np.nan,
+            max_pupil=float(np.max(finite_values)) if nv else np.nan,
+            q25_pupil=float(np.quantile(finite_values, 0.25)) if nv else np.nan,
+            q75_pupil=float(np.quantile(finite_values, 0.75)) if nv else np.nan,
+            pupil_auc=auc,
+            pupil_time_span_ms=span,
+            pupil_window_status="valid"
+            if nv >= min_valid_samples
+            else ("no_valid_pupil" if nv == 0 else "insufficient_valid_pupil"),
+            pupil_window_pupil_column=pupil_source,
+            pupil_window_time_column=time_source,
+            pupil_window_min_valid_samples=int(min_valid_samples),
+            pupil_window_include_end=bool(include_window_end),
+        )
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    sort_cols = ["window_start_ms", "window_end_ms"] + groups
+    return out.sort_values(sort_cols, kind="stable", ignore_index=True)
 
 
 def summarise_gazepoint_pupil_trial_features(
-    data, pupil_col=None, trial_col=None, group_cols=None
+    data,
+    pupil_col=None,
+    trial_col=None,
+    group_cols=None,
+    *,
+    time_col=None,
+    interpolated_col=None,
+    artifact_col=None,
+    artifact_reason_col=None,
+    early_window=None,
+    middle_window=None,
+    late_window=None,
+    min_valid_samples=None,
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    trial_col = infer_column(df, "trial", trial_col, required=True)
-    groups = normalize_group_cols(df, group_cols) + [trial_col]
-    work = df.copy()
-    work["_p"] = finite_numeric(work[pupil_col])
-    return (
-        work.groupby(groups, dropna=False)
-        .agg(
-            mean_pupil=("_p", "mean"),
-            peak_pupil=("_p", "max"),
-            min_pupil=("_p", "min"),
-            sd_pupil=("_p", "std"),
-            n_valid=("_p", "count"),
+    """Summarise trial-level pupil features using legacy or R v2.3.0 semantics."""
+    r_mode = any(
+        value is not None
+        for value in (
+            time_col,
+            interpolated_col,
+            artifact_col,
+            artifact_reason_col,
+            early_window,
+            middle_window,
+            late_window,
+            min_valid_samples,
         )
-        .reset_index()
     )
+    if not r_mode:
+        df = ensure_dataframe(data, copy=False)
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        trial_col = infer_column(df, "trial", trial_col, required=True)
+        groups = normalize_group_cols(df, group_cols) + [trial_col]
+        work = df.copy()
+        work["_p"] = finite_numeric(work[pupil_col])
+        return (
+            work.groupby(groups, dropna=False)
+            .agg(
+                mean_pupil=("_p", "mean"),
+                peak_pupil=("_p", "max"),
+                min_pupil=("_p", "min"),
+                sd_pupil=("_p", "std"),
+                n_valid=("_p", "count"),
+            )
+            .reset_index()
+        )
+
+    df = ensure_dataframe(data, copy=False)
+    groups = (
+        ["subject", "trial_global"]
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    if len(groups) != len(set(groups)) or any(not isinstance(c, str) or not c for c in groups):
+        raise ValueError("group_cols must contain unique non-empty column names")
+    time_col = "time" if time_col is None else time_col
+    interpolated_col = "pupil_was_interpolated" if interpolated_col is None else interpolated_col
+    early_window = (0, 500) if early_window is None else tuple(early_window)
+    middle_window = (500, 1500) if middle_window is None else tuple(middle_window)
+    late_window = (1500, 3000) if late_window is None else tuple(late_window)
+    min_valid_samples = 1 if min_valid_samples is None else float(min_valid_samples)
+    for name, window in (
+        ("early_window", early_window),
+        ("middle_window", middle_window),
+        ("late_window", late_window),
+    ):
+        if len(window) != 2 or not np.isfinite(window).all() or window[1] <= window[0]:
+            raise ValueError(f"{name} must contain two increasing finite values")
+    if pupil_col is None:
+        pupil_col = _gp3_r_first_present(
+            df,
+            [
+                "pupil_smoothed",
+                "pupil_baseline_corrected",
+                "pupil_baseline_percent_change",
+                "pupil_interpolated",
+                "pupil_clean",
+                "pupil",
+            ],
+        )
+    if pupil_col is None:
+        raise KeyError("Could not automatically detect a pupil column")
+    if artifact_col is None:
+        artifact_col = _gp3_r_first_present(
+            df, ["pupil_artifact_flag", "pupil_flag_invalid", "artifact_flag"]
+        )
+    if artifact_reason_col is None:
+        artifact_reason_col = _gp3_r_first_present(
+            df, ["pupil_artifact_reason", "pupil_flag_reason", "artifact_reason"]
+        )
+    required = groups + [pupil_col, time_col]
+    missing = [c for c in dict.fromkeys(required) if c not in df.columns]
+    if missing:
+        raise KeyError("Missing required columns: " + ", ".join(missing))
+
+    work = df.copy()
+    work["_gp3_pupil"] = pd.to_numeric(work[pupil_col], errors="coerce")
+    work["_gp3_time"] = pd.to_numeric(work[time_col], errors="coerce")
+    if interpolated_col in work.columns:
+        work["_gp3_interp"] = _gp3_r_bool(work[interpolated_col]).astype("boolean")
+    else:
+        work["_gp3_interp"] = pd.Series(pd.NA, index=work.index, dtype="boolean")
+    if artifact_col is not None and artifact_col in work.columns:
+        work["_gp3_artifact"] = _gp3_r_bool(work[artifact_col]).astype("boolean")
+    elif artifact_reason_col is not None and artifact_reason_col in work.columns:
+        reason = work[artifact_reason_col].astype("string")
+        work["_gp3_artifact"] = (reason.notna() & reason.ne("") & reason.ne("valid")).astype(
+            "boolean"
+        )
+    else:
+        work["_gp3_artifact"] = pd.Series(pd.NA, index=work.index, dtype="boolean")
+
+    def mean_window(y, t, window):
+        mask = np.isfinite(y) & np.isfinite(t) & (t >= window[0]) & (t < window[1])
+        return float(np.mean(y[mask])) if mask.any() else np.nan
+
+    def count_window(y, t, window):
+        return int((np.isfinite(y) & np.isfinite(t) & (t >= window[0]) & (t < window[1])).sum())
+
+    rows = []
+    for key, part in _gp3_r_group_parts(work, groups):
+        row = _gp3_r_group_row(groups, key)
+        y = part["_gp3_pupil"].to_numpy(dtype=float)
+        t = part["_gp3_time"].to_numpy(dtype=float)
+        valid = np.isfinite(y) & np.isfinite(t)
+        finite_y = y[np.isfinite(y)]
+        finite_t = t[np.isfinite(t)]
+        n_samples = len(part)
+        n_valid = int(valid.sum())
+        n_missing = int((~valid).sum())
+        interp = part["_gp3_interp"]
+        artifact = part["_gp3_artifact"]
+        n_interp = np.nan if interp.isna().all() else int(interp.fillna(False).sum())
+        n_artifact = np.nan if artifact.isna().all() else int(artifact.fillna(False).sum())
+        if n_valid:
+            peak = float(np.max(y[valid]))
+            first_peak = int(np.flatnonzero(valid & (y == peak))[0])
+            peak_time = float(t[first_peak])
+        else:
+            peak = np.nan
+            peak_time = np.nan
+        if n_valid >= 2 and len(np.unique(t[valid])) >= 2:
+            order = np.argsort(t[valid], kind="stable")
+            tt = t[valid][order]
+            yy = y[valid][order]
+            auc = float(np.sum(np.diff(tt) * (yy[:-1] + yy[1:]) / 2))
+        else:
+            auc = np.nan
+        time_min = float(np.min(finite_t)) if len(finite_t) else np.nan
+        time_max = float(np.max(finite_t)) if len(finite_t) else np.nan
+        row.update(
+            n_samples=n_samples,
+            n_valid_pupil=n_valid,
+            n_missing_pupil=n_missing,
+            valid_sample_pct=100 * n_valid / n_samples if n_samples else np.nan,
+            missing_sample_pct=100 * n_missing / n_samples if n_samples else np.nan,
+            n_interpolated_samples=n_interp,
+            interpolation_pct=(100 * n_interp / n_samples)
+            if n_samples and np.isfinite(n_interp)
+            else np.nan,
+            n_artifact_samples=n_artifact,
+            artifact_pct=(100 * n_artifact / n_samples)
+            if n_samples and np.isfinite(n_artifact)
+            else np.nan,
+            time_min=time_min,
+            time_max=time_max,
+            time_span_ms=time_max - time_min
+            if np.isfinite(time_min) and np.isfinite(time_max)
+            else np.nan,
+            mean_pupil=float(np.mean(finite_y)) if len(finite_y) else np.nan,
+            sd_pupil=float(np.std(finite_y, ddof=1)) if len(finite_y) >= 2 else np.nan,
+            peak_pupil=peak,
+            peak_time_ms=peak_time,
+            time_to_peak_ms=peak_time - time_min
+            if np.isfinite(peak_time) and np.isfinite(time_min)
+            else np.nan,
+            pupil_auc=auc,
+            early_mean_pupil=mean_window(y, t, early_window),
+            middle_mean_pupil=mean_window(y, t, middle_window),
+            late_mean_pupil=mean_window(y, t, late_window),
+            n_valid_early=count_window(y, t, early_window),
+            n_valid_middle=count_window(y, t, middle_window),
+            n_valid_late=count_window(y, t, late_window),
+            early_window_start_ms=float(early_window[0]),
+            early_window_end_ms=float(early_window[1]),
+            middle_window_start_ms=float(middle_window[0]),
+            middle_window_end_ms=float(middle_window[1]),
+            late_window_start_ms=float(late_window[0]),
+            late_window_end_ms=float(late_window[1]),
+            pupil_feature_status="insufficient_valid_samples"
+            if n_valid < min_valid_samples
+            else ("missing_pupil" if not len(finite_y) else "ok"),
+            pupil_feature_pupil_column=pupil_col,
+            pupil_feature_time_column=time_col,
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def summarize_gazepoint_pupil_response_features(data, **kwargs):
