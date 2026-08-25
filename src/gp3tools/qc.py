@@ -224,15 +224,117 @@ def flag_tracking_quality(data, min_usable_prop: float = 0.8, **kwargs) -> pd.Da
 
 
 def clean_gazepoint_by_trackloss(
-    data, validity_col: str | None = None, drop: bool = True
+    data,
+    group_cols=None,
+    tracking_col=None,
+    x_col=None,
+    y_col=None,
+    max_trackloss=0.25,
+    action=None,
+    treat_zero_zero_as_loss=True,
+    rate_col=".gp3_trackloss_rate",
+    exclude_col=".gp3_trackloss_exclude",
+    *,
+    validity_col=None,
+    drop=None,
 ) -> pd.DataFrame:
+    """Flag/filter groups by trackloss, with the legacy row-validity API retained."""
+    if validity_col is not None or drop is not None:
+        df = ensure_dataframe(data)
+        validity_col = infer_column(df, "validity", validity_col)
+        if validity_col is None:
+            return df
+        invert = validity_col.lower() == "trackloss"
+        valid = as_bool(df[validity_col], invert_trackloss=invert)
+        drop = True if drop is None else bool(drop)
+        return df.loc[valid].copy() if drop else df.assign(gp3_track_valid=valid)
+
     df = ensure_dataframe(data)
-    validity_col = infer_column(df, "validity", validity_col)
-    if validity_col is None:
-        return df
-    invert = validity_col.lower() == "trackloss"
-    valid = as_bool(df[validity_col], invert_trackloss=invert)
-    return df.loc[valid].copy() if drop else df.assign(gp3_track_valid=valid)
+    if not np.isfinite(max_trackloss) or not 0 <= float(max_trackloss) <= 1:
+        raise ValueError("max_trackloss must be between 0 and 1")
+
+    action = "flag" if action is None else action
+    if action not in {"flag", "filter"}:
+        raise ValueError("action must be 'flag' or 'filter'")
+
+    groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    missing_groups = [column for column in groups if column not in df.columns]
+    if missing_groups:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing_groups))
+
+    if tracking_col is not None:
+        if tracking_col not in df.columns:
+            raise ValueError(f"data is missing required column(s): {tracking_col}")
+        raw = df[tracking_col]
+        if pd.api.types.is_bool_dtype(raw):
+            trackloss = raw.isna() | ~raw.fillna(False)
+        elif pd.api.types.is_numeric_dtype(raw):
+            numeric = pd.to_numeric(raw, errors="coerce")
+            trackloss = numeric.isna() | numeric.le(0)
+        else:
+            text = raw.astype("string").str.strip().str.lower()
+            trackloss = raw.isna() | text.isin(
+                ["", "0", "false", "f", "invalid", "lost", "missing", "na", "nan"]
+            )
+    else:
+        if x_col is None or y_col is None:
+            raise ValueError("Supply either tracking_col or both x_col and y_col")
+        missing = [column for column in (x_col, y_col) if column not in df.columns]
+        if missing:
+            raise ValueError("data is missing required column(s): " + ", ".join(missing))
+        x = pd.to_numeric(df[x_col], errors="coerce")
+        y = pd.to_numeric(df[y_col], errors="coerce")
+        trackloss = ~(np.isfinite(x) & np.isfinite(y))
+        if bool(treat_zero_zero_as_loss):
+            trackloss = trackloss | (x.eq(0) & y.eq(0))
+
+    work = df.copy()
+    work["_gp3_trackloss_internal"] = pd.Series(trackloss, index=work.index).astype(bool)
+
+    if groups:
+        group_keys = work[groups].astype("string")
+        valid_group = ~group_keys.isna().any(axis=1)
+        key = group_keys.astype(str).agg(".".join, axis=1).where(valid_group)
+    else:
+        key = pd.Series(".gp3_all_rows", index=work.index, dtype="object")
+
+    rates = (
+        work.loc[key.notna()].groupby(key[key.notna()], sort=True)["_gp3_trackloss_internal"].mean()
+    )
+    counts = (
+        work.loc[key.notna()].groupby(key[key.notna()], sort=True)["_gp3_trackloss_internal"].size()
+    )
+    lost = (
+        work.loc[key.notna()].groupby(key[key.notna()], sort=True)["_gp3_trackloss_internal"].sum()
+    )
+
+    row_rate = key.map(rates)
+    row_exclude = row_rate.gt(float(max_trackloss))
+
+    out = df.copy()
+    out[rate_col] = row_rate.to_numpy()
+    out[exclude_col] = row_exclude.to_numpy()
+
+    summary = pd.DataFrame(
+        {
+            "group_id": rates.index.astype(str),
+            "n_rows": counts.reindex(rates.index).astype(int).to_numpy(),
+            "n_trackloss_rows": lost.reindex(rates.index).astype(int).to_numpy(),
+            "trackloss_rate": rates.to_numpy(float),
+            "exclude": rates.gt(float(max_trackloss)).to_numpy(bool),
+        }
+    )
+    out.attrs["gp3_trackloss_summary"] = summary
+
+    if action == "filter":
+        out = out.loc[~out[exclude_col].fillna(False)].reset_index(drop=True)
+        out.attrs["gp3_trackloss_summary"] = summary
+
+    return out
 
 
 def summarise_gazepoint_missingness(
@@ -760,12 +862,208 @@ def summarise_gazepoint_coordinate_coverage(
 summarize_gazepoint_coordinate_coverage = summarise_gazepoint_coordinate_coverage
 
 
-def audit_gazepoint_design_balance(data, group_cols=("subject", "condition")) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    cols = [c for c in group_cols if c in df]
-    if not cols:
-        return result_table(n_rows=len(df))
-    return df.groupby(cols, dropna=False).size().rename("n").reset_index()
+def audit_gazepoint_design_balance(
+    data,
+    subject_col="subject",
+    condition_col="condition",
+    unit_cols=("media_id", "trial_global"),
+    expected_conditions=None,
+    min_units_per_condition=1,
+    max_condition_ratio=2,
+    require_all_conditions_per_subject=True,
+    *,
+    group_cols=None,
+):
+    """Audit experimental balance; group_cols retains the historical count table."""
+    frame = ensure_dataframe(data, copy=False)
+    if group_cols is not None:
+        columns = [column for column in group_cols if column in frame.columns]
+        if not columns:
+            return result_table(n_rows=len(frame))
+        return frame.groupby(columns, dropna=False).size().rename("n").reset_index()
+
+    if frame.empty:
+        raise ValueError("data must contain at least one row")
+    work = frame.copy()
+    if "MEDIA_ID" in work.columns and "media_id" not in work.columns:
+        work["media_id"] = work["MEDIA_ID"]
+    if "USER_FILE" in work.columns and "subject" not in work.columns:
+        work["subject"] = work["USER_FILE"]
+    if subject_col == "USER_FILE" and "subject" in work.columns:
+        subject_col = "subject"
+    if condition_col not in work.columns or subject_col not in work.columns:
+        missing = [column for column in (subject_col, condition_col) if column not in work.columns]
+        raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+    unit_cols = (
+        []
+        if unit_cols is None
+        else ([unit_cols] if isinstance(unit_cols, str) else list(unit_cols))
+    )
+    unit_cols = [
+        "media_id" if column == "MEDIA_ID" else "subject" if column == "USER_FILE" else column
+        for column in unit_cols
+    ]
+    unit_cols = [column for column in unit_cols if column in work.columns]
+    if min_units_per_condition <= 0 or not np.isfinite(min_units_per_condition):
+        raise ValueError("min_units_per_condition must be positive")
+    if max_condition_ratio <= 0 or not np.isfinite(max_condition_ratio):
+        raise ValueError("max_condition_ratio must be positive")
+    if not isinstance(require_all_conditions_per_subject, (bool, np.bool_)):
+        raise ValueError("require_all_conditions_per_subject must be TRUE or FALSE")
+
+    observed = sorted(
+        value
+        for value in work[condition_col].astype("string").dropna().unique().tolist()
+        if str(value)
+    )
+    if not observed:
+        raise ValueError("condition_col must contain at least one non-missing condition")
+    conditions = observed if expected_conditions is None else list(expected_conditions)
+    if not conditions or any(not isinstance(value, str) or not value for value in conditions):
+        raise ValueError("expected_conditions must be a non-empty character vector")
+
+    keep = list(dict.fromkeys([subject_col, condition_col, *unit_cols]))
+    units = work[keep].copy()
+    units[subject_col] = units[subject_col].astype("string")
+    units[condition_col] = units[condition_col].astype("string")
+    units = units.loc[
+        units[subject_col].notna()
+        & units[subject_col].ne("")
+        & units[condition_col].notna()
+        & units[condition_col].ne("")
+    ].drop_duplicates()
+    if units.empty:
+        raise ValueError("subject_col and condition_col must define at least one usable row")
+
+    subjects = sorted(units[subject_col].astype(str).unique())
+    grid = pd.MultiIndex.from_product(
+        [subjects, conditions], names=[subject_col, condition_col]
+    ).to_frame(index=False)
+    counts = (
+        units.groupby([subject_col, condition_col], sort=True)
+        .size()
+        .rename("n_units")
+        .reset_index()
+    )
+    cells = grid.merge(counts, on=[subject_col, condition_col], how="left", sort=False)
+    cells["n_units"] = cells["n_units"].fillna(0).astype(int)
+    cells["design_cell_status"] = np.select(
+        [
+            cells["n_units"].eq(0),
+            cells["n_units"].lt(min_units_per_condition),
+        ],
+        ["missing_condition", "too_few_units"],
+        default="ok",
+    )
+
+    subject_rows = []
+    for subject, block in cells.groupby(subject_col, sort=True):
+        counts_array = block["n_units"].to_numpy(int)
+        nonzero = counts_array[counts_array > 0]
+        n_missing = int(np.sum(counts_array == 0))
+        n_low = int(block["design_cell_status"].eq("too_few_units").sum())
+        ratio = float(nonzero.max() / nonzero.min()) if len(nonzero) > 1 else np.nan
+        if require_all_conditions_per_subject and n_missing > 0:
+            status = "missing_condition"
+        elif n_low > 0:
+            status = "too_few_units"
+        elif np.isfinite(ratio) and ratio > max_condition_ratio:
+            status = "condition_count_imbalance"
+        else:
+            status = "ok"
+        subject_rows.append(
+            {
+                subject_col: str(subject),
+                "n_conditions_expected": len(conditions),
+                "n_conditions_observed": int(np.sum(counts_array > 0)),
+                "min_units_per_condition_observed": int(nonzero.min()) if len(nonzero) else np.nan,
+                "max_units_per_condition_observed": int(nonzero.max()) if len(nonzero) else np.nan,
+                "condition_count_ratio": ratio,
+                "n_missing_conditions": n_missing,
+                "n_low_count_conditions": n_low,
+                "design_balance_status": status,
+            }
+        )
+    subject_summary = pd.DataFrame(subject_rows)
+
+    condition_rows = []
+    for condition, block in cells.groupby(condition_col, sort=True):
+        nonzero = block.loc[block["n_units"].gt(0), "n_units"]
+        condition_rows.append(
+            {
+                condition_col: str(condition),
+                "n_subject_cells": len(block),
+                "n_subjects_with_condition": int(block["n_units"].gt(0).sum()),
+                "n_subjects_missing_condition": int(block["n_units"].eq(0).sum()),
+                "total_units": int(block["n_units"].sum()),
+                "min_units_per_subject": int(nonzero.min()) if len(nonzero) else np.nan,
+                "max_units_per_subject": int(nonzero.max()) if len(nonzero) else np.nan,
+                "mean_units_per_subject": float(block["n_units"].mean()),
+                "condition_summary_status": (
+                    "ok" if block["n_units"].eq(0).sum() == 0 else "missing_for_some_subjects"
+                ),
+            }
+        )
+    condition_summary = pd.DataFrame(condition_rows)
+    imbalance_summary = (
+        subject_summary["design_balance_status"]
+        .value_counts(sort=False)
+        .rename_axis("design_balance_status")
+        .rename("n_subjects")
+        .reset_index()
+        .sort_values("design_balance_status", kind="stable")
+        .reset_index(drop=True)
+    )
+    flagged_cells = cells.loc[~cells["design_cell_status"].eq("ok")].copy()
+    n_flagged_subjects = int(subject_summary["design_balance_status"].ne("ok").sum())
+    overview = pd.DataFrame(
+        [
+            {
+                "n_rows": len(work),
+                "n_units": len(units),
+                "n_subjects": units[subject_col].nunique(),
+                "n_conditions": len(conditions),
+                "n_flagged_subjects": n_flagged_subjects,
+                "n_flagged_cells": len(flagged_cells),
+                "design_balance_status": (
+                    "ok" if n_flagged_subjects == 0 and len(flagged_cells) == 0 else "review"
+                ),
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "subject_col",
+                "condition_col",
+                "unit_cols",
+                "expected_conditions",
+                "min_units_per_condition",
+                "max_condition_ratio",
+                "require_all_conditions_per_subject",
+            ],
+            "value": [
+                subject_col,
+                condition_col,
+                ", ".join(unit_cols),
+                pd.NA if expected_conditions is None else ", ".join(conditions),
+                str(min_units_per_condition),
+                str(max_condition_ratio),
+                "TRUE" if require_all_conditions_per_subject else "FALSE",
+            ],
+        }
+    )
+    return {
+        "overview": overview,
+        "subject_summary": subject_summary,
+        "condition_summary": condition_summary,
+        "cell_summary": cells,
+        "imbalance_summary": imbalance_summary,
+        "flagged_cells": flagged_cells,
+        "settings": settings,
+        "_gp3_class": "gp3_design_balance_audit",
+    }
 
 
 def audit_gazepoint_condition_quality_imbalance(data, condition_col=None, **kwargs) -> pd.DataFrame:

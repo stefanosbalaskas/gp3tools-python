@@ -309,11 +309,86 @@ def report_gazepoint_phase_coverage(
     }
 
 
-def report_gazepoint_qc_overview(data) -> str:
+def report_gazepoint_qc_overview(data, max_objects=None):
+    """Return the legacy short text or an R-style structured QC overview."""
     from .qc import summarise_gazepoint_qc_status
 
-    q = summarise_gazepoint_qc_status(data)
-    return f"QC summary contains {len(q)} evaluated unit(s)."
+    if isinstance(data, pd.DataFrame) and {"object_name", "qc_status"}.issubset(data.columns):
+        summary_table = data[["object_name", "qc_status"]].copy()
+    elif isinstance(data, pd.DataFrame) and {"component", "status"}.issubset(data.columns):
+        summary_table = data[["component", "status"]].copy()
+    else:
+        summary_table = summarise_gazepoint_qc_status(data)
+    if max_objects is None:
+        return f"QC summary contains {len(summary_table)} evaluated unit(s)."
+    try:
+        max_objects = int(max_objects)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_objects must be a positive integer") from exc
+    if max_objects < 1:
+        raise ValueError("max_objects must be a positive integer")
+
+    if {"component", "status"}.issubset(summary_table.columns):
+        object_summary = summary_table.rename(
+            columns={"component": "object_name", "status": "qc_status"}
+        ).copy()
+    else:
+        object_summary = summary_table.copy()
+        if "object_name" not in object_summary:
+            object_summary["object_name"] = [f"object_{i + 1}" for i in range(len(object_summary))]
+        if "qc_status" not in object_summary:
+            object_summary["qc_status"] = "unknown"
+    status = object_summary["qc_status"].astype(str)
+    counts = {
+        label: int(status.eq(label).sum()) for label in ["pass", "warn", "fail", "info", "unknown"]
+    }
+    counts["unknown"] += int(
+        ~status.isin(
+            ["pass", "warn", "fail", "info", "unknown", "available", "not_available"]
+        ).sum()
+    )
+    counts["pass"] += int(status.eq("available").sum())
+    counts["unknown"] += int(status.eq("not_available").sum())
+    overall_status = (
+        "fail" if counts["fail"] else "warn" if counts["warn"] or counts["unknown"] else "pass"
+    )
+    overview = pd.DataFrame(
+        [
+            {
+                "n_objects": len(object_summary),
+                "n_pass": counts["pass"],
+                "n_warn": counts["warn"],
+                "n_fail": counts["fail"],
+                "n_info": counts["info"],
+                "n_unknown": counts["unknown"],
+                "qc_overview_status": overall_status,
+            }
+        ]
+    )
+    review = object_summary.loc[
+        object_summary["qc_status"].astype(str).isin(["fail", "warn", "unknown", "not_available"])
+    ].copy()
+    priority = {"fail": 0, "warn": 1, "unknown": 2, "not_available": 2}
+    if len(review):
+        review["_order"] = review["qc_status"].astype(str).map(priority).fillna(3)
+        review = review.sort_values(["_order", "object_name"], kind="stable")
+    names = review["object_name"].head(max_objects).astype(str).tolist() if len(review) else []
+    review_text = ", ".join(names) if names else "none"
+    report_text = (
+        f"QC overview collected {len(object_summary)} object(s): "
+        f"{counts['pass']} pass, {counts['warn']} warn, {counts['fail']} fail, "
+        f"{counts['info']} info, and {counts['unknown']} unknown. "
+        f"Overall QC overview status was '{overall_status}'. "
+        f"Object(s) needing review or interpretation: {review_text}. "
+        "This overview is a reporting aid only; it does not replace the underlying "
+        "audit outputs, readiness gates, or exclusion decisions."
+    )
+    return {
+        "summary": {"overview": overview, "object_summary": object_summary},
+        "object_summary": object_summary,
+        "report_text": report_text,
+        "_gp3_class": "gp3_qc_overview_report",
+    }
 
 
 def report_gazepoint_face_qc(data) -> str:
@@ -323,11 +398,95 @@ def report_gazepoint_face_qc(data) -> str:
     return f"Face-quality audit evaluated {int(q['n'].iloc[0])} row(s)."
 
 
-def report_gazepoint_multiverse(data) -> str:
-    from .stats import summarise_gazepoint_multiverse_results
+def report_gazepoint_multiverse(
+    data,
+    *,
+    branch_col=None,
+    term_col=None,
+    estimate_col=None,
+    p_col=None,
+    status_col=None,
+    alpha=None,
+):
+    """Report multiverse results; bare DataFrame input retains the historical string."""
+    if all(
+        value is None for value in (branch_col, term_col, estimate_col, p_col, status_col, alpha)
+    ):
+        from .stats import summarise_gazepoint_multiverse_results
 
-    s = summarise_gazepoint_multiverse_results(data)
-    return f"Multiverse contained {int(s['n_specifications'].iloc[0])} specification(s)."
+        summary = summarise_gazepoint_multiverse_results(data)
+        if isinstance(summary, pd.DataFrame):
+            return (
+                f"Multiverse contained {int(summary['n_specifications'].iloc[0])} specification(s)."
+            )
+
+    alpha = 0.05 if alpha is None else float(alpha)
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between 0 and 1")
+    if isinstance(data, dict):
+        frame = data.get("branch_summary")
+        if frame is None:
+            frame = data.get("branch_results")
+    else:
+        frame = data
+    frame = ensure_dataframe(frame, copy=False)
+
+    def first(supplied, candidates):
+        if supplied is not None:
+            if supplied not in frame.columns:
+                raise ValueError(f"{supplied} was not found")
+            return supplied
+        return next((candidate for candidate in candidates if candidate in frame.columns), None)
+
+    branch_col = first(branch_col, ["branch", "specification", "model", "analysis", ".gp3_branch"])
+    term_col = first(term_col, ["term", "parameter", "effect", "coefficient"])
+    estimate_col = first(estimate_col, ["estimate", "effect_size", "beta", "b"])
+    p_col = first(p_col, ["p.value", "p_value", "p", "Pr(>|z|)", "Pr(>|t|)"])
+    status_col = first(status_col, ["status", "model_status", "fit_status", "branch_status"])
+    work = frame.copy()
+    if branch_col is None:
+        work[".gp3_branch"] = "all"
+        branch_col = ".gp3_branch"
+    if status_col is None:
+        work[".gp3_status"] = "unknown"
+        status_col = ".gp3_status"
+
+    branch_summary = (
+        work.groupby(branch_col, sort=True, dropna=True)
+        .agg(
+            n_rows=(branch_col, "size"),
+            status=(status_col, lambda values: ";".join(sorted(set(map(str, values))))),
+        )
+        .reset_index()
+        .rename(columns={branch_col: "branch"})
+    )
+    if term_col is not None:
+        n_terms = work.groupby(branch_col, sort=True)[term_col].nunique()
+        branch_summary["n_terms"] = branch_summary["branch"].map(n_terms)
+    else:
+        branch_summary["n_terms"] = np.nan
+    status_summary = (
+        work[status_col]
+        .astype(str)
+        .value_counts(sort=False)
+        .rename_axis("status")
+        .rename("n")
+        .reset_index()
+    )
+    status_summary["prop"] = status_summary["n"] / status_summary["n"].sum()
+    inferential = pd.DataFrame()
+    if estimate_col is not None and p_col is not None:
+        inferential = work[
+            [branch_col] + ([term_col] if term_col else []) + [estimate_col, p_col]
+        ].copy()
+        inferential["significant"] = pd.to_numeric(inferential[p_col], errors="coerce") < alpha
+    return {
+        "branch_summary": branch_summary,
+        "status_summary": status_summary,
+        "inferential_summary": inferential,
+        "alpha": alpha,
+        "_gp3_class": "gp3_multiverse_report",
+    }
 
 
 def benchmark_gazepoint_export_performance(data, repeats=3, **kwargs) -> pd.DataFrame:
@@ -1113,9 +1272,89 @@ def create_gazepoint_cross_package_report(
     )
 
 
-def export_gazepoint_cluster_results(result, output_dir="cluster_results", prefix="cluster"):
+def export_gazepoint_cluster_results(
+    result,
+    output_dir="cluster_results",
+    prefix="cluster",
+    *,
+    overwrite=False,
+):
     root = Path(output_dir)
+    if root.exists() and any(root.iterdir()) and not overwrite:
+        # Preserve the historical API when its default output_dir/prefix path is used.
+        # R-compatible callers can set overwrite=True to reuse a populated directory.
+        raise FileExistsError("output directory already exists; use overwrite=True to reuse it")
     root.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(result, dict) and any(
+        key in result
+        for key in (
+            "cluster_summary",
+            "cluster_table",
+            "null_distribution",
+            "null_statistics",
+            "max_cluster_statistics",
+            "permutation_distribution",
+            "cluster_status",
+        )
+    ):
+        from .stats import report_gazepoint_cluster_permutation, summarize_gazepoint_time_clusters
+
+        try:
+            clusters = summarize_gazepoint_time_clusters(result)
+        except Exception:
+            clusters = None
+            for key in ("clusters", "cluster_summary", "cluster_table"):
+                if key in result and result[key] is not None:
+                    clusters = result[key]
+                    break
+        written_rows = []
+        if isinstance(clusters, pd.DataFrame):
+            path = root / "cluster_summary.csv"
+            clusters.to_csv(path, index=False)
+            written_rows.append({"file": str(path), "file_type": "cluster_summary"})
+        null_values = next(
+            (
+                result[key]
+                for key in [
+                    "null_distribution",
+                    "null_statistics",
+                    "max_cluster_statistics",
+                    "permutation_distribution",
+                ]
+                if key in result and np.asarray(result[key]).ndim == 1
+            ),
+            None,
+        )
+        if null_values is not None:
+            path = root / "null_distribution.csv"
+            pd.DataFrame({"null_statistic": np.asarray(null_values, dtype=float)}).to_csv(
+                path, index=False
+            )
+            written_rows.append({"file": str(path), "file_type": "null_distribution"})
+        try:
+            report = report_gazepoint_cluster_permutation(result)
+            report_text = (
+                report.get("report_text", str(report)) if isinstance(report, dict) else str(report)
+            )
+            path = root / "cluster_report.txt"
+            path.write_text(report_text, encoding="utf-8")
+            written_rows.append({"file": str(path), "file_type": "report_text"})
+        except Exception:
+            pass
+        if "settings" in result:
+            settings = result["settings"]
+            settings_frame = (
+                pd.DataFrame([settings])
+                if isinstance(settings, dict)
+                else ensure_dataframe(settings)
+            )
+            path = root / "cluster_settings.csv"
+            settings_frame.to_csv(path, index=False)
+            written_rows.append({"file": str(path), "file_type": "settings"})
+        if written_rows:
+            return pd.DataFrame(written_rows)
+
     if isinstance(result, dict):
         return write_gazepoint_outputs(result, root, prefix=prefix)
     return export_gazepoint_tables({"clusters": ensure_dataframe(result)}, root, prefix=prefix)

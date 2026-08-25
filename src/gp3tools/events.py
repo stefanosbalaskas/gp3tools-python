@@ -993,25 +993,138 @@ def create_gazepoint_event_review_template(
 
 
 def simulate_gazepoint_fixations(
-    n_fixations: int = 30, samples_per_fixation: int = 8, random_state: int = 123
+    n_fixations: int = 30,
+    samples_per_fixation: int = 8,
+    random_state: int = 123,
+    *,
+    n_subjects=None,
+    n_fix=None,
+    sd=None,
+    coordinate_system=None,
+    screen_width=None,
+    screen_height=None,
+    duration_mean=None,
+    duration_sd=None,
+    saccade_gap_mean=None,
+    seed=None,
 ) -> pd.DataFrame:
-    rng = np.random.default_rng(random_state)
+    """Simulate fixation data using legacy sample-level or R v2.3.0 fixation-level output."""
+    r_mode = any(
+        value is not None
+        for value in (
+            n_subjects,
+            n_fix,
+            sd,
+            coordinate_system,
+            screen_width,
+            screen_height,
+            duration_mean,
+            duration_sd,
+            saccade_gap_mean,
+            seed,
+        )
+    )
+    if not r_mode:
+        rng = np.random.default_rng(random_state)
+        rows = []
+        time = 0.0
+        for fixation_id in range(1, n_fixations + 1):
+            center_x, center_y = rng.uniform(0.1, 0.9, 2)
+            for _ in range(samples_per_fixation):
+                rows.append(
+                    {
+                        "TIME": time,
+                        "FPOGX": center_x + rng.normal(0, 0.005),
+                        "FPOGY": center_y + rng.normal(0, 0.005),
+                        "fixation": True,
+                        "fixation_id": fixation_id,
+                    }
+                )
+                time += 1 / 60
+            time += rng.uniform(0.02, 0.08)
+        return pd.DataFrame(rows)
+
+    n_subjects = 10 if n_subjects is None else n_subjects
+    n_fix = 50 if n_fix is None else n_fix
+    sd = 10 if sd is None else sd
+    coordinate_system = "pixels" if coordinate_system is None else coordinate_system
+    screen_width = 1920 if screen_width is None else screen_width
+    screen_height = 1080 if screen_height is None else screen_height
+    duration_mean = 250 if duration_mean is None else duration_mean
+    duration_sd = 80 if duration_sd is None else duration_sd
+    saccade_gap_mean = 40 if saccade_gap_mean is None else saccade_gap_mean
+
+    if coordinate_system not in {"pixels", "normalized"}:
+        raise ValueError("coordinate_system must be 'pixels' or 'normalized'")
+    for value, name in ((n_subjects, "n_subjects"), (n_fix, "n_fix")):
+        if isinstance(value, (bool, np.bool_)) or not float(value).is_integer() or int(value) < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    for value, name in (
+        (sd, "sd"),
+        (screen_width, "screen_width"),
+        (screen_height, "screen_height"),
+        (duration_mean, "duration_mean"),
+        (duration_sd, "duration_sd"),
+        (saccade_gap_mean, "saccade_gap_mean"),
+    ):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be non-negative and finite")
+    if screen_width <= 0 or screen_height <= 0 or duration_mean <= 0:
+        raise ValueError("Screen dimensions and duration_mean must be positive")
+
+    rng = np.random.default_rng(seed)
     rows = []
-    t = 0.0
-    for fid in range(1, n_fixations + 1):
-        cx, cy = rng.uniform(0.1, 0.9, 2)
-        for _ in range(samples_per_fixation):
+    for subject_index in range(1, int(n_subjects) + 1):
+        duration_ms = np.maximum(
+            40.0,
+            rng.normal(float(duration_mean), float(duration_sd), int(n_fix)),
+        )
+        gap_ms = np.maximum(
+            0.0,
+            rng.exponential(max(float(saccade_gap_mean), 1.0), int(n_fix)),
+        )
+        if coordinate_system == "pixels":
+            x0 = rng.uniform(0.2 * screen_width, 0.8 * screen_width)
+            y0 = rng.uniform(0.2 * screen_height, 0.8 * screen_height)
+            x = x0 + np.cumsum(rng.normal(0, sd, int(n_fix)))
+            y = y0 + np.cumsum(rng.normal(0, sd, int(n_fix)))
+            x = np.clip(x, 0, screen_width)
+            y = np.clip(y, 0, screen_height)
+            fpogx = x / screen_width
+            fpogy = y / screen_height
+        else:
+            x0 = rng.uniform(0.2, 0.8)
+            y0 = rng.uniform(0.2, 0.8)
+            step_sd = sd / max(screen_width, screen_height) if sd > 1 else sd
+            x = np.clip(x0 + np.cumsum(rng.normal(0, step_sd, int(n_fix))), 0, 1)
+            y = np.clip(y0 + np.cumsum(rng.normal(0, step_sd, int(n_fix))), 0, 1)
+            fpogx, fpogy = x, y
+
+        onset_ms = np.concatenate([[0.0], np.cumsum((duration_ms + gap_ms)[:-1])])
+        end_ms = onset_ms + duration_ms
+        subject = f"P{subject_index:03d}"
+        for index in range(int(n_fix)):
             rows.append(
                 {
-                    "TIME": t,
-                    "FPOGX": cx + rng.normal(0, 0.005),
-                    "FPOGY": cy + rng.normal(0, 0.005),
-                    "fixation": True,
-                    "fixation_id": fid,
+                    "USER_ID": subject,
+                    "MEDIA_ID": "simulated_stimulus",
+                    "FPOGID": index + 1,
+                    "FPOGS": onset_ms[index] / 1000,
+                    "FPOGD": duration_ms[index] / 1000,
+                    "FPOGX": fpogx[index],
+                    "FPOGY": fpogy[index],
+                    "FPOGV": 1,
+                    "subject": subject,
+                    "fixation_id": index + 1,
+                    "start_time": onset_ms[index] / 1000,
+                    "end_time": end_ms[index] / 1000,
+                    "duration": duration_ms[index],
+                    "duration_ms": duration_ms[index],
+                    "x": x[index],
+                    "y": y[index],
+                    "coordinate_system": coordinate_system,
                 }
             )
-            t += 1 / 60
-        t += rng.uniform(0.02, 0.08)
     return pd.DataFrame(rows)
 
 

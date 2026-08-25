@@ -2140,23 +2140,185 @@ def compute_gazepoint_time_varying_transition_matrix(
 
 
 def compute_gazepoint_aoi_entropy(
-    data=None, sequence=None, aoi_col=None, group_cols=None, time_col=None, normalize=True
+    data=None,
+    sequence=None,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    normalize=True,
+    *,
+    include_missing=False,
+    missing_label="missing",
+    collapse_repeats=False,
+    log_base=2,
 ) -> pd.DataFrame:
+    """Compute AOI entropy using legacy scalar-sequence or R v2.3.0 semantics."""
     if data is None:
         seqdf = pd.DataFrame([{"sequence": list(sequence or [])}])
         groups = []
-    else:
-        seqdf, groups = _sequence_frame(data, aoi_col, group_cols, time_col)
+        rows = []
+        for _, row in seqdf.iterrows():
+            values = row.sequence
+            counts = np.array(list(Counter(values).values()), dtype=float)
+            probabilities = counts / counts.sum() if counts.sum() else np.array([])
+            entropy = (
+                float(-(probabilities * np.log2(probabilities)).sum())
+                if len(probabilities)
+                else 0.0
+            )
+            n_states = len(counts)
+            normalized = entropy / np.log2(n_states) if normalize and n_states > 1 else entropy
+            rows.append(
+                {
+                    "n": len(values),
+                    "n_states": n_states,
+                    "entropy": entropy,
+                    "normalized_entropy": normalized,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    frame = ensure_dataframe(data, copy=False)
+    if not isinstance(aoi_col, str) or not aoi_col:
+        raise ValueError("aoi_col must be a non-empty string")
+    groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    needed = [aoi_col, *groups]
+    if time_col is not None:
+        if not isinstance(time_col, str) or not time_col:
+            raise ValueError("time_col must be None or a non-empty string")
+        needed.append(time_col)
+    missing = [column for column in needed if column not in frame.columns]
+    if missing:
+        raise ValueError("Missing columns: " + ", ".join(missing))
+    if not isinstance(include_missing, (bool, np.bool_)):
+        raise ValueError("include_missing must be TRUE or FALSE")
+    if not isinstance(collapse_repeats, (bool, np.bool_)):
+        raise ValueError("collapse_repeats must be TRUE or FALSE")
+    if not isinstance(missing_label, str) or not missing_label:
+        raise ValueError("missing_label must be a non-empty string")
+    if (
+        isinstance(log_base, (bool, np.bool_))
+        or not isinstance(log_base, (int, float, np.integer, np.floating))
+        or not np.isfinite(log_base)
+        or log_base <= 0
+        or log_base == 1
+    ):
+        raise ValueError("log_base must be a positive finite numeric scalar other than 1")
+
+    def entropy_value(values):
+        counts = pd.Series(values, dtype="object").value_counts(dropna=False).to_numpy(float)
+        if counts.sum() <= 0:
+            return np.nan
+        probabilities = counts / counts.sum()
+        return float(-(probabilities * (np.log(probabilities) / np.log(log_base))).sum())
+
+    def normalized_entropy(value, n_levels):
+        if not np.isfinite(value):
+            return np.nan
+        if n_levels <= 1:
+            return 0.0
+        maximum = np.log(n_levels) / np.log(log_base)
+        return float(value / maximum) if maximum > 0 else np.nan
+
+    iterator = [((), frame)] if not groups else frame.groupby(groups, sort=True, dropna=True)
     rows = []
-    for _, r in seqdf.iterrows():
-        seq = r.sequence
-        counts = np.array(list(Counter(seq).values()), dtype=float)
-        p = counts / counts.sum() if counts.sum() else np.array([])
-        h = float(-(p * np.log2(p)).sum()) if len(p) else 0.0
-        k = len(counts)
-        hn = h / np.log2(k) if normalize and k > 1 else h
-        base = {c: r[c] for c in groups}
-        rows.append({**base, "n": len(seq), "n_states": k, "entropy": h, "normalized_entropy": hn})
+    for key, block in iterator:
+        if time_col is not None:
+            block = block.sort_values(time_col, kind="stable", na_position="last")
+        values = []
+        for value in block[aoi_col]:
+            missing_value = pd.isna(value) or str(value).strip() == ""
+            if missing_value:
+                if include_missing:
+                    values.append(missing_label)
+                continue
+            values.append(str(value))
+        if collapse_repeats:
+            values = list(collapse_consecutive(values))
+
+        base = {}
+        if groups:
+            key = key if isinstance(key, tuple) else (key,)
+            base = {column: value for column, value in zip(groups, key, strict=True)}
+
+        n_observations = len(values)
+        n_aoi = len(set(values))
+        if n_observations == 0:
+            rows.append(
+                {
+                    **base,
+                    "n_observations": 0,
+                    "n_aoi": 0,
+                    "spatial_entropy": np.nan,
+                    "spatial_entropy_norm": np.nan,
+                    "n_transitions": 0,
+                    "n_transition_types": 0,
+                    "transition_entropy": np.nan,
+                    "transition_entropy_norm": np.nan,
+                    "conditional_transition_entropy": np.nan,
+                    "conditional_transition_entropy_norm": np.nan,
+                    "entropy_status": "no_valid_aoi",
+                }
+            )
+            continue
+
+        spatial_entropy = entropy_value(values)
+        spatial_norm = normalized_entropy(spatial_entropy, n_aoi)
+        if n_observations < 2:
+            rows.append(
+                {
+                    **base,
+                    "n_observations": n_observations,
+                    "n_aoi": n_aoi,
+                    "spatial_entropy": spatial_entropy,
+                    "spatial_entropy_norm": spatial_norm,
+                    "n_transitions": 0,
+                    "n_transition_types": 0,
+                    "transition_entropy": np.nan,
+                    "transition_entropy_norm": np.nan,
+                    "conditional_transition_entropy": np.nan,
+                    "conditional_transition_entropy_norm": np.nan,
+                    "entropy_status": "no_transitions",
+                }
+            )
+            continue
+
+        from_values = values[:-1]
+        to_values = values[1:]
+        transitions = [
+            f"{left} -> {right}" for left, right in zip(from_values, to_values, strict=True)
+        ]
+        transition_entropy = entropy_value(transitions)
+        n_transition_types = len(set(transitions))
+        transition_norm = normalized_entropy(transition_entropy, n_transition_types)
+
+        conditional = 0.0
+        for from_level in dict.fromkeys(from_values):
+            indexes = [i for i, value in enumerate(from_values) if value == from_level]
+            weight = len(indexes) / len(from_values)
+            conditional += weight * entropy_value([to_values[i] for i in indexes])
+        conditional_norm = normalized_entropy(conditional, n_aoi)
+
+        rows.append(
+            {
+                **base,
+                "n_observations": n_observations,
+                "n_aoi": n_aoi,
+                "spatial_entropy": spatial_entropy,
+                "spatial_entropy_norm": spatial_norm,
+                "n_transitions": len(transitions),
+                "n_transition_types": n_transition_types,
+                "transition_entropy": transition_entropy,
+                "transition_entropy_norm": transition_norm,
+                "conditional_transition_entropy": conditional,
+                "conditional_transition_entropy_norm": conditional_norm,
+                "entropy_status": "ok",
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -3467,13 +3629,205 @@ def summarise_gazepoint_aoi_windows(
 
 
 def transform_gazepoint_aoi_empirical_logit(
-    data, success_col="success", total_col="total", adjustment=0.5, output_col="empirical_logit"
+    data,
+    numerator_col=None,
+    denominator_col=None,
+    proportion_col=None,
+    correction=0.5,
+    pseudo_denominator=1,
+    output_col=None,
+    adjusted_proportion_col="aoi_proportion_adjusted",
+    raw_proportion_col="aoi_proportion_raw",
+    numerator_output_col="aoi_numerator",
+    denominator_output_col="aoi_denominator",
+    status_col="aoi_empirical_logit_status",
+    overwrite=False,
+    name="gazepoint_aoi_empirical_logit",
+    *,
+    success_col=None,
+    total_col=None,
+    adjustment=None,
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    s = finite_numeric(df[success_col])
-    n = finite_numeric(df[total_col])
-    df[output_col] = np.log((s + adjustment) / (n - s + adjustment))
-    return df
+    """Apply empirical-logit transformation with legacy success/total compatibility."""
+    frame = ensure_dataframe(data)
+    legacy = (
+        numerator_col is None
+        and denominator_col is None
+        and proportion_col is None
+        and ("success" in frame.columns or success_col is not None)
+        and ("total" in frame.columns or total_col is not None)
+    )
+    if legacy:
+        success_col = "success" if success_col is None else success_col
+        total_col = "total" if total_col is None else total_col
+        adjustment = correction if adjustment is None else adjustment
+        target = "empirical_logit" if output_col is None else output_col
+        success = finite_numeric(frame[success_col])
+        total = finite_numeric(frame[total_col])
+        frame[target] = np.log((success + adjustment) / (total - success + adjustment))
+        return frame
+
+    if frame.empty:
+        raise ValueError("data must contain at least one row")
+    if proportion_col is None and (numerator_col is None or denominator_col is None):
+        raise ValueError("Supply either proportion_col or both numerator_col and denominator_col")
+    for column, argument in (
+        (numerator_col, "numerator_col"),
+        (denominator_col, "denominator_col"),
+        (proportion_col, "proportion_col"),
+    ):
+        if column is not None and (
+            not isinstance(column, str) or not column or column not in frame.columns
+        ):
+            raise ValueError(f"{argument} must identify a column in data")
+    for value, argument in ((correction, "correction"), (pseudo_denominator, "pseudo_denominator")):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{argument} must be a positive finite numeric scalar")
+    if not isinstance(overwrite, (bool, np.bool_)):
+        raise ValueError("overwrite must be TRUE or FALSE")
+    if not isinstance(name, str) or not name:
+        raise ValueError("name must be a non-empty string")
+
+    output_col = "aoi_empirical_logit" if output_col is None else output_col
+    output_columns = [
+        output_col,
+        adjusted_proportion_col,
+        raw_proportion_col,
+        numerator_output_col,
+        denominator_output_col,
+        status_col,
+    ]
+    if any(not isinstance(column, str) or not column for column in output_columns):
+        raise ValueError("output column names must be non-empty strings")
+    if len(set(output_columns)) != len(output_columns):
+        raise ValueError("Output column names must be unique")
+    existing = [column for column in output_columns if column in frame.columns]
+    if existing and not overwrite:
+        raise ValueError(
+            "Output column(s) already exist in data: "
+            + ", ".join(existing)
+            + ". Use overwrite=True to replace them"
+        )
+
+    if numerator_col is not None and denominator_col is not None:
+        numerator = pd.to_numeric(frame[numerator_col], errors="coerce").to_numpy(float)
+        denominator = pd.to_numeric(frame[denominator_col], errors="coerce").to_numpy(float)
+        raw = numerator / denominator
+        denominator_source = "observed_denominator"
+    elif proportion_col is not None and denominator_col is not None:
+        raw = pd.to_numeric(frame[proportion_col], errors="coerce").to_numpy(float)
+        denominator = pd.to_numeric(frame[denominator_col], errors="coerce").to_numpy(float)
+        numerator = raw * denominator
+        denominator_source = "observed_denominator_from_proportion"
+    else:
+        raw = pd.to_numeric(frame[proportion_col], errors="coerce").to_numpy(float)
+        denominator = np.full(len(raw), float(pseudo_denominator))
+        numerator = raw * denominator
+        denominator_source = "pseudo_denominator_from_proportion"
+
+    non_aoi = denominator - numerator
+    status = np.full(len(frame), "complete", dtype=object)
+    status[~np.isfinite(raw)] = "missing_or_nonfinite_proportion"
+    status[~np.isfinite(numerator)] = "missing_or_nonfinite_numerator"
+    status[~np.isfinite(denominator)] = "missing_or_nonfinite_denominator"
+    status[np.isfinite(denominator) & (denominator <= 0)] = "invalid_denominator"
+    status[np.isfinite(numerator) & (numerator < 0)] = "invalid_numerator"
+    status[np.isfinite(non_aoi) & (non_aoi < 0)] = "numerator_exceeds_denominator"
+    status[np.isfinite(raw) & ((raw < 0) | (raw > 1))] = "proportion_out_of_bounds"
+
+    valid = status == "complete"
+    adjusted = np.full(len(frame), np.nan)
+    empirical = np.full(len(frame), np.nan)
+    adjusted[valid] = (numerator[valid] + correction) / (denominator[valid] + 2 * correction)
+    empirical[valid] = np.log((numerator[valid] + correction) / (non_aoi[valid] + correction))
+
+    out = frame.copy()
+    out[raw_proportion_col] = raw
+    out[numerator_output_col] = numerator
+    out[denominator_output_col] = denominator
+    out[adjusted_proportion_col] = adjusted
+    out[output_col] = empirical
+    out[status_col] = status
+
+    def safe_min(values):
+        finite = np.asarray(values, float)
+        finite = finite[np.isfinite(finite)]
+        return float(finite.min()) if len(finite) else np.nan
+
+    def safe_max(values):
+        finite = np.asarray(values, float)
+        finite = finite[np.isfinite(finite)]
+        return float(finite.max()) if len(finite) else np.nan
+
+    overview = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "transformation": "aoi_empirical_logit",
+                "numerator_col": numerator_col,
+                "denominator_col": denominator_col,
+                "proportion_col": proportion_col,
+                "denominator_source": denominator_source,
+                "correction": correction,
+                "pseudo_denominator": pseudo_denominator,
+                "n_input_rows": len(frame),
+                "n_complete": int(np.sum(status == "complete")),
+                "n_problem_rows": int(np.sum(status != "complete")),
+                "min_raw_proportion": safe_min(raw),
+                "max_raw_proportion": safe_max(raw),
+                "min_empirical_logit": safe_min(empirical),
+                "max_empirical_logit": safe_max(empirical),
+            }
+        ]
+    )
+    status_summary = (
+        (pd.Series(status, name="status").value_counts(sort=False).rename("n").reset_index())
+        .sort_values("status", kind="stable")
+        .reset_index(drop=True)
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "numerator_col",
+                "denominator_col",
+                "proportion_col",
+                "correction",
+                "pseudo_denominator",
+                "output_col",
+                "adjusted_proportion_col",
+                "raw_proportion_col",
+                "numerator_output_col",
+                "denominator_output_col",
+                "status_col",
+                "overwrite",
+                "name",
+            ],
+            "value": [
+                numerator_col,
+                denominator_col,
+                proportion_col,
+                str(correction),
+                str(pseudo_denominator),
+                output_col,
+                adjusted_proportion_col,
+                raw_proportion_col,
+                numerator_output_col,
+                denominator_output_col,
+                status_col,
+                "TRUE" if overwrite else "FALSE",
+                name,
+            ],
+        }
+    )
+    out.attrs["gp3_empirical_logit_overview"] = overview
+    out.attrs["gp3_empirical_logit_status_summary"] = status_summary
+    out.attrs["gp3_empirical_logit_settings"] = settings
+    return out
 
 
 def audit_gazepoint_aoi_window_denominators(
