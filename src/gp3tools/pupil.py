@@ -360,34 +360,227 @@ def _interpolate_series(x: pd.Series, method: str, limit: int | None = None) -> 
 def interpolate_gazepoint_pupil(
     data,
     pupil_col=None,
-    output_col=None,
-    method="linear",
-    max_gap_ms: float | None = 150.0,
     time_col=None,
     group_cols=None,
+    max_gap_ms: float = 150.0,
+    max_gap_samples=np.inf,
+    min_valid_points: int = 2,
+    *,
+    output_col=None,
+    method=None,
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    output_col = output_col or pupil_col
-    time_col = infer_column(df, "time", time_col)
-    groups = normalize_group_cols(df, group_cols)
-    out = pd.Series(np.nan, index=df.index, dtype=float)
-    iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
-    for _, frame in iterator:
-        x = finite_numeric(frame[pupil_col])
-        limit = None
-        if max_gap_ms is not None:
-            if time_col:
-                t = time_to_seconds(frame[time_col]).dropna().to_numpy(float)
-                diffs = np.diff(t)
-                hz = 1 / np.median(diffs[diffs > 0]) if np.any(diffs > 0) else 60.0
-            else:
-                hz = 60.0
-            limit = max(1, int(round(max_gap_ms / 1000 * hz)))
-        out.loc[frame.index] = _interpolate_series(x, method, limit)
-    df[output_col] = out
-    df[f"{output_col}_interpolated"] = finite_numeric(df[pupil_col]).isna() & out.notna()
-    return df
+    """Interpolate pupil gaps with R v2.3.0 semantics and legacy compatibility."""
+    if output_col is not None or method is not None:
+        df = ensure_dataframe(data)
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        output_col = output_col or pupil_col
+        time_col = infer_column(df, "time", time_col)
+        groups = normalize_group_cols(df, group_cols)
+        out = pd.Series(np.nan, index=df.index, dtype=float)
+        iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
+        for _, frame in iterator:
+            x = finite_numeric(frame[pupil_col])
+            limit = None
+            if max_gap_ms is not None:
+                if time_col:
+                    t = time_to_seconds(frame[time_col]).dropna().to_numpy(float)
+                    diffs = np.diff(t)
+                    hz = 1 / np.median(diffs[diffs > 0]) if np.any(diffs > 0) else 60.0
+                else:
+                    hz = 60.0
+                limit = max(1, int(round(float(max_gap_ms) / 1000 * hz)))
+            selected_method = "linear" if method is None else method
+            out.loc[frame.index] = _interpolate_series(x, selected_method, limit)
+        df[output_col] = out
+        df[f"{output_col}_interpolated"] = finite_numeric(df[pupil_col]).isna() & out.notna()
+        return df
+
+    df = ensure_dataframe(data, copy=False)
+    if group_cols is None:
+        group_cols = ["subject", "media_id"]
+    if pupil_col is not None and (not isinstance(pupil_col, str) or not pupil_col):
+        raise ValueError("pupil_col must be None or a single character string")
+    if time_col is not None and (not isinstance(time_col, str) or not time_col):
+        raise ValueError("time_col must be None or a single character string")
+    if isinstance(group_cols, str):
+        group_cols = [group_cols]
+    else:
+        group_cols = list(group_cols)
+    if not all(isinstance(col, str) and col for col in group_cols):
+        raise ValueError("group_cols must be a character vector")
+    if (
+        isinstance(max_gap_ms, (bool, np.bool_))
+        or not isinstance(max_gap_ms, (int, float, np.integer, np.floating))
+        or np.isnan(max_gap_ms)
+        or max_gap_ms < 0
+    ):
+        raise ValueError("max_gap_ms must be greater than or equal to 0")
+    if (
+        isinstance(max_gap_samples, (bool, np.bool_))
+        or not isinstance(max_gap_samples, (int, float, np.integer, np.floating))
+        or np.isnan(max_gap_samples)
+        or max_gap_samples < 0
+    ):
+        raise ValueError("max_gap_samples must be greater than or equal to 0")
+    if (
+        isinstance(min_valid_points, (bool, np.bool_))
+        or not isinstance(min_valid_points, (int, float, np.integer, np.floating))
+        or not np.isfinite(min_valid_points)
+        or min_valid_points < 2
+    ):
+        raise ValueError("min_valid_points must be greater than or equal to 2")
+    min_valid_points = int(min_valid_points)
+
+    def detect(candidates):
+        return next((candidate for candidate in candidates if candidate in df.columns), None)
+
+    role_sources = {
+        "subject": detect(("subject", "pID", "participant")),
+        "media_id": detect(("media_id", "MEDIA_ID")),
+        "trial": detect(("trial",)),
+        "trial_global": detect(("trial_global",)),
+    }
+    pupil_source = pupil_col or detect(
+        (
+            "pupil_clean",
+            "pupil_for_preprocessing",
+            "mean_pupil",
+            "pupil",
+            "pupil_raw",
+            "left_pupil",
+            "right_pupil",
+        )
+    )
+    time_source = time_col or detect(("time_ms", "time", "time_orig", "time_orig_ms"))
+    if pupil_source is None or pupil_source not in df.columns:
+        raise ValueError("No pupil column was found")
+    if time_source is None or time_source not in df.columns:
+        raise ValueError("No time column was found")
+    allowed = list(role_sources)
+    invalid = [col for col in group_cols if col not in allowed]
+    if invalid:
+        raise ValueError("group_cols can only contain: " + ", ".join(allowed))
+    missing = [col for col in group_cols if role_sources[col] is None]
+    if missing:
+        raise ValueError(
+            "The following grouping column role(s) were requested but not found: "
+            + ", ".join(missing)
+        )
+
+    work = pd.DataFrame({"row_id": np.arange(1, len(df) + 1, dtype=int)})
+    for role, source_col in role_sources.items():
+        work[role] = (
+            df[source_col].astype("string").to_numpy()
+            if source_col is not None
+            else pd.array([pd.NA] * len(df), dtype="string")
+        )
+    work["time_ms"] = pd.to_numeric(df[time_source], errors="coerce").to_numpy(float)
+    work["pupil_input_value"] = pd.to_numeric(df[pupil_source], errors="coerce").to_numpy(float)
+
+    def interpolate_group(frame):
+        frame = frame.sort_values(["time_ms", "row_id"], kind="stable").copy()
+        values = frame["pupil_input_value"].to_numpy(float)
+        times = frame["time_ms"].to_numpy(float)
+        n = len(frame)
+        observed = np.isfinite(values)
+        time_valid = np.isfinite(times)
+        endpoint_valid = observed & time_valid
+        needs = ~observed
+        pupil_after = values.copy()
+        was = np.zeros(n, dtype=bool)
+        status = np.full(n, "observed", dtype=object)
+        status[needs] = "missing_unfilled"
+        status[needs & ~time_valid] = "missing_no_time"
+        gap_id = np.full(n, np.nan)
+        gap_n = np.full(n, np.nan)
+        gap_duration = np.full(n, np.nan)
+
+        if endpoint_valid.sum() < min_valid_points:
+            status[needs & time_valid] = "missing_insufficient_valid"
+        elif needs.any():
+            valid_times = times[endpoint_valid]
+            valid_values = values[endpoint_valid]
+            unique_times = np.unique(valid_times)
+            unique_values = np.array(
+                [valid_values[valid_times == value].mean() for value in unique_times]
+            )
+            starts = np.flatnonzero(needs & np.r_[True, ~needs[:-1]])
+            ends = np.flatnonzero(needs & np.r_[~needs[1:], True])
+            for counter, (start, end) in enumerate(zip(starts, ends, strict=True), start=1):
+                idx = np.arange(start, end + 1)
+                gap_id[idx] = counter
+                gap_n[idx] = len(idx)
+                previous = np.flatnonzero(endpoint_valid & (np.arange(n) < start))
+                following = np.flatnonzero(endpoint_valid & (np.arange(n) > end))
+                if len(previous) == 0 or len(following) == 0:
+                    status[idx[time_valid[idx]]] = "missing_edge_gap"
+                    continue
+                left = previous.max()
+                right = following.min()
+                duration = times[right] - times[left]
+                gap_duration[idx] = duration
+                if (
+                    (not np.isfinite(duration))
+                    or duration > float(max_gap_ms)
+                    or len(idx) > float(max_gap_samples)
+                ):
+                    status[idx[time_valid[idx]]] = "missing_long_gap"
+                    continue
+                interpolated = np.interp(
+                    times[idx], unique_times, unique_values, left=np.nan, right=np.nan
+                )
+                fillable = time_valid[idx] & np.isfinite(interpolated)
+                if fillable.any():
+                    fill_idx = idx[fillable]
+                    pupil_after[fill_idx] = interpolated[fillable]
+                    was[fill_idx] = True
+                    status[fill_idx] = "interpolated"
+                if (~fillable).any():
+                    unfilled_idx = idx[(~fillable) & time_valid[idx]]
+                    status[unfilled_idx] = "missing_unfilled"
+
+        return pd.DataFrame(
+            {
+                "row_id": frame["row_id"].to_numpy(int),
+                "pupil_interpolated": pupil_after,
+                "pupil_was_interpolated": was,
+                "pupil_interpolation_status": status,
+                "pupil_gap_id": pd.array(gap_id, dtype="Int64"),
+                "pupil_gap_n_samples": pd.array(gap_n, dtype="Int64"),
+                "pupil_gap_duration_ms": gap_duration,
+            }
+        )
+
+    if not group_cols:
+        interpolated = interpolate_group(work)
+    else:
+        parts = []
+        for _, frame in work.groupby(group_cols, dropna=False, sort=True):
+            parts.append(interpolate_group(frame))
+        interpolated = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    interpolated = interpolated.sort_values("row_id", kind="stable").reset_index(drop=True)
+    interpolated["pupil_interp_pupil_column"] = pupil_source
+    interpolated["pupil_interp_time_column"] = time_source
+    interpolated["pupil_interp_max_gap_ms"] = max_gap_ms
+    interpolated["pupil_interp_max_gap_samples"] = max_gap_samples
+    interpolated["pupil_interp_min_valid_points"] = min_valid_points
+    output_cols = [
+        "pupil_interpolated",
+        "pupil_was_interpolated",
+        "pupil_interpolation_status",
+        "pupil_gap_id",
+        "pupil_gap_n_samples",
+        "pupil_gap_duration_ms",
+        "pupil_interp_pupil_column",
+        "pupil_interp_time_column",
+        "pupil_interp_max_gap_ms",
+        "pupil_interp_max_gap_samples",
+        "pupil_interp_min_valid_points",
+    ]
+    original = df.drop(columns=[col for col in output_cols if col in df.columns]).reset_index(
+        drop=True
+    )
+    return pd.concat([original, interpolated[output_cols]], axis=1)
 
 
 def interpolate_gazepoint_pupil_pchip(data, **kwargs) -> pd.DataFrame:
@@ -406,24 +599,205 @@ def interpolate_gazepoint_blinks(data, pupil_col=None, blink_col="blink", **kwar
 
 
 def smooth_gazepoint_pupil(
-    data, pupil_col=None, output_col=None, window: int = 5, method="moving_average"
+    data,
+    pupil_col=None,
+    time_col=None,
+    group_cols=None,
+    window_samples: int = 5,
+    method="mean",
+    align="center",
+    min_points: int = 1,
+    preserve_missing: bool = True,
+    *,
+    output_col=None,
+    window=None,
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    output_col = output_col or f"{pupil_col}_smoothed"
-    x = finite_numeric(df[pupil_col])
-    if method in {"moving_average", "mean"}:
-        y = x.rolling(window, center=True, min_periods=1).mean()
-    elif method == "median":
-        y = x.rolling(window, center=True, min_periods=1).median()
-    elif method == "savgol":
-        win = max(3, window + (1 - window % 2))
-        vals = x.interpolate(limit_direction="both").to_numpy(float)
-        y = pd.Series(signal.savgol_filter(vals, win, min(2, win - 1)), index=df.index)
-    else:
+    """Smooth pupil data with R v2.3.0 semantics and legacy compatibility."""
+    legacy_mode = (
+        output_col is not None or window is not None or method in {"moving_average", "savgol"}
+    )
+    if legacy_mode:
+        df = ensure_dataframe(data)
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        selected_window = int(window_samples if window is None else window)
+        output_col = output_col or f"{pupil_col}_smoothed"
+        x = finite_numeric(df[pupil_col])
+        if method in {"moving_average", "mean"}:
+            y = x.rolling(selected_window, center=True, min_periods=1).mean()
+        elif method == "median":
+            y = x.rolling(selected_window, center=True, min_periods=1).median()
+        elif method == "savgol":
+            win = max(3, selected_window + (1 - selected_window % 2))
+            vals = x.interpolate(limit_direction="both").to_numpy(float)
+            y = pd.Series(signal.savgol_filter(vals, win, min(2, win - 1)), index=df.index)
+        else:
+            raise ValueError(f"Unknown smoothing method: {method}")
+        df[output_col] = y
+        return df
+
+    df = ensure_dataframe(data, copy=False)
+    if group_cols is None:
+        group_cols = ["subject", "media_id"]
+    if method not in {"mean", "median"}:
         raise ValueError(f"Unknown smoothing method: {method}")
-    df[output_col] = y
-    return df
+    if align not in {"center", "right", "left"}:
+        raise ValueError("align must be one of: center, right, left")
+    if not isinstance(preserve_missing, (bool, np.bool_)):
+        raise ValueError("preserve_missing must be True or False")
+    if (
+        isinstance(window_samples, (bool, np.bool_))
+        or not isinstance(window_samples, (int, float, np.integer, np.floating))
+        or not np.isfinite(window_samples)
+        or window_samples < 1
+    ):
+        raise ValueError("window_samples must be greater than or equal to 1")
+    if (
+        isinstance(min_points, (bool, np.bool_))
+        or not isinstance(min_points, (int, float, np.integer, np.floating))
+        or not np.isfinite(min_points)
+        or min_points < 1
+    ):
+        raise ValueError("min_points must be greater than or equal to 1")
+    window_samples = int(window_samples)
+    min_points = int(min_points)
+    if min_points > window_samples:
+        raise ValueError("min_points must be less than or equal to window_samples")
+    if isinstance(group_cols, str):
+        group_cols = [group_cols]
+    else:
+        group_cols = list(group_cols)
+
+    def detect(candidates):
+        return next((candidate for candidate in candidates if candidate in df.columns), None)
+
+    role_sources = {
+        "subject": detect(("subject", "pID", "participant")),
+        "media_id": detect(("media_id", "MEDIA_ID")),
+        "trial": detect(("trial",)),
+        "trial_global": detect(("trial_global",)),
+    }
+    pupil_source = pupil_col or detect(
+        (
+            "pupil_baseline_corrected",
+            "pupil_baseline_percent_change",
+            "pupil_interpolated",
+            "pupil_for_preprocessing",
+            "mean_pupil",
+            "pupil",
+            "pupil_raw",
+            "left_pupil",
+            "right_pupil",
+        )
+    )
+    time_source = time_col or detect(("time_ms", "time", "time_orig", "time_orig_ms"))
+    if pupil_source is None or pupil_source not in df.columns:
+        raise ValueError("No pupil column was found")
+    if time_source is None or time_source not in df.columns:
+        raise ValueError("No time column was found")
+    standard_roles = set(role_sources)
+    missing_roles = [
+        col for col in group_cols if col in standard_roles and role_sources[col] is None
+    ]
+    if missing_roles:
+        raise ValueError(
+            "The following grouping column role(s) were requested but not found: "
+            + ", ".join(missing_roles)
+        )
+    custom = [col for col in group_cols if col not in standard_roles]
+    missing_custom = [col for col in custom if col not in df.columns]
+    if missing_custom:
+        raise ValueError(
+            "The following grouping column(s) were requested but not found: "
+            + ", ".join(missing_custom)
+        )
+
+    work = pd.DataFrame({"row_id": np.arange(1, len(df) + 1, dtype=int)})
+    for role, source_col in role_sources.items():
+        work[role] = (
+            df[source_col].astype("string").to_numpy()
+            if source_col is not None
+            else pd.array([pd.NA] * len(df), dtype="string")
+        )
+    work["time_ms"] = pd.to_numeric(df[time_source], errors="coerce").to_numpy(float)
+    work["pupil_input_value"] = pd.to_numeric(df[pupil_source], errors="coerce").to_numpy(float)
+    for col in custom:
+        work[col] = df[col].to_numpy()
+
+    def smooth_vector(values):
+        x = np.asarray(values, dtype=float)
+        n = len(x)
+        smoothed = np.full(n, np.nan)
+        window_n = np.zeros(n, dtype=int)
+        status = np.full(n, "insufficient_window", dtype=object)
+        finite = np.isfinite(x)
+        status[~finite] = "missing_input"
+        for i in range(n):
+            if align == "center":
+                before = (window_samples - 1) // 2
+                after = window_samples - 1 - before
+                start = max(0, i - before)
+                end = min(n, i + after + 1)
+            elif align == "right":
+                start = max(0, i - window_samples + 1)
+                end = i + 1
+            else:
+                start = i
+                end = min(n, i + window_samples)
+            vals = x[start:end]
+            vals = vals[np.isfinite(vals)]
+            window_n[i] = len(vals)
+            if preserve_missing and not finite[i]:
+                continue
+            if len(vals) < min_points:
+                continue
+            smoothed[i] = float(np.median(vals) if method == "median" else np.mean(vals))
+            status[i] = "smoothed"
+        return smoothed, status, window_n
+
+    parts = []
+    iterator = (
+        [(None, work)] if not group_cols else work.groupby(group_cols, dropna=False, sort=True)
+    )
+    for _, frame in iterator:
+        smoothed, status, window_n = smooth_vector(frame["pupil_input_value"].to_numpy(float))
+        parts.append(
+            pd.DataFrame(
+                {
+                    "row_id": frame["row_id"].to_numpy(int),
+                    "pupil_smoothed": smoothed,
+                    "pupil_smoothing_status": status,
+                    "pupil_smoothing_window_n": window_n,
+                }
+            )
+        )
+    result = (
+        pd.concat(parts, ignore_index=True)
+        .sort_values("row_id", kind="stable")
+        .reset_index(drop=True)
+    )
+    result["pupil_smoothing_input_column"] = pupil_source
+    result["pupil_smoothing_time_column"] = time_source
+    result["pupil_smoothing_method"] = method
+    result["pupil_smoothing_align"] = align
+    result["pupil_smoothing_window_samples"] = window_samples
+    result["pupil_smoothing_min_points"] = min_points
+    result["pupil_smoothing_preserve_missing"] = bool(preserve_missing)
+    output_cols = [
+        "pupil_smoothed",
+        "pupil_smoothing_status",
+        "pupil_smoothing_window_n",
+        "pupil_smoothing_input_column",
+        "pupil_smoothing_time_column",
+        "pupil_smoothing_method",
+        "pupil_smoothing_align",
+        "pupil_smoothing_window_samples",
+        "pupil_smoothing_min_points",
+        "pupil_smoothing_preserve_missing",
+    ]
+    original = df.drop(columns=[col for col in output_cols if col in df.columns]).reset_index(
+        drop=True
+    )
+    return pd.concat([original, result[output_cols]], axis=1)
 
 
 def _gp3_pupil_r_roll(
@@ -672,62 +1046,406 @@ def baseline_correct_gazepoint_pupil(
     data,
     pupil_col=None,
     time_col=None,
-    baseline=(-200.0, 0.0),
+    baseline_time_col=None,
+    baseline_window=(-200.0, 0.0),
+    baseline_flag_col=None,
     group_cols=None,
+    baseline_method="mean",
+    min_baseline_samples: int = 1,
+    *,
+    baseline=None,
     output_col=None,
-    mode="subtract",
+    mode=None,
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    time_col = infer_column(df, "time", time_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
-    output_col = output_col or f"{pupil_col}_baseline_corrected"
-    out = pd.Series(np.nan, index=df.index, dtype=float)
-    bases = pd.Series(np.nan, index=df.index, dtype=float)
-    iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
-    for _, frame in iterator:
-        t = finite_numeric(frame[time_col])
-        x = finite_numeric(frame[pupil_col])
-        mask = t.between(float(baseline[0]), float(baseline[1]))
-        b = float(x.loc[mask].mean()) if mask.any() else np.nan
-        bases.loc[frame.index] = b
-        if mode == "subtract":
-            y = x - b
-        elif mode == "divide":
-            y = x / b
-        elif mode in {"percent", "percent_change"}:
-            y = (x - b) / b * 100
+    """Baseline-correct pupil data with R v2.3.0 semantics and legacy compatibility."""
+    legacy_mode = baseline is not None or output_col is not None or mode is not None
+    if legacy_mode:
+        df = ensure_dataframe(data)
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        time_col = infer_column(df, "time", time_col, required=True)
+        groups = normalize_group_cols(df, group_cols)
+        selected_baseline = baseline_window if baseline is None else baseline
+        selected_mode = "subtract" if mode is None else mode
+        output_col = output_col or f"{pupil_col}_baseline_corrected"
+        out = pd.Series(np.nan, index=df.index, dtype=float)
+        bases = pd.Series(np.nan, index=df.index, dtype=float)
+        iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
+        for _, frame in iterator:
+            t = finite_numeric(frame[time_col])
+            x = finite_numeric(frame[pupil_col])
+            mask = t.between(float(selected_baseline[0]), float(selected_baseline[1]))
+            b = float(x.loc[mask].mean()) if mask.any() else np.nan
+            bases.loc[frame.index] = b
+            if selected_mode == "subtract":
+                y = x - b
+            elif selected_mode == "divide":
+                y = x / b
+            elif selected_mode in {"percent", "percent_change"}:
+                y = (x - b) / b * 100
+            else:
+                raise ValueError(f"Unknown baseline mode {selected_mode!r}")
+            out.loc[frame.index] = y
+        df[output_col] = out
+        df["pupil_baseline"] = bases
+        return df
+
+    df = ensure_dataframe(data, copy=False)
+    if group_cols is None:
+        group_cols = ["subject", "media_id"]
+    if baseline_method not in {"mean", "median"}:
+        raise ValueError("baseline_method must be one of: mean, median")
+    if (
+        isinstance(min_baseline_samples, (bool, np.bool_))
+        or not isinstance(min_baseline_samples, (int, float, np.integer, np.floating))
+        or not np.isfinite(min_baseline_samples)
+        or min_baseline_samples < 1
+    ):
+        raise ValueError("min_baseline_samples must be greater than or equal to 1")
+    min_baseline_samples = int(min_baseline_samples)
+    if baseline_flag_col is None:
+        if baseline_window is None or len(baseline_window) != 2:
+            raise ValueError("baseline_window must be a numeric vector of length 2")
+        start_window, end_window = map(float, baseline_window)
+        if not np.isfinite([start_window, end_window]).all() or end_window < start_window:
+            raise ValueError(
+                "baseline_window[2] must be greater than or equal to baseline_window[1]"
+            )
+    else:
+        if baseline_flag_col not in df.columns:
+            raise ValueError("baseline_flag_col was not found in data")
+        if baseline_window is None:
+            start_window = end_window = np.nan
         else:
-            raise ValueError(f"Unknown baseline mode {mode!r}")
-        out.loc[frame.index] = y
-    df[output_col] = out
-    df["pupil_baseline"] = bases
-    return df
+            if len(baseline_window) != 2:
+                raise ValueError("baseline_window must be None or a numeric vector of length 2")
+            start_window, end_window = map(float, baseline_window)
+    if isinstance(group_cols, str):
+        group_cols = [group_cols]
+    else:
+        group_cols = list(group_cols)
+
+    def detect(candidates):
+        return next((candidate for candidate in candidates if candidate in df.columns), None)
+
+    role_sources = {
+        "subject": detect(("subject", "pID", "participant")),
+        "media_id": detect(("media_id", "MEDIA_ID")),
+        "trial": detect(("trial",)),
+        "trial_global": detect(("trial_global",)),
+    }
+    pupil_source = pupil_col or detect(
+        (
+            "pupil_interpolated",
+            "pupil_for_preprocessing",
+            "mean_pupil",
+            "pupil",
+            "pupil_raw",
+            "left_pupil",
+            "right_pupil",
+        )
+    )
+    time_source = time_col or detect(("time_ms", "time", "time_orig", "time_orig_ms"))
+    baseline_time_source = baseline_time_col or detect(
+        (
+            "time_relative_ms",
+            "relative_time_ms",
+            "event_time_ms",
+            "time_ms",
+            "time",
+            "time_orig",
+            "time_orig_ms",
+        )
+    )
+    if pupil_source is None or pupil_source not in df.columns:
+        raise ValueError("No pupil column was found")
+    if time_source is None or time_source not in df.columns:
+        raise ValueError("No time column was found")
+    if baseline_time_source is None or baseline_time_source not in df.columns:
+        raise ValueError("No baseline-time column was found")
+    standard_roles = set(role_sources)
+    missing_roles = [
+        col for col in group_cols if col in standard_roles and role_sources[col] is None
+    ]
+    if missing_roles:
+        raise ValueError(
+            "The following grouping column role(s) were requested but not found: "
+            + ", ".join(missing_roles)
+        )
+    custom = [col for col in group_cols if col not in standard_roles]
+    missing_custom = [col for col in custom if col not in df.columns]
+    if missing_custom:
+        raise ValueError(
+            "The following grouping column(s) were requested but not found: "
+            + ", ".join(missing_custom)
+        )
+
+    work = pd.DataFrame({"row_id": np.arange(1, len(df) + 1, dtype=int)})
+    for role, source_col in role_sources.items():
+        work[role] = (
+            df[source_col].astype("string").to_numpy()
+            if source_col is not None
+            else pd.array([pd.NA] * len(df), dtype="string")
+        )
+    work["time_ms"] = pd.to_numeric(df[time_source], errors="coerce").to_numpy(float)
+    work["baseline_time_ms"] = pd.to_numeric(df[baseline_time_source], errors="coerce").to_numpy(
+        float
+    )
+    work["pupil_input_value"] = pd.to_numeric(df[pupil_source], errors="coerce").to_numpy(float)
+    for col in custom:
+        work[col] = df[col].to_numpy()
+    if baseline_flag_col is not None:
+        flag = df[baseline_flag_col].fillna(False).astype(bool).to_numpy()
+        work["baseline_candidate"] = flag & np.isfinite(work["pupil_input_value"].to_numpy(float))
+    else:
+        bt = work["baseline_time_ms"].to_numpy(float)
+        pv = work["pupil_input_value"].to_numpy(float)
+        work["baseline_candidate"] = (
+            np.isfinite(pv) & np.isfinite(bt) & (bt >= start_window) & (bt <= end_window)
+        )
+
+    def summarize(frame):
+        mask = frame["baseline_candidate"].to_numpy(bool)
+        values = frame.loc[mask, "pupil_input_value"].to_numpy(float)
+        times = frame.loc[mask, "baseline_time_ms"].to_numpy(float)
+        values = values[np.isfinite(values)]
+        times = times[np.isfinite(times)]
+        baseline_value = (
+            float(np.median(values) if baseline_method == "median" else np.mean(values))
+            if len(values)
+            else np.nan
+        )
+        baseline_sd = float(np.std(values, ddof=1)) if len(values) >= 2 else np.nan
+        return {
+            "pupil_baseline_n": int(mask.sum()),
+            "pupil_baseline_value": baseline_value,
+            "pupil_baseline_sd": baseline_sd,
+            "pupil_baseline_time_min": float(times.min()) if len(times) else np.nan,
+            "pupil_baseline_time_max": float(times.max()) if len(times) else np.nan,
+        }
+
+    summaries = pd.DataFrame(
+        index=work.index,
+        columns=[
+            "pupil_baseline_n",
+            "pupil_baseline_value",
+            "pupil_baseline_sd",
+            "pupil_baseline_time_min",
+            "pupil_baseline_time_max",
+        ],
+    )
+    iterator = (
+        [(None, work)] if not group_cols else work.groupby(group_cols, dropna=False, sort=True)
+    )
+    for _, frame in iterator:
+        summary = summarize(frame)
+        for key, value in summary.items():
+            summaries.loc[frame.index, key] = value
+    for col in summaries.columns:
+        work[col] = pd.to_numeric(summaries[col], errors="coerce")
+    work["pupil_baseline_n"] = work["pupil_baseline_n"].astype("Int64")
+    available = (work["pupil_baseline_n"].astype(float) >= min_baseline_samples) & np.isfinite(
+        work["pupil_baseline_value"].to_numpy(float)
+    )
+    pv = work["pupil_input_value"].to_numpy(float)
+    bv = work["pupil_baseline_value"].to_numpy(float)
+    sd = work["pupil_baseline_sd"].to_numpy(float)
+    finite_pupil = np.isfinite(pv)
+    work["pupil_baseline_available"] = available
+    work["pupil_baseline_corrected"] = np.where(available & finite_pupil, pv - bv, np.nan)
+    nonzero = available & finite_pupil & (bv != 0)
+    work["pupil_baseline_percent_change"] = np.where(nonzero, ((pv - bv) / bv) * 100, np.nan)
+    work["pupil_baseline_ratio"] = np.where(nonzero, pv / bv, np.nan)
+    z_ok = available & finite_pupil & np.isfinite(sd) & (sd > 0)
+    work["pupil_baseline_z"] = np.where(z_ok, (pv - bv) / sd, np.nan)
+    work["pupil_baseline_status"] = np.where(
+        ~finite_pupil, "missing_pupil", np.where(~available, "no_baseline", "corrected")
+    )
+    work["pupil_baseline_used"] = work["baseline_candidate"].astype(bool)
+    work["pupil_baseline_pupil_column"] = pupil_source
+    work["pupil_baseline_time_column"] = baseline_time_source
+    work["pupil_baseline_flag_column"] = pd.NA if baseline_flag_col is None else baseline_flag_col
+    work["pupil_baseline_window_start"] = start_window
+    work["pupil_baseline_window_end"] = end_window
+    work["pupil_baseline_method"] = baseline_method
+    work["pupil_baseline_min_samples"] = min_baseline_samples
+    work = work.sort_values("row_id", kind="stable").reset_index(drop=True)
+    output_cols = [
+        "pupil_baseline_value",
+        "pupil_baseline_sd",
+        "pupil_baseline_n",
+        "pupil_baseline_available",
+        "pupil_baseline_time_min",
+        "pupil_baseline_time_max",
+        "pupil_baseline_used",
+        "pupil_baseline_corrected",
+        "pupil_baseline_percent_change",
+        "pupil_baseline_ratio",
+        "pupil_baseline_z",
+        "pupil_baseline_status",
+        "pupil_baseline_pupil_column",
+        "pupil_baseline_time_column",
+        "pupil_baseline_flag_column",
+        "pupil_baseline_window_start",
+        "pupil_baseline_window_end",
+        "pupil_baseline_method",
+        "pupil_baseline_min_samples",
+    ]
+    original = df.drop(columns=[col for col in output_cols if col in df.columns]).reset_index(
+        drop=True
+    )
+    return pd.concat([original, work[output_cols]], axis=1)
 
 
 def audit_gazepoint_pupil_gaps(
-    data, pupil_col=None, time_col=None, group_cols=None
+    data,
+    group_cols=None,
+    status_col="pupil_interpolation_status",
+    gap_id_col="pupil_gap_id",
+    gap_n_samples_col="pupil_gap_n_samples",
+    gap_duration_col="pupil_gap_duration_ms",
+    interpolated_col="pupil_was_interpolated",
+    pupil_col="pupil_interpolated",
+    *,
+    time_col=None,
 ) -> pd.DataFrame:
+    """Audit pupil gaps with R v2.3.0 semantics and legacy raw-gap compatibility."""
     df = ensure_dataframe(data, copy=False)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
-    rows = []
-    iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
-    for key, frame in iterator:
-        if groups and not isinstance(key, tuple):
-            key = (key,)
-        miss = finite_numeric(frame[pupil_col]).isna().to_numpy()
-        labels, n = ndimage.label(miss.astype(int))
-        lengths = [int((labels == lab).sum()) for lab in range(1, n + 1)]
-        row = {c: v for c, v in zip(groups, key, strict=False)} if groups else {}
-        row.update(
-            n_samples=len(frame),
-            n_missing=int(miss.sum()),
-            missing_prop=float(miss.mean()),
-            n_gaps=n,
-            max_gap_samples=max(lengths, default=0),
-            mean_gap_samples=float(np.mean(lengths)) if lengths else 0.0,
+    if time_col is not None or status_col not in df.columns:
+        resolved_pupil = infer_column(
+            df, "pupil", pupil_col if pupil_col in df.columns else None, required=True
         )
+        groups = normalize_group_cols(df, group_cols)
+        rows = []
+        iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
+        for key, frame in iterator:
+            if groups and not isinstance(key, tuple):
+                key = (key,)
+            miss = finite_numeric(frame[resolved_pupil]).isna().to_numpy()
+            labels, n = ndimage.label(miss.astype(int))
+            lengths = [int((labels == lab).sum()) for lab in range(1, n + 1)]
+            row = {c: v for c, v in zip(groups, key, strict=False)} if groups else {}
+            row.update(
+                n_samples=len(frame),
+                n_missing=int(miss.sum()),
+                missing_prop=float(miss.mean()),
+                n_gaps=n,
+                max_gap_samples=max(lengths, default=0),
+                mean_gap_samples=float(np.mean(lengths)) if lengths else 0.0,
+            )
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    if group_cols is None:
+        group_cols = ["subject", "media_id"]
+    if isinstance(group_cols, str):
+        group_cols = [group_cols]
+    else:
+        group_cols = list(group_cols)
+    if len(set(group_cols)) != len(group_cols) or any(
+        not isinstance(col, str) or not col for col in group_cols
+    ):
+        raise ValueError("group_cols must be a character vector of unique column names")
+    column_args = [
+        status_col,
+        gap_id_col,
+        gap_n_samples_col,
+        gap_duration_col,
+        interpolated_col,
+        pupil_col,
+    ]
+    if any(not isinstance(col, str) or not col for col in column_args):
+        raise ValueError("Column-name arguments must be non-missing character scalars")
+    missing = [col for col in dict.fromkeys(group_cols + column_args) if col not in df.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+
+    def logical_flag(series):
+        if pd.api.types.is_bool_dtype(series):
+            return series.fillna(False).to_numpy(bool)
+        if pd.api.types.is_numeric_dtype(series):
+            values = pd.to_numeric(series, errors="coerce").to_numpy(float)
+            return np.isfinite(values) & (values != 0)
+        return (
+            series.astype("string")
+            .str.strip()
+            .str.lower()
+            .isin(["true", "t", "1", "yes", "y"])
+            .to_numpy(bool)
+        )
+
+    work = df.copy()
+    work[".status"] = work[status_col].astype("string")
+    work[".was"] = logical_flag(work[interpolated_col]) | work[".status"].eq("interpolated").fillna(
+        False
+    ).to_numpy(bool)
+    work[".gap_id"] = work[gap_id_col]
+    work[".gap_n"] = pd.to_numeric(work[gap_n_samples_col], errors="coerce")
+    work[".gap_duration"] = pd.to_numeric(work[gap_duration_col], errors="coerce")
+    work[".pupil"] = pd.to_numeric(work[pupil_col], errors="coerce")
+
+    no_time = {"missing_no_time", "missing_no_time_gap"}
+    insufficient = {"missing_insufficient_valid_samples", "missing_insufficient_valid"}
+    unfilled = {"missing_unfilled", "unfilled"}
+    rows = []
+    iterator = [((), work)] if not group_cols else work.groupby(group_cols, dropna=False, sort=True)
+    for key, frame in iterator:
+        if group_cols and not isinstance(key, tuple):
+            key = (key,)
+        base = {col: value for col, value in zip(group_cols, key, strict=False)}
+        status = frame[".status"].astype("string")
+        pupil = pd.to_numeric(frame[".pupil"], errors="coerce")
+        n_rows = len(frame)
+        row = {
+            **base,
+            "n_rows": n_rows,
+            "n_observed_samples": int(status.eq("observed").sum()),
+            "n_interpolated_samples": int(frame[".was"].sum()),
+            "n_missing_edge_gap_samples": int(status.eq("missing_edge_gap").sum()),
+            "n_missing_long_gap_samples": int(status.eq("missing_long_gap").sum()),
+            "n_missing_no_time_samples": int(status.isin(no_time).sum()),
+            "n_missing_insufficient_valid_samples": int(status.isin(insufficient).sum()),
+            "n_missing_unfilled_samples": int(status.isin(unfilled).sum()),
+            "n_remaining_missing_samples": int(pupil.isna().sum()),
+            "n_total_missing_or_gap_samples": int(
+                ((status.notna() & ~status.eq("observed")) | pupil.isna()).sum()
+            ),
+        }
+        row["pct_observed_samples"] = 100 * row["n_observed_samples"] / n_rows if n_rows else np.nan
+        row["pct_interpolated_samples"] = (
+            100 * row["n_interpolated_samples"] / n_rows if n_rows else np.nan
+        )
+        row["pct_remaining_missing_samples"] = (
+            100 * row["n_remaining_missing_samples"] / n_rows if n_rows else np.nan
+        )
+        gaps = frame.loc[frame[".gap_id"].notna()].groupby(".gap_id", dropna=False, sort=True)
+        gap_records = []
+        for _, gap in gaps:
+            gap_status = gap[".status"].astype("string")
+            nvals = pd.to_numeric(gap[".gap_n"], errors="coerce").to_numpy(float)
+            dvals = pd.to_numeric(gap[".gap_duration"], errors="coerce").to_numpy(float)
+            nfinite = nvals[np.isfinite(nvals)]
+            dfinite = dvals[np.isfinite(dvals)]
+            gap_records.append(
+                {
+                    "interpolated": bool(gap[".was"].any()),
+                    "edge": bool(gap_status.eq("missing_edge_gap").any()),
+                    "long": bool(gap_status.eq("missing_long_gap").any()),
+                    "n": float(nfinite.max()) if len(nfinite) else np.nan,
+                    "duration": float(dfinite.max()) if len(dfinite) else np.nan,
+                }
+            )
+        row["n_gaps_total"] = len(gap_records)
+        row["n_gaps_interpolated"] = sum(record["interpolated"] for record in gap_records)
+        row["n_gaps_edge"] = sum(record["edge"] for record in gap_records)
+        row["n_gaps_long"] = sum(record["long"] for record in gap_records)
+        durations = np.array([record["duration"] for record in gap_records], dtype=float)
+        ns = np.array([record["n"] for record in gap_records], dtype=float)
+        durations = durations[np.isfinite(durations)]
+        ns = ns[np.isfinite(ns)]
+        row["mean_gap_duration_ms"] = float(durations.mean()) if len(durations) else np.nan
+        row["max_gap_duration_ms"] = float(durations.max()) if len(durations) else np.nan
+        row["mean_gap_n_samples"] = float(ns.mean()) if len(ns) else np.nan
+        row["max_gap_n_samples"] = float(ns.max()) if len(ns) else np.nan
         rows.append(row)
     return pd.DataFrame(rows)
 
