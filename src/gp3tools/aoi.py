@@ -722,43 +722,819 @@ def add_gazepoint_dynamic_aoi(
     return merged.sort_index()
 
 
-def audit_gazepoint_aoi_geometry(aoi_geometry) -> dict[str, Any]:
-    g = ensure_dataframe(aoi_geometry, copy=False)
-    issues = []
-    required = ["xmin", "xmax", "ymin", "ymax"]
-    missing = [c for c in required if c not in g]
-    if missing:
-        issues.append(f"missing columns: {missing}")
-    if not missing:
-        bad = ((g.xmin >= g.xmax) | (g.ymin >= g.ymax)).sum()
-        if bad:
-            issues.append(f"{int(bad)} invalid rectangles")
+def _gp3_aoi_geometry_r_audit(
+    data,
+    *,
+    aoi_col=None,
+    stimulus_col=None,
+    x_min_col=None,
+    y_min_col=None,
+    x_max_col=None,
+    y_max_col=None,
+    x_col=None,
+    y_col=None,
+    width_col=None,
+    height_col=None,
+    screen_x_range=(0, 1),
+    screen_y_range=(0, 1),
+    min_width=0,
+    min_height=0,
+    min_area=0,
+    max_area_prop=1,
+    require_within_screen=True,
+):
+    if not isinstance(data, pd.DataFrame):
+        raise ValueError("data must be a data frame")
+    if data.empty:
+        raise ValueError("data must contain at least one row")
+
+    frame = _gp3_aoi_coding_r_aliases(data)
+    columns = frame.columns
+
+    resolved_aoi = _gp3_aoi_coding_r_resolve(
+        aoi_col,
+        columns,
+        "aoi_col",
+        ("aoi", "aoi_name", "aoi_id", "AOI", "AOI_NAME", "AOI_ID"),
+        True,
+    )
+    resolved_stimulus = _gp3_aoi_coding_r_resolve(
+        stimulus_col,
+        columns,
+        "stimulus_col",
+    )
+    resolved_x_min = _gp3_aoi_coding_r_resolve(
+        x_min_col,
+        columns,
+        "x_min_col",
+        ("x_min", "xmin", "left", "Left", "AOI_X_MIN", "AOI_LEFT"),
+    )
+    resolved_y_min = _gp3_aoi_coding_r_resolve(
+        y_min_col,
+        columns,
+        "y_min_col",
+        ("y_min", "ymin", "top", "Top", "AOI_Y_MIN", "AOI_TOP"),
+    )
+    resolved_x_max = _gp3_aoi_coding_r_resolve(
+        x_max_col,
+        columns,
+        "x_max_col",
+        ("x_max", "xmax", "right", "Right", "AOI_X_MAX", "AOI_RIGHT"),
+    )
+    resolved_y_max = _gp3_aoi_coding_r_resolve(
+        y_max_col,
+        columns,
+        "y_max_col",
+        ("y_max", "ymax", "bottom", "Bottom", "AOI_Y_MAX", "AOI_BOTTOM"),
+    )
+    resolved_x = _gp3_aoi_coding_r_resolve(
+        x_col,
+        columns,
+        "x_col",
+        ("x", "X", "aoi_x", "AOI_X"),
+    )
+    resolved_y = _gp3_aoi_coding_r_resolve(
+        y_col,
+        columns,
+        "y_col",
+        ("y", "Y", "aoi_y", "AOI_Y"),
+    )
+    resolved_width = _gp3_aoi_coding_r_resolve(
+        width_col,
+        columns,
+        "width_col",
+        ("width", "Width", "aoi_width", "AOI_WIDTH"),
+    )
+    resolved_height = _gp3_aoi_coding_r_resolve(
+        height_col,
+        columns,
+        "height_col",
+        ("height", "Height", "aoi_height", "AOI_HEIGHT"),
+    )
+
+    has_bounds = all(
+        value is not None
+        for value in (
+            resolved_x_min,
+            resolved_y_min,
+            resolved_x_max,
+            resolved_y_max,
+        )
+    )
+    has_origin_size = all(
+        value is not None
+        for value in (
+            resolved_x,
+            resolved_y,
+            resolved_width,
+            resolved_height,
+        )
+    )
+    if not has_bounds and not has_origin_size:
+        raise ValueError(
+            "AOI geometry requires either x/y min-max columns or x/y plus width/height columns"
+        )
+
+    screen_x = _gp3_aoi_coding_r_range(screen_x_range, "screen_x_range")
+    screen_y = _gp3_aoi_coding_r_range(screen_y_range, "screen_y_range")
+
+    for value, arg in (
+        (min_width, "min_width"),
+        (min_height, "min_height"),
+        (min_area, "min_area"),
+    ):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{arg} must be a non-negative numeric scalar")
+
+    if (
+        isinstance(max_area_prop, (bool, np.bool_))
+        or not isinstance(max_area_prop, (int, float, np.integer, np.floating))
+        or not np.isfinite(max_area_prop)
+        or max_area_prop < 0
+        or max_area_prop > 1
+    ):
+        raise ValueError("max_area_prop must be a numeric scalar between 0 and 1")
+
+    if not isinstance(require_within_screen, (bool, np.bool_)):
+        raise ValueError("require_within_screen must be TRUE or FALSE")
+
+    if has_bounds:
+        xmin = _gp3_aoi_coding_r_numeric(frame[resolved_x_min])
+        ymin = _gp3_aoi_coding_r_numeric(frame[resolved_y_min])
+        xmax = _gp3_aoi_coding_r_numeric(frame[resolved_x_max])
+        ymax = _gp3_aoi_coding_r_numeric(frame[resolved_y_max])
+        coordinate_format = "bounds"
+    else:
+        xmin = _gp3_aoi_coding_r_numeric(frame[resolved_x])
+        ymin = _gp3_aoi_coding_r_numeric(frame[resolved_y])
+        width_input = _gp3_aoi_coding_r_numeric(frame[resolved_width])
+        height_input = _gp3_aoi_coding_r_numeric(frame[resolved_height])
+        xmax = xmin + width_input
+        ymax = ymin + height_input
+        coordinate_format = "origin_size"
+
+    width = xmax - xmin
+    height = ymax - ymin
+    area = width * height
+    screen_width = float(screen_x[1] - screen_x[0])
+    screen_height = float(screen_y[1] - screen_y[0])
+    screen_area = screen_width * screen_height
+    area_prop = area / screen_area
+    center_x = xmin + width / 2
+    center_y = ymin + height / 2
+
+    invalid_coordinate = ~(
+        np.isfinite(xmin) & np.isfinite(ymin) & np.isfinite(xmax) & np.isfinite(ymax)
+    )
+    invalid_dimension = ~invalid_coordinate & ((width <= 0) | (height <= 0))
+    too_small = (
+        ~invalid_coordinate
+        & ~invalid_dimension
+        & ((width < float(min_width)) | (height < float(min_height)) | (area < float(min_area)))
+    )
+    too_large = ~invalid_coordinate & ~invalid_dimension & (area_prop > float(max_area_prop))
+    outside_screen = (
+        ~invalid_coordinate
+        & ~invalid_dimension
+        & (
+            (xmin < screen_x[0])
+            | (xmax > screen_x[1])
+            | (ymin < screen_y[0])
+            | (ymax > screen_y[1])
+        )
+    )
+
+    status = np.full(len(frame), "ok", dtype=object)
+    status[too_large] = "too_large"
+    status[too_small] = "too_small"
+    if bool(require_within_screen):
+        status[outside_screen] = "outside_screen"
+    status[invalid_dimension] = "invalid_dimension"
+    status[invalid_coordinate] = "invalid_coordinate"
+
+    id_cols = [resolved_aoi]
+    if resolved_stimulus is not None:
+        id_cols.append(resolved_stimulus)
+
+    geometry_summary = frame[id_cols].copy().reset_index(drop=True)
+    geometry_summary["x_min"] = xmin
+    geometry_summary["y_min"] = ymin
+    geometry_summary["x_max"] = xmax
+    geometry_summary["y_max"] = ymax
+    geometry_summary["width"] = width
+    geometry_summary["height"] = height
+    geometry_summary["area"] = area
+    geometry_summary["area_prop"] = area_prop
+    geometry_summary["center_x"] = center_x
+    geometry_summary["center_y"] = center_y
+    geometry_summary["outside_screen"] = outside_screen
+    geometry_summary["aoi_geometry_status"] = status
+
+    def _safe(series, op):
+        values = pd.to_numeric(series, errors="coerce").to_numpy(float)
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            return np.nan
+        if op == "min":
+            return float(np.min(values))
+        if op == "median":
+            return float(np.median(values))
+        return float(np.max(values))
+
+    size_summary = pd.DataFrame(
+        [
+            {
+                "n_aois": len(geometry_summary),
+                "min_width": _safe(geometry_summary["width"], "min"),
+                "median_width": _safe(geometry_summary["width"], "median"),
+                "max_width": _safe(geometry_summary["width"], "max"),
+                "min_height": _safe(geometry_summary["height"], "min"),
+                "median_height": _safe(geometry_summary["height"], "median"),
+                "max_height": _safe(geometry_summary["height"], "max"),
+                "min_area": _safe(geometry_summary["area"], "min"),
+                "median_area": _safe(geometry_summary["area"], "median"),
+                "max_area": _safe(geometry_summary["area"], "max"),
+                "min_area_prop": _safe(geometry_summary["area_prop"], "min"),
+                "median_area_prop": _safe(geometry_summary["area_prop"], "median"),
+                "max_area_prop": _safe(geometry_summary["area_prop"], "max"),
+            }
+        ]
+    )
+
+    duplicate_group_cols = []
+    if resolved_stimulus is not None:
+        duplicate_group_cols.append(resolved_stimulus)
+    duplicate_group_cols.extend(["x_min", "y_min", "x_max", "y_max"])
+    duplicate_rows = []
+    for key, block in geometry_summary.groupby(
+        duplicate_group_cols,
+        dropna=True,
+        sort=True,
+    ):
+        if len(block) <= 1:
+            continue
+        if not isinstance(key, tuple):
+            key = (key,)
+        row = dict(zip(duplicate_group_cols, key, strict=True))
+        row["n_aois"] = len(block)
+        row["aoi_values"] = ", ".join(block[resolved_aoi].astype(str))
+        row["duplicate_geometry_status"] = "duplicate_geometry"
+        duplicate_rows.append(row)
+
+    duplicate_columns = duplicate_group_cols + [
+        "n_aois",
+        "aoi_values",
+        "duplicate_geometry_status",
+    ]
+    duplicate_geometry = pd.DataFrame(
+        duplicate_rows,
+        columns=duplicate_columns,
+    )
+    if not duplicate_rows:
+        duplicate_geometry = pd.DataFrame(
+            columns=[
+                "n_aois",
+                "aoi_values",
+                "duplicate_geometry_status",
+            ]
+        )
+
+    flagged_aois = geometry_summary.loc[
+        geometry_summary["aoi_geometry_status"].ne("ok")
+    ].reset_index(drop=True)
+
+    n_duplicate_groups = int(len(duplicate_geometry))
+    overview = pd.DataFrame(
+        [
+            {
+                "n_rows": len(frame),
+                "n_aois": len(geometry_summary),
+                "n_stimuli": (
+                    int(geometry_summary[resolved_stimulus].nunique(dropna=False))
+                    if resolved_stimulus is not None
+                    else pd.NA
+                ),
+                "n_flagged_aois": len(flagged_aois),
+                "n_duplicate_geometry_groups": n_duplicate_groups,
+                "coordinate_format": coordinate_format,
+                "screen_width": screen_width,
+                "screen_height": screen_height,
+                "screen_area": screen_area,
+                "aoi_geometry_status": (
+                    "review" if len(flagged_aois) > 0 or n_duplicate_groups > 0 else "ok"
+                ),
+            }
+        ]
+    )
+
+    def _setting(value):
+        if value is None:
+            return pd.NA
+        if isinstance(value, (bool, np.bool_)):
+            return "TRUE" if bool(value) else "FALSE"
+        return str(value)
+
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "aoi_col",
+                "stimulus_col",
+                "x_min_col",
+                "y_min_col",
+                "x_max_col",
+                "y_max_col",
+                "x_col",
+                "y_col",
+                "width_col",
+                "height_col",
+                "screen_x_range",
+                "screen_y_range",
+                "min_width",
+                "min_height",
+                "min_area",
+                "max_area_prop",
+                "require_within_screen",
+            ],
+            "value": [
+                resolved_aoi,
+                _setting(resolved_stimulus),
+                _setting(resolved_x_min),
+                _setting(resolved_y_min),
+                _setting(resolved_x_max),
+                _setting(resolved_y_max),
+                _setting(resolved_x),
+                _setting(resolved_y),
+                _setting(resolved_width),
+                _setting(resolved_height),
+                f"{screen_x[0]:g}, {screen_x[1]:g}",
+                f"{screen_y[0]:g}, {screen_y[1]:g}",
+                _setting(min_width),
+                _setting(min_height),
+                _setting(min_area),
+                _setting(max_area_prop),
+                _setting(require_within_screen),
+            ],
+        }
+    )
+
     return {
-        "valid": not issues,
-        "issues": issues,
-        "summary": pd.DataFrame([{"n_aois": len(g), "n_issues": len(issues)}]),
+        "overview": overview,
+        "geometry_summary": geometry_summary,
+        "size_summary": size_summary,
+        "duplicate_geometry": duplicate_geometry,
+        "flagged_aois": flagged_aois,
+        "settings": settings,
+        "_gp3_class": "gp3_aoi_geometry_audit",
     }
 
 
-def audit_gazepoint_aoi_overlap(aoi_geometry) -> pd.DataFrame:
-    g = ensure_dataframe(aoi_geometry, copy=False)
-    name = next((c for c in ("aoi", "name", "label") if c in g), None)
-    rows = []
-    for i in range(len(g)):
-        for j in range(i + 1, len(g)):
-            a, b = g.iloc[i], g.iloc[j]
-            x = max(0, min(a.xmax, b.xmax) - max(a.xmin, b.xmin))
-            y = max(0, min(a.ymax, b.ymax) - max(a.ymin, b.ymin))
-            area = x * y
-            if area > 0:
-                rows.append(
-                    {
-                        "aoi1": a[name] if name else i,
-                        "aoi2": b[name] if name else j,
-                        "overlap_area": area,
-                    }
+def audit_gazepoint_aoi_geometry(
+    aoi_geometry=None,
+    *,
+    data=None,
+    aoi_col=None,
+    stimulus_col=None,
+    x_min_col=None,
+    y_min_col=None,
+    x_max_col=None,
+    y_max_col=None,
+    x_col=None,
+    y_col=None,
+    width_col=None,
+    height_col=None,
+    screen_x_range=(0, 1),
+    screen_y_range=(0, 1),
+    min_width=0,
+    min_height=0,
+    min_area=0,
+    max_area_prop=1,
+    require_within_screen=True,
+):
+    """Audit AOI geometry with legacy and R v2.3.0-compatible contracts."""
+    r_mode = any(
+        [
+            aoi_col is not None,
+            stimulus_col is not None,
+            x_min_col is not None,
+            y_min_col is not None,
+            x_max_col is not None,
+            y_max_col is not None,
+            x_col is not None,
+            y_col is not None,
+            width_col is not None,
+            height_col is not None,
+            tuple(screen_x_range) != (0, 1),
+            tuple(screen_y_range) != (0, 1),
+            min_width != 0,
+            min_height != 0,
+            min_area != 0,
+            max_area_prop != 1,
+            require_within_screen is not True,
+        ]
+    )
+    if not r_mode:
+        if data is not None:
+            if aoi_geometry is not None:
+                raise TypeError("supply either aoi_geometry or data, not both")
+            aoi_geometry = data
+        g = ensure_dataframe(aoi_geometry, copy=False)
+        issues = []
+        required = ["xmin", "xmax", "ymin", "ymax"]
+        missing = [column for column in required if column not in g]
+        if missing:
+            issues.append(f"missing columns: {missing}")
+        if not missing:
+            bad = ((g.xmin >= g.xmax) | (g.ymin >= g.ymax)).sum()
+            if bad:
+                issues.append(f"{int(bad)} invalid rectangles")
+        return {
+            "valid": not issues,
+            "issues": issues,
+            "summary": pd.DataFrame([{"n_aois": len(g), "n_issues": len(issues)}]),
+        }
+
+    if data is not None:
+        if aoi_geometry is not None:
+            raise TypeError("supply either aoi_geometry or data, not both")
+        aoi_geometry = data
+
+    return _gp3_aoi_geometry_r_audit(
+        aoi_geometry,
+        aoi_col=aoi_col,
+        stimulus_col=stimulus_col,
+        x_min_col=x_min_col,
+        y_min_col=y_min_col,
+        x_max_col=x_max_col,
+        y_max_col=y_max_col,
+        x_col=x_col,
+        y_col=y_col,
+        width_col=width_col,
+        height_col=height_col,
+        screen_x_range=screen_x_range,
+        screen_y_range=screen_y_range,
+        min_width=min_width,
+        min_height=min_height,
+        min_area=min_area,
+        max_area_prop=max_area_prop,
+        require_within_screen=require_within_screen,
+    )
+
+
+def audit_gazepoint_aoi_overlap(
+    aoi_geometry=None,
+    *,
+    data=None,
+    aoi_col=None,
+    stimulus_col=None,
+    x_min_col=None,
+    y_min_col=None,
+    x_max_col=None,
+    y_max_col=None,
+    x_col=None,
+    y_col=None,
+    width_col=None,
+    height_col=None,
+    screen_x_range=(0, 1),
+    screen_y_range=(0, 1),
+    min_overlap_area=0,
+    min_overlap_prop=0,
+    ignore_invalid_geometry=True,
+):
+    """Audit pairwise AOI overlap with legacy and R v2.3.0-compatible contracts."""
+    r_mode = any(
+        [
+            aoi_col is not None,
+            stimulus_col is not None,
+            x_min_col is not None,
+            y_min_col is not None,
+            x_max_col is not None,
+            y_max_col is not None,
+            x_col is not None,
+            y_col is not None,
+            width_col is not None,
+            height_col is not None,
+            tuple(screen_x_range) != (0, 1),
+            tuple(screen_y_range) != (0, 1),
+            min_overlap_area != 0,
+            min_overlap_prop != 0,
+            ignore_invalid_geometry is not True,
+        ]
+    )
+    if not r_mode:
+        if data is not None:
+            if aoi_geometry is not None:
+                raise TypeError("supply either aoi_geometry or data, not both")
+            aoi_geometry = data
+        g = ensure_dataframe(aoi_geometry, copy=False)
+        name = next((column for column in ("aoi", "name", "label") if column in g), None)
+        rows = []
+        for i in range(len(g)):
+            for j in range(i + 1, len(g)):
+                a, b = g.iloc[i], g.iloc[j]
+                x_overlap = max(0, min(a.xmax, b.xmax) - max(a.xmin, b.xmin))
+                y_overlap = max(0, min(a.ymax, b.ymax) - max(a.ymin, b.ymin))
+                area = x_overlap * y_overlap
+                if area > 0:
+                    rows.append(
+                        {
+                            "aoi1": a[name] if name else i,
+                            "aoi2": b[name] if name else j,
+                            "overlap_area": area,
+                        }
+                    )
+        return pd.DataFrame(
+            rows,
+            columns=["aoi1", "aoi2", "overlap_area"],
+        )
+
+    if data is not None:
+        if aoi_geometry is not None:
+            raise TypeError("supply either aoi_geometry or data, not both")
+        aoi_geometry = data
+
+    if (
+        isinstance(min_overlap_area, (bool, np.bool_))
+        or not isinstance(
+            min_overlap_area,
+            (int, float, np.integer, np.floating),
+        )
+        or not np.isfinite(min_overlap_area)
+        or min_overlap_area < 0
+    ):
+        raise ValueError("min_overlap_area must be a non-negative numeric scalar")
+    if (
+        isinstance(min_overlap_prop, (bool, np.bool_))
+        or not isinstance(
+            min_overlap_prop,
+            (int, float, np.integer, np.floating),
+        )
+        or not np.isfinite(min_overlap_prop)
+        or min_overlap_prop < 0
+        or min_overlap_prop > 1
+    ):
+        raise ValueError("min_overlap_prop must be a numeric scalar between 0 and 1")
+    if not isinstance(ignore_invalid_geometry, (bool, np.bool_)):
+        raise ValueError("ignore_invalid_geometry must be TRUE or FALSE")
+
+    geometry_audit = _gp3_aoi_geometry_r_audit(
+        aoi_geometry,
+        aoi_col=aoi_col,
+        stimulus_col=stimulus_col,
+        x_min_col=x_min_col,
+        y_min_col=y_min_col,
+        x_max_col=x_max_col,
+        y_max_col=y_max_col,
+        x_col=x_col,
+        y_col=y_col,
+        width_col=width_col,
+        height_col=height_col,
+        screen_x_range=screen_x_range,
+        screen_y_range=screen_y_range,
+        require_within_screen=False,
+    )
+    geometry_summary = geometry_audit["geometry_summary"]
+    settings_lookup = dict(
+        zip(
+            geometry_audit["settings"]["setting"],
+            geometry_audit["settings"]["value"],
+            strict=True,
+        )
+    )
+    resolved_aoi = settings_lookup["aoi_col"]
+    resolved_stimulus = settings_lookup["stimulus_col"]
+    if pd.isna(resolved_stimulus) or str(resolved_stimulus) == "":
+        resolved_stimulus = None
+    else:
+        resolved_stimulus = str(resolved_stimulus)
+
+    geometry_for_overlap = geometry_summary
+    if bool(ignore_invalid_geometry):
+        geometry_for_overlap = geometry_for_overlap.loc[
+            ~geometry_for_overlap["aoi_geometry_status"].isin(
+                ["invalid_coordinate", "invalid_dimension"]
+            )
+        ].copy()
+
+    pair_columns = [
+        "aoi_1",
+        "aoi_2",
+        "x_min_1",
+        "y_min_1",
+        "x_max_1",
+        "y_max_1",
+        "x_min_2",
+        "y_min_2",
+        "x_max_2",
+        "y_max_2",
+        "overlap_x_min",
+        "overlap_y_min",
+        "overlap_x_max",
+        "overlap_y_max",
+        "overlap_width",
+        "overlap_height",
+        "overlap_area",
+        "overlap_prop_aoi_1",
+        "overlap_prop_aoi_2",
+        "overlap_prop_smaller",
+        "aoi_overlap_status",
+    ]
+    if resolved_stimulus is not None:
+        pair_columns = [resolved_stimulus] + pair_columns
+
+    pair_rows = []
+    if resolved_stimulus is not None:
+        grouped = geometry_for_overlap.groupby(
+            resolved_stimulus,
+            dropna=True,
+            sort=True,
+        )
+    else:
+        grouped = [("all_stimuli", geometry_for_overlap)]
+
+    for stimulus_value, block in grouped:
+        block = block.reset_index(drop=True)
+        for i in range(len(block)):
+            for j in range(i + 1, len(block)):
+                a = block.iloc[i]
+                b = block.iloc[j]
+                overlap_x_min = max(a["x_min"], b["x_min"])
+                overlap_y_min = max(a["y_min"], b["y_min"])
+                overlap_x_max = min(a["x_max"], b["x_max"])
+                overlap_y_max = min(a["y_max"], b["y_max"])
+                overlap_width = max(0.0, overlap_x_max - overlap_x_min)
+                overlap_height = max(0.0, overlap_y_max - overlap_y_min)
+                overlap_area = overlap_width * overlap_height
+
+                area_a = float(a["area"]) if np.isfinite(a["area"]) else np.nan
+                area_b = float(b["area"]) if np.isfinite(b["area"]) else np.nan
+                prop_a = overlap_area / area_a if np.isfinite(area_a) and area_a > 0 else np.nan
+                prop_b = overlap_area / area_b if np.isfinite(area_b) and area_b > 0 else np.nan
+                smaller = (
+                    min(area_a, area_b) if np.isfinite(area_a) and np.isfinite(area_b) else np.nan
                 )
-    return pd.DataFrame(rows, columns=["aoi1", "aoi2", "overlap_area"])
+                prop_smaller = (
+                    overlap_area / smaller if np.isfinite(smaller) and smaller > 0 else np.nan
+                )
+                flagged = overlap_area > float(min_overlap_area) or (
+                    np.isfinite(prop_smaller) and prop_smaller > float(min_overlap_prop)
+                )
+                row = {
+                    "aoi_1": str(a[resolved_aoi]),
+                    "aoi_2": str(b[resolved_aoi]),
+                    "x_min_1": a["x_min"],
+                    "y_min_1": a["y_min"],
+                    "x_max_1": a["x_max"],
+                    "y_max_1": a["y_max"],
+                    "x_min_2": b["x_min"],
+                    "y_min_2": b["y_min"],
+                    "x_max_2": b["x_max"],
+                    "y_max_2": b["y_max"],
+                    "overlap_x_min": overlap_x_min,
+                    "overlap_y_min": overlap_y_min,
+                    "overlap_x_max": overlap_x_max,
+                    "overlap_y_max": overlap_y_max,
+                    "overlap_width": overlap_width,
+                    "overlap_height": overlap_height,
+                    "overlap_area": overlap_area,
+                    "overlap_prop_aoi_1": prop_a,
+                    "overlap_prop_aoi_2": prop_b,
+                    "overlap_prop_smaller": prop_smaller,
+                    "aoi_overlap_status": "overlap" if flagged else "ok",
+                }
+                if resolved_stimulus is not None:
+                    row = {resolved_stimulus: str(stimulus_value), **row}
+                pair_rows.append(row)
+
+    pairwise_overlap = pd.DataFrame(pair_rows, columns=pair_columns)
+    flagged_overlaps = pairwise_overlap.loc[
+        pairwise_overlap["aoi_overlap_status"].ne("ok")
+    ].reset_index(drop=True)
+
+    def _safe_max(values):
+        numeric = pd.to_numeric(values, errors="coerce").to_numpy(float)
+        numeric = numeric[np.isfinite(numeric)]
+        return float(np.max(numeric)) if len(numeric) else np.nan
+
+    summary_columns = [
+        "n_aoi_pairs",
+        "n_overlapping_pairs",
+        "n_flagged_overlaps",
+        "max_overlap_area",
+        "max_overlap_prop_smaller",
+        "aoi_overlap_summary_status",
+    ]
+    summary_rows = []
+    if len(pairwise_overlap):
+        if resolved_stimulus is not None:
+            summary_groups = pairwise_overlap.groupby(
+                resolved_stimulus,
+                dropna=True,
+                sort=True,
+            )
+        else:
+            summary_groups = [(None, pairwise_overlap)]
+        for stimulus_value, block in summary_groups:
+            row = {
+                "n_aoi_pairs": len(block),
+                "n_overlapping_pairs": int((block["overlap_area"] > 0).sum()),
+                "n_flagged_overlaps": int(block["aoi_overlap_status"].ne("ok").sum()),
+                "max_overlap_area": _safe_max(block["overlap_area"]),
+                "max_overlap_prop_smaller": _safe_max(block["overlap_prop_smaller"]),
+                "aoi_overlap_summary_status": (
+                    "review" if block["aoi_overlap_status"].ne("ok").any() else "ok"
+                ),
+            }
+            if resolved_stimulus is not None:
+                row = {resolved_stimulus: str(stimulus_value), **row}
+            summary_rows.append(row)
+
+    overlap_summary_columns = (
+        [resolved_stimulus] + summary_columns if resolved_stimulus is not None else summary_columns
+    )
+    overlap_summary = pd.DataFrame(
+        summary_rows,
+        columns=overlap_summary_columns,
+    )
+
+    overview = pd.DataFrame(
+        [
+            {
+                "n_rows": len(aoi_geometry),
+                "n_aois": len(geometry_summary),
+                "n_aois_used": len(geometry_for_overlap),
+                "n_stimuli": (
+                    int(geometry_summary[resolved_stimulus].nunique(dropna=False))
+                    if resolved_stimulus is not None
+                    else pd.NA
+                ),
+                "n_aoi_pairs": len(pairwise_overlap),
+                "n_overlapping_pairs": int((pairwise_overlap["overlap_area"] > 0).sum()),
+                "n_flagged_overlaps": len(flagged_overlaps),
+                "max_overlap_area": _safe_max(pairwise_overlap["overlap_area"]),
+                "max_overlap_prop_smaller": _safe_max(pairwise_overlap["overlap_prop_smaller"]),
+                "aoi_overlap_status": ("review" if len(flagged_overlaps) > 0 else "ok"),
+            }
+        ]
+    )
+
+    def _text(value):
+        if value is None or pd.isna(value):
+            return pd.NA
+        return str(value)
+
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "aoi_col",
+                "stimulus_col",
+                "x_min_col",
+                "y_min_col",
+                "x_max_col",
+                "y_max_col",
+                "x_col",
+                "y_col",
+                "width_col",
+                "height_col",
+                "screen_x_range",
+                "screen_y_range",
+                "min_overlap_area",
+                "min_overlap_prop",
+                "ignore_invalid_geometry",
+            ],
+            "value": [
+                resolved_aoi,
+                _text(resolved_stimulus),
+                settings_lookup["x_min_col"],
+                settings_lookup["y_min_col"],
+                settings_lookup["x_max_col"],
+                settings_lookup["y_max_col"],
+                settings_lookup["x_col"],
+                settings_lookup["y_col"],
+                settings_lookup["width_col"],
+                settings_lookup["height_col"],
+                settings_lookup["screen_x_range"],
+                settings_lookup["screen_y_range"],
+                str(min_overlap_area),
+                str(min_overlap_prop),
+                "TRUE" if bool(ignore_invalid_geometry) else "FALSE",
+            ],
+        }
+    )
+
+    return {
+        "overview": overview,
+        "geometry_summary": geometry_summary,
+        "pairwise_overlap": pairwise_overlap,
+        "overlap_summary": overlap_summary,
+        "flagged_overlaps": flagged_overlaps,
+        "settings": settings,
+        "_gp3_class": "gp3_aoi_overlap_audit",
+    }
 
 
 def audit_gazepoint_aoi_screen_coverage(
@@ -4999,11 +5775,9 @@ add_gazepoint_aoi = r_aliases(
 add_gazepoint_dynamic_aoi = r_aliases(
     add_gazepoint_dynamic_aoi, master_df="data", aoi_defs="aoi_data", label_col="output_col"
 )
-audit_gazepoint_aoi_geometry = r_aliases(audit_gazepoint_aoi_geometry, data="aoi_geometry")
 audit_gazepoint_aoi_margin_sensitivity = r_aliases(
     audit_gazepoint_aoi_margin_sensitivity, gaze_data="data"
 )
-audit_gazepoint_aoi_overlap = r_aliases(audit_gazepoint_aoi_overlap, data="aoi_geometry")
 audit_gazepoint_aoi_screen_coverage = r_aliases(
     audit_gazepoint_aoi_screen_coverage,
     data="aoi_geometry",
