@@ -235,10 +235,90 @@ def check_gazepoint_performance_regression(
     )
 
 
-def write_gazepoint_performance_benchmark(data, path="performance_benchmark.csv") -> Path:
+def write_gazepoint_performance_benchmark(
+    data=None,
+    path="performance_benchmark.csv",
+    *,
+    x=None,
+    output_dir=None,
+    prefix="gp3tools-performance",
+):
+    """Write performance benchmark output.
+
+    Benchmark dictionaries use the R v2.3.0 four-file export contract.
+    Plain DataFrames retain the original Python single-file interface.
+    """
+    if x is not None or output_dir is not None:
+        if x is None or output_dir is None:
+            raise ValueError("x and output_dir must be supplied together")
+
+        if data is not None:
+            raise TypeError("data cannot be combined with the R-compatible x/output_dir interface")
+
+        if not isinstance(x, dict):
+            raise TypeError("x must be a benchmark dictionary")
+
+        regression = x.get(
+            "regression",
+            {},
+        )
+
+        if not isinstance(regression, dict):
+            raise TypeError("x['regression'] must be a dictionary")
+
+        required = {
+            "trials": x.get("trials"),
+            "summary": x.get("summary"),
+            "checks": regression.get("checks"),
+            "evaluated": regression.get("evaluated"),
+        }
+
+        missing = [name for name, value in required.items() if value is None]
+
+        if missing:
+            raise ValueError("benchmark object is missing: " + ", ".join(missing))
+
+        root = Path(output_dir)
+        root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError("prefix must be a non-empty string")
+
+        files = {
+            "trials": root / f"{prefix}-trials.csv",
+            "summary": root / f"{prefix}-summary.csv",
+            "checks": root / f"{prefix}-checks.csv",
+            "evaluated": root / f"{prefix}-evaluated.csv",
+        }
+
+        for name, file in files.items():
+            ensure_dataframe(
+                required[name],
+                copy=False,
+            ).to_csv(
+                file,
+                index=False,
+            )
+
+        return {name: file.resolve() for name, file in files.items()}
+
+    if data is None:
+        raise TypeError("data is required for the Python interface")
+
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    ensure_dataframe(data).to_csv(p, index=False)
+    p.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    ensure_dataframe(data).to_csv(
+        p,
+        index=False,
+    )
+
     return p
 
 

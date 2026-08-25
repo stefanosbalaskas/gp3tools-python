@@ -276,11 +276,87 @@ def benchmark_gazepoint_event_detectors(data, repeats: int = 3, **kwargs) -> pd.
     return pd.DataFrame(rows)
 
 
-def summarise_gazepoint_event_detector_benchmark(data) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
+def summarise_gazepoint_event_detector_benchmark(
+    data=None,
+    *,
+    x=None,
+    level="detector",
+    sort=True,
+) -> pd.DataFrame:
+    """Summarise an event-detector benchmark.
+
+    Dict-like benchmark objects use the R v2.3.0 level-selection semantics.
+    Plain DataFrames retain the original Python timing-summary behaviour.
+    """
+    if x is not None:
+        if data is not None:
+            raise TypeError("supply either data or x, not both")
+        data = x
+
+    if isinstance(data, dict) and any(
+        key in data
+        for key in (
+            "detector_metrics",
+            "sequence_metrics",
+            "matches",
+            "errors",
+        )
+    ):
+        valid_levels = {
+            "detector": "detector_metrics",
+            "sequence": "sequence_metrics",
+            "matches": "matches",
+            "errors": "errors",
+        }
+
+        if level not in valid_levels:
+            raise ValueError("level must be one of: detector, sequence, matches, errors")
+
+        key = valid_levels[level]
+
+        if key not in data:
+            raise ValueError(f"benchmark object does not contain {key!r}")
+
+        out = ensure_dataframe(
+            data[key],
+            copy=False,
+        ).copy()
+
+        if level == "detector" and sort and len(out) and "f1" in out.columns:
+            order_value = pd.to_numeric(
+                out["f1"],
+                errors="coerce",
+            ).fillna(-np.inf)
+
+            out = (
+                out.assign(_gp3_order=order_value)
+                .sort_values(
+                    ["_gp3_order", "detector"],
+                    ascending=[False, True],
+                    kind="stable",
+                )
+                .drop(columns="_gp3_order")
+                .reset_index(drop=True)
+            )
+
+        return out
+
+    df = ensure_dataframe(
+        data,
+        copy=False,
+    )
+
     return (
-        df.groupby("detector", dropna=False)["elapsed_seconds"]
-        .agg(n="size", mean_seconds="mean", median_seconds="median", max_seconds="max")
+        df.groupby(
+            "detector",
+            dropna=False,
+        )["elapsed_seconds"]
+        .agg(
+            n="size",
+            mean_seconds="mean",
+            median_seconds="median",
+            max_seconds="max",
+        )
         .reset_index()
     )
 

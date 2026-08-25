@@ -480,3 +480,19 @@ def test_unknown_keyword_is_not_silently_swallowed():
             x=pd.DataFrame({"a": [1]}),
             definitely_not_an_argument=True,
         )
+
+
+def test_us_spelling_qc_status_inherits_r_alias():
+    qc = {
+        "sampling": pd.DataFrame({"x": [1]}),
+        "other": None,
+    }
+
+    british = gp3.summarise_gazepoint_qc_status(qc_bundle=qc)
+
+    american = gp3.summarize_gazepoint_qc_status(qc_bundle=qc)
+
+    pd.testing.assert_frame_equal(
+        british,
+        american,
+    )

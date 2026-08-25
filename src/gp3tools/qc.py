@@ -297,53 +297,309 @@ def harmonize_gazepoint_screen_coordinates(
     height: float | None = None,
     output_x: str = "x_norm",
     output_y: str = "y_norm",
+    *,
+    from_width: float | None = None,
+    from_height: float | None = None,
+    to_width: float | None = None,
+    to_height: float | None = None,
+    output_x_col: str | None = None,
+    output_y_col: str | None = None,
+    keep_original: bool = True,
 ) -> pd.DataFrame:
+    """Harmonize screen coordinates.
+
+    The original Python normalization interface is retained. Supplying any
+    ``from_*``/``to_*`` argument activates the R v2.3.0 scaling interface.
+    """
     df = ensure_dataframe(data)
     x_col, y_col = (
         infer_column(df, "x", x_col, required=True),
         infer_column(df, "y", y_col, required=True),
     )
-    x, y = finite_numeric(df[x_col]), finite_numeric(df[y_col])
+
+    r_values = (
+        from_width,
+        from_height,
+        to_width,
+        to_height,
+    )
+    r_mode = any(value is not None for value in r_values)
+
+    if r_mode:
+        if any(value is None for value in r_values):
+            raise ValueError(
+                "from_width, from_height, to_width, and to_height "
+                "must all be supplied for R-compatible harmonization"
+            )
+
+        values = {
+            "from_width": from_width,
+            "from_height": from_height,
+            "to_width": to_width,
+            "to_height": to_height,
+        }
+
+        for name, value in values.items():
+            value = float(value)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a finite positive number")
+
+        output_x_col = output_x_col or "gaze_x_harmonized"
+        output_y_col = output_y_col or "gaze_y_harmonized"
+
+        x = finite_numeric(df[x_col])
+        y = finite_numeric(df[y_col])
+
+        x_scale = float(to_width) / float(from_width)
+        y_scale = float(to_height) / float(from_height)
+
+        df[output_x_col] = x * x_scale
+        df[output_y_col] = y * y_scale
+
+        if not keep_original:
+            remove = {
+                x_col,
+                y_col,
+            } - {
+                output_x_col,
+                output_y_col,
+            }
+
+            if remove:
+                df = df.drop(columns=list(remove))
+
+        df.attrs["gp3_screen_harmonization"] = {
+            "x_col": x_col,
+            "y_col": y_col,
+            "from_width": float(from_width),
+            "from_height": float(from_height),
+            "to_width": float(to_width),
+            "to_height": float(to_height),
+            "output_x_col": output_x_col,
+            "output_y_col": output_y_col,
+            "x_scale": x_scale,
+            "y_scale": y_scale,
+        }
+
+        return df
+
+    x = finite_numeric(df[x_col])
+    y = finite_numeric(df[y_col])
+
     if width is None:
         width = 1.0 if x.max(skipna=True) <= 1.5 else float(x.max(skipna=True))
+
     if height is None:
         height = 1.0 if y.max(skipna=True) <= 1.5 else float(y.max(skipna=True))
+
     df[output_x] = x / width
     df[output_y] = y / height
     return df
 
 
 def summarise_gazepoint_coordinate_coverage(
-    data, x_col=None, y_col=None, group_cols=None
+    data,
+    x_col=None,
+    y_col=None,
+    group_cols=None,
+    *,
+    screen_width: float | None = None,
+    screen_height: float | None = None,
+    grid_n_x: int = 10,
+    grid_n_y: int = 10,
+    include_out_of_bounds: bool = False,
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
+    """Summarise coordinate coverage.
+
+    Screen dimensions activate the R v2.3.0 coverage/grid calculation.
+    Without them the original Python range summary is returned.
+    """
+    df = ensure_dataframe(
+        data,
+        copy=False,
+    )
+
     x_col, y_col = (
-        infer_column(df, "x", x_col, required=True),
-        infer_column(df, "y", y_col, required=True),
+        infer_column(
+            df,
+            "x",
+            x_col,
+            required=True,
+        ),
+        infer_column(
+            df,
+            "y",
+            y_col,
+            required=True,
+        ),
     )
-    groups = normalize_group_cols(df, group_cols)
-    work = df.assign(_x=finite_numeric(df[x_col]), _y=finite_numeric(df[y_col]))
-    if groups:
-        return (
-            work.groupby(groups, dropna=False)
-            .agg(
-                n_samples=("_x", "size"),
-                n_xy=("_x", lambda s: int((s.notna() & work.loc[s.index, "_y"].notna()).sum())),
-                x_min=("_x", "min"),
-                x_max=("_x", "max"),
-                y_min=("_y", "min"),
-                y_max=("_y", "max"),
-            )
-            .reset_index()
+
+    if screen_width is None and screen_height is None:
+        groups = normalize_group_cols(
+            df,
+            group_cols,
         )
-    return result_table(
-        n_samples=len(work),
-        n_xy=int((work._x.notna() & work._y.notna()).sum()),
-        x_min=float(work._x.min()),
-        x_max=float(work._x.max()),
-        y_min=float(work._y.min()),
-        y_max=float(work._y.max()),
+
+        work = df.assign(
+            _x=finite_numeric(df[x_col]),
+            _y=finite_numeric(df[y_col]),
+        )
+
+        if groups:
+            return (
+                work.groupby(
+                    groups,
+                    dropna=False,
+                )
+                .agg(
+                    n_samples=("_x", "size"),
+                    n_xy=(
+                        "_x",
+                        lambda s: int(
+                            (
+                                s.notna()
+                                & work.loc[
+                                    s.index,
+                                    "_y",
+                                ].notna()
+                            ).sum()
+                        ),
+                    ),
+                    x_min=("_x", "min"),
+                    x_max=("_x", "max"),
+                    y_min=("_y", "min"),
+                    y_max=("_y", "max"),
+                )
+                .reset_index()
+            )
+
+        return result_table(
+            n_samples=len(work),
+            n_xy=int((work._x.notna() & work._y.notna()).sum()),
+            x_min=float(work._x.min()),
+            x_max=float(work._x.max()),
+            y_min=float(work._y.min()),
+            y_max=float(work._y.max()),
+        )
+
+    if screen_width is None or screen_height is None:
+        raise ValueError("screen_width and screen_height must be supplied together")
+
+    screen_width = float(screen_width)
+    screen_height = float(screen_height)
+
+    if (
+        not np.isfinite(screen_width)
+        or screen_width <= 0
+        or not np.isfinite(screen_height)
+        or screen_height <= 0
+    ):
+        raise ValueError("screen dimensions must be finite and positive")
+
+    if (
+        not isinstance(grid_n_x, int)
+        or grid_n_x <= 0
+        or not isinstance(grid_n_y, int)
+        or grid_n_y <= 0
+    ):
+        raise ValueError("grid_n_x and grid_n_y must be positive integers")
+
+    groups = normalize_group_cols(
+        df,
+        group_cols,
     )
+
+    x = finite_numeric(df[x_col]).to_numpy(float)
+    y = finite_numeric(df[y_col]).to_numpy(float)
+
+    finite = np.isfinite(x) & np.isfinite(y)
+
+    inside = finite & (x >= 0) & (x <= screen_width) & (y >= 0) & (y <= screen_height)
+
+    if groups:
+        group_labels = df[groups].astype("string").fillna("<NA>").agg(".".join, axis=1)
+    else:
+        group_labels = pd.Series(
+            "all",
+            index=df.index,
+            dtype="string",
+        )
+
+    rows = []
+
+    for group_id in pd.unique(group_labels):
+        idx = np.flatnonzero(group_labels.to_numpy() == group_id)
+
+        range_mask = finite[idx] if include_out_of_bounds else inside[idx]
+
+        range_idx = idx[range_mask]
+        grid_idx = idx[inside[idx]]
+
+        if len(grid_idx):
+            gx = np.floor(x[grid_idx] / screen_width * grid_n_x).astype(int)
+
+            gy = np.floor(y[grid_idx] / screen_height * grid_n_y).astype(int)
+
+            gx = np.clip(
+                gx,
+                0,
+                grid_n_x - 1,
+            )
+
+            gy = np.clip(
+                gy,
+                0,
+                grid_n_y - 1,
+            )
+
+            occupied = len(set(zip(gx, gy, strict=False)))
+        else:
+            occupied = 0
+
+        def safe_stat(values, function):
+            if not len(values):
+                return np.nan
+            return float(function(values))
+
+        rows.append(
+            {
+                "group_id": str(group_id),
+                "n_rows": int(len(idx)),
+                "n_finite_coordinates": int(finite[idx].sum()),
+                "n_inside_screen": int(inside[idx].sum()),
+                "finite_coordinate_rate": float(finite[idx].mean()),
+                "inside_screen_rate": float(inside[idx].mean()),
+                "x_min": safe_stat(
+                    x[range_idx],
+                    np.min,
+                ),
+                "x_max": safe_stat(
+                    x[range_idx],
+                    np.max,
+                ),
+                "y_min": safe_stat(
+                    y[range_idx],
+                    np.min,
+                ),
+                "y_max": safe_stat(
+                    y[range_idx],
+                    np.max,
+                ),
+                "x_mean": safe_stat(
+                    x[range_idx],
+                    np.mean,
+                ),
+                "y_mean": safe_stat(
+                    y[range_idx],
+                    np.mean,
+                ),
+                "occupied_grid_cells": int(occupied),
+                "total_grid_cells": int(grid_n_x * grid_n_y),
+                "occupied_grid_rate": float(occupied / (grid_n_x * grid_n_y)),
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 summarize_gazepoint_coordinate_coverage = summarise_gazepoint_coordinate_coverage
@@ -413,18 +669,164 @@ def check_gazepoint_file_pairs(folder: str | Path) -> pd.DataFrame:
 
 
 def segment_gazepoint_task_phases(
-    data, time_col=None, boundaries=None, labels=None, output_col: str = "phase"
+    data,
+    time_col=None,
+    boundaries=None,
+    labels=None,
+    output_col: str = "phase",
+    *,
+    phase_windows=None,
+    phase_col: str | None = None,
+    window_phase_col: str = "phase",
+    window_start_col: str = "start",
+    window_end_col: str = "end",
+    outside_label="outside",
+    include_lower: bool = True,
+    include_upper: bool = False,
+    keep_window_metadata: bool = False,
 ) -> pd.DataFrame:
+    """Segment samples into task phases.
+
+    ``phase_windows`` activates the R v2.3.0 window-based interface.
+    Otherwise the original Python boundary-based behaviour is retained.
+    """
     df = ensure_dataframe(data)
     time_col = infer_column(df, "time", time_col, required=True)
+
+    if phase_windows is not None:
+        windows = ensure_dataframe(
+            phase_windows,
+            copy=False,
+        ).copy()
+
+        required = {
+            window_phase_col,
+            window_start_col,
+            window_end_col,
+        }
+
+        missing = required - set(windows.columns)
+        if missing:
+            raise ValueError(
+                "phase_windows is missing required columns: " + ", ".join(sorted(missing))
+            )
+
+        phase_col = phase_col or "task_phase"
+
+        windows = windows[
+            [
+                window_phase_col,
+                window_start_col,
+                window_end_col,
+            ]
+        ].copy()
+
+        windows.columns = [
+            "phase",
+            "start",
+            "end",
+        ]
+
+        windows["start"] = pd.to_numeric(
+            windows["start"],
+            errors="coerce",
+        )
+
+        windows["end"] = pd.to_numeric(
+            windows["end"],
+            errors="coerce",
+        )
+
+        if windows["start"].isna().any() or windows["end"].isna().any():
+            raise ValueError("phase-window start/end values must be numeric")
+
+        if (windows["end"] < windows["start"]).any():
+            raise ValueError("phase-window end values must not precede start values")
+
+        t = finite_numeric(df[time_col]).to_numpy(float)
+
+        assigned = np.full(
+            len(df),
+            None,
+            dtype=object,
+        )
+
+        assigned_start = np.full(
+            len(df),
+            np.nan,
+            dtype=float,
+        )
+
+        assigned_end = np.full(
+            len(df),
+            np.nan,
+            dtype=float,
+        )
+
+        already = np.zeros(
+            len(df),
+            dtype=bool,
+        )
+
+        for row in windows.itertuples(index=False):
+            lower = t >= row.start if include_lower else t > row.start
+
+            upper = t <= row.end if include_upper else t < row.end
+
+            mask = np.isfinite(t) & lower & upper & ~already
+
+            assigned[mask] = row.phase
+            assigned_start[mask] = row.start
+            assigned_end[mask] = row.end
+            already[mask] = True
+
+        if outside_label is not None:
+            assigned[~already] = outside_label
+
+        df[phase_col] = pd.Series(
+            assigned,
+            index=df.index,
+            dtype="object",
+        )
+
+        df[".gp3_phase_assigned"] = already
+
+        if keep_window_metadata:
+            df[".gp3_phase_window_start"] = assigned_start
+            df[".gp3_phase_window_end"] = assigned_end
+
+        df.attrs["gp3_phase_windows"] = windows
+        df.attrs["gp3_phase_segmentation"] = {
+            "time_col": time_col,
+            "phase_col": phase_col,
+            "outside_label": outside_label,
+            "include_lower": include_lower,
+            "include_upper": include_upper,
+        }
+
+        return df
+
     t = finite_numeric(df[time_col])
+
     if boundaries is None:
         q = t.quantile([0, 1 / 3, 2 / 3, 1]).to_numpy()
         boundaries = np.unique(q)
-    boundaries = np.asarray(boundaries, dtype=float)
+
+    boundaries = np.asarray(
+        boundaries,
+        dtype=float,
+    )
+
     if labels is None:
         labels = [f"phase_{i + 1}" for i in range(len(boundaries) - 1)]
-    df[output_col] = pd.cut(t, boundaries, labels=labels, include_lowest=True)
+
+    df[output_col] = pd.cut(
+        t,
+        boundaries,
+        labels=labels,
+        include_lowest=True,
+    )
+
     return df
 
 
@@ -626,11 +1028,73 @@ def gp3tools_naming_policy() -> dict[str, Any]:
     }
 
 
-def write_gazepoint_naming_audit(path, names=None) -> Path:
+def write_gazepoint_naming_audit(
+    path=None,
+    names=None,
+    *,
+    x=None,
+    output_file=None,
+) -> Path:
+    """Write a naming audit.
+
+    ``x`` plus ``output_file`` implements the R v2.3.0 audit-object
+    interface. ``path`` plus ``names`` retains the original Python API.
+    """
+    if x is not None or output_file is not None:
+        if x is None or output_file is None:
+            raise ValueError("x and output_file must be supplied together")
+
+        if path is not None:
+            raise TypeError("path cannot be combined with the R-compatible x/output_file interface")
+
+        if isinstance(x, dict):
+            pairs = x.get("pairs")
+        else:
+            pairs = getattr(
+                x,
+                "pairs",
+                None,
+            )
+
+        if pairs is None:
+            raise TypeError("x must contain a 'pairs' table")
+
+        out = Path(output_file)
+
+        if not str(out).strip():
+            raise ValueError("output_file must be a non-empty path")
+
+        out.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        ensure_dataframe(
+            pairs,
+            copy=False,
+        ).to_csv(
+            out,
+            index=False,
+        )
+
+        return out.resolve()
+
+    if path is None:
+        raise TypeError("path is required for the Python interface")
+
     out = Path(path)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     audit = audit_gazepoint_naming_consistency(names)
-    audit["summary"].to_csv(out, index=False)
+
+    audit["summary"].to_csv(
+        out,
+        index=False,
+    )
+
     return out
 
 
@@ -642,3 +1106,6 @@ audit_gazepoint_screen_bounds = r_aliases(
 summarise_gazepoint_qc_status = r_aliases(summarise_gazepoint_qc_status, qc_bundle="qc")
 validate_gazepoint_master = r_aliases(validate_gazepoint_master, master="data")
 # END R V2.3.0 CALL-SURFACE ALIASES
+
+# R v2.3.0 alias rebinding after compatibility wrappers
+summarize_gazepoint_qc_status = summarise_gazepoint_qc_status
