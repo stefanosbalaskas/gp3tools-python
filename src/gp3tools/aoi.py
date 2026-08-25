@@ -669,20 +669,145 @@ def audit_gazepoint_aoi_overlap(aoi_geometry) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["aoi1", "aoi2", "overlap_area"])
 
 
-def audit_gazepoint_aoi_screen_coverage(aoi_geometry, width=1.0, height=1.0) -> pd.DataFrame:
+def audit_gazepoint_aoi_screen_coverage(
+    aoi_geometry,
+    width=1.0,
+    height=1.0,
+    aoi_col=None,
+    x_min_col="x_min",
+    x_max_col="x_max",
+    y_min_col="y_min",
+    y_max_col="y_max",
+    margin=0,
+):
+    """Audit AOI screen coverage; legacy summary is retained for default calls."""
     g = ensure_dataframe(aoi_geometry, copy=False)
-    total = float(width * height)
-    areas = (g.xmax - g.xmin).clip(lower=0) * (g.ymax - g.ymin).clip(lower=0)
-    return pd.DataFrame(
+    r_mode = (
+        aoi_col is not None
+        or x_min_col != "x_min"
+        or x_max_col != "x_max"
+        or y_min_col != "y_min"
+        or y_max_col != "y_max"
+        or margin != 0
+    )
+    if not r_mode:
+        total = float(width * height)
+        x0 = "xmin" if "xmin" in g.columns else x_min_col
+        x1 = "xmax" if "xmax" in g.columns else x_max_col
+        y0 = "ymin" if "ymin" in g.columns else y_min_col
+        y1 = "ymax" if "ymax" in g.columns else y_max_col
+        areas = (g[x1] - g[x0]).clip(lower=0) * (g[y1] - g[y0]).clip(lower=0)
+        return pd.DataFrame(
+            [
+                {
+                    "n_aois": len(g),
+                    "sum_aoi_area": float(areas.sum()),
+                    "screen_area": total,
+                    "nominal_coverage_prop": float(areas.sum() / total) if total else np.nan,
+                }
+            ]
+        )
+
+    screen_width = float(width)
+    screen_height = float(height)
+    if not np.isfinite(screen_width) or screen_width <= 0:
+        raise ValueError("screen_width must be positive")
+    if not np.isfinite(screen_height) or screen_height <= 0:
+        raise ValueError("screen_height must be positive")
+    if not isinstance(margin, (int, float, np.integer, np.floating)) or margin < 0:
+        raise ValueError("margin must be a single non-negative numeric value")
+
+    required = [x_min_col, x_max_col, y_min_col, y_max_col]
+    if aoi_col is not None:
+        required.insert(0, aoi_col)
+    missing = [column for column in required if column not in g.columns]
+    if missing:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+    x_min = pd.to_numeric(g[x_min_col], errors="coerce").to_numpy(float)
+    x_max = pd.to_numeric(g[x_max_col], errors="coerce").to_numpy(float)
+    y_min = pd.to_numeric(g[y_min_col], errors="coerce").to_numpy(float)
+    y_max = pd.to_numeric(g[y_max_col], errors="coerce").to_numpy(float)
+    aoi_id = (
+        g[aoi_col].astype(str).to_numpy()
+        if aoi_col is not None
+        else np.asarray([f"AOI_{i}" for i in range(1, len(g) + 1)], dtype=object)
+    )
+
+    missing_geometry = ~(
+        np.isfinite(x_min) & np.isfinite(x_max) & np.isfinite(y_min) & np.isfinite(y_max)
+    )
+    invalid_rectangle = ~missing_geometry & ((x_max <= x_min) | (y_max <= y_min))
+    offscreen_left = ~missing_geometry & (x_min < -margin)
+    offscreen_right = ~missing_geometry & (x_max > screen_width + margin)
+    offscreen_top = ~missing_geometry & (y_min < -margin)
+    offscreen_bottom = ~missing_geometry & (y_max > screen_height + margin)
+    outside_screen = offscreen_left | offscreen_right | offscreen_top | offscreen_bottom
+
+    raw_width = np.where(missing_geometry | invalid_rectangle, np.nan, x_max - x_min)
+    raw_height = np.where(missing_geometry | invalid_rectangle, np.nan, y_max - y_min)
+    raw_area = raw_width * raw_height
+    clipped_x_min = np.maximum(0, np.minimum(screen_width, x_min))
+    clipped_x_max = np.maximum(0, np.minimum(screen_width, x_max))
+    clipped_y_min = np.maximum(0, np.minimum(screen_height, y_min))
+    clipped_y_max = np.maximum(0, np.minimum(screen_height, y_max))
+    clipped_area = np.maximum(0, clipped_x_max - clipped_x_min) * np.maximum(
+        0, clipped_y_max - clipped_y_min
+    )
+    clipped_area[missing_geometry | invalid_rectangle] = np.nan
+    screen_area = screen_width * screen_height
+
+    aoi_summary = pd.DataFrame(
+        {
+            "aoi_id": aoi_id,
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": y_min,
+            "y_max": y_max,
+            "width": raw_width,
+            "height": raw_height,
+            "raw_area": raw_area,
+            "clipped_area": clipped_area,
+            "raw_screen_coverage": raw_area / screen_area,
+            "clipped_screen_coverage": clipped_area / screen_area,
+            "missing_geometry": missing_geometry,
+            "invalid_rectangle": invalid_rectangle,
+            "outside_screen": outside_screen,
+            "offscreen_left": offscreen_left,
+            "offscreen_right": offscreen_right,
+            "offscreen_top": offscreen_top,
+            "offscreen_bottom": offscreen_bottom,
+        }
+    )
+    overall_summary = pd.DataFrame(
         [
             {
-                "n_aois": len(g),
-                "sum_aoi_area": float(areas.sum()),
-                "screen_area": total,
-                "nominal_coverage_prop": float(areas.sum() / total) if total else np.nan,
+                "n_aois": len(aoi_summary),
+                "n_missing_geometry": int(missing_geometry.sum()),
+                "n_invalid_rectangles": int(invalid_rectangle.sum()),
+                "n_outside_screen": int(outside_screen.sum()),
+                "total_raw_area": float(np.nansum(raw_area)),
+                "total_clipped_area": float(np.nansum(clipped_area)),
+                "total_raw_screen_coverage": float(np.nansum(raw_area / screen_area)),
+                "total_clipped_screen_coverage": float(np.nansum(clipped_area / screen_area)),
+                "coverage_note": "Coverage sums are descriptive and do not correct for AOI overlap.",
             }
         ]
     )
+    return {
+        "aoi_summary": aoi_summary,
+        "overall_summary": overall_summary,
+        "settings": {
+            "screen_width": screen_width,
+            "screen_height": screen_height,
+            "aoi_col": aoi_col,
+            "x_min_col": x_min_col,
+            "x_max_col": x_max_col,
+            "y_min_col": y_min_col,
+            "y_max_col": y_max_col,
+            "margin": margin,
+        },
+    }
 
 
 def audit_gazepoint_dynamic_aoi_coverage(data, aoi_col="aoi_current") -> pd.DataFrame:
@@ -1372,18 +1497,87 @@ def audit_gazepoint_aoi_margin_sensitivity(
     return pd.DataFrame(rows)
 
 
-def summarise_aoi_samples(data, aoi_col=None, group_cols=None) -> pd.DataFrame:
+def summarise_aoi_samples(
+    data,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+) -> pd.DataFrame:
+    """Summarise AOI samples with legacy counts or R v2.3.0 timing semantics."""
     df = ensure_dataframe(data, copy=False)
-    aoi_col = infer_column(df, "aoi", aoi_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
-    out = df.groupby(groups + [aoi_col], dropna=False).size().rename("n_samples").reset_index()
-    totals = (
-        out.groupby(groups, dropna=False).n_samples.transform("sum")
-        if groups
-        else out.n_samples.sum()
+
+    # Historical Python mode: sample counts/proportions.
+    if time_col is None:
+        resolved_aoi = infer_column(df, "aoi", aoi_col, required=True)
+        groups = normalize_group_cols(df, group_cols)
+        out = (
+            df.groupby(groups + [resolved_aoi], dropna=False)
+            .size()
+            .rename("n_samples")
+            .reset_index()
+        )
+        totals = (
+            out.groupby(groups, dropna=False).n_samples.transform("sum")
+            if groups
+            else out.n_samples.sum()
+        )
+        out["proportion"] = out.n_samples / totals
+        return out
+
+    # R v2.3.0 mode.
+    frame = standardise_gazepoint_names(df)
+    resolved_aoi = "AOI" if aoi_col is None else aoi_col
+    groups = (
+        ["MEDIA_ID"]
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
     )
-    out["proportion"] = out.n_samples / totals
-    return out
+    needed = [*groups, resolved_aoi, time_col]
+    missing = [column for column in needed if column not in frame.columns]
+    if missing:
+        raise ValueError("Missing columns: " + ", ".join(missing))
+
+    work = frame.sort_values(
+        [*groups, time_col] if groups else [time_col],
+        kind="stable",
+        na_position="last",
+    ).copy()
+    work["_gp3_time_numeric"] = pd.to_numeric(work[time_col], errors="coerce")
+
+    if groups:
+        work["_gp3_dt_next"] = (
+            work.groupby(groups, dropna=False, sort=False)["_gp3_time_numeric"].shift(-1)
+            - work["_gp3_time_numeric"]
+        )
+        medians = work.groupby(groups, dropna=False, sort=False)["_gp3_dt_next"].transform("median")
+    else:
+        work["_gp3_dt_next"] = work["_gp3_time_numeric"].shift(-1) - work["_gp3_time_numeric"]
+        medians = pd.Series(work["_gp3_dt_next"].median(), index=work.index)
+
+    work["_gp3_dt_next"] = work["_gp3_dt_next"].where(
+        work["_gp3_dt_next"].notna(),
+        medians,
+    )
+    work = work.loc[work[resolved_aoi].notna() & work[resolved_aoi].astype(str).ne("")]
+
+    rows = []
+    keys = [*groups, resolved_aoi]
+    for key, block in work.groupby(keys, dropna=False, sort=True):
+        values = key if isinstance(key, tuple) else (key,)
+        row = dict(zip(keys, values, strict=True))
+        row.update(
+            {
+                "time_to_first_view_sec": float(block["_gp3_time_numeric"].min()),
+                "aoi_sample_count": int(len(block)),
+                "approx_time_viewed_sec": float(block["_gp3_dt_next"].sum(skipna=True)),
+            }
+        )
+        rows.append(row)
+
+    return pd.DataFrame(
+        rows,
+        columns=[*keys, "time_to_first_view_sec", "aoi_sample_count", "approx_time_viewed_sec"],
+    )
 
 
 def summarise_gazepoint_aoi(
@@ -2024,24 +2218,220 @@ def _levenshtein(a, b) -> int:
 
 
 def compute_gazepoint_sequence_distance(
-    sequence_a, sequence_b, method="levenshtein", normalize=True
-) -> float:
-    a = list(sequence_a)
-    b = list(sequence_b)
-    if method in {"levenshtein", "edit"}:
-        d = float(_levenshtein(a, b))
-    elif method == "jaccard":
-        d = 1 - len(set(a) & set(b)) / max(len(set(a) | set(b)), 1)
-    else:
-        raise ValueError("method must be levenshtein/edit or jaccard")
-    return d / max(len(a), len(b), 1) if normalize and method in {"levenshtein", "edit"} else d
+    sequence_a,
+    sequence_b,
+    method="levenshtein",
+    normalize=True,
+    *,
+    ignore_missing=None,
+    missing_label="missing",
+    collapse_repeats=False,
+    substitution_cost=1,
+    insertion_cost=1,
+    deletion_cost=1,
+):
+    """Compute legacy scalar distance or an R v2.3.0 distance table."""
+    r_mode = (
+        ignore_missing is not None
+        or collapse_repeats
+        or substitution_cost != 1
+        or insertion_cost != 1
+        or deletion_cost != 1
+    )
+
+    if not r_mode:
+        a = list(sequence_a)
+        b = list(sequence_b)
+        if method in {"levenshtein", "edit"}:
+            d = float(_levenshtein(a, b))
+        elif method == "jaccard":
+            d = 1 - len(set(a) & set(b)) / max(len(set(a) | set(b)), 1)
+        else:
+            raise ValueError("method must be levenshtein/edit or jaccard")
+        return d / max(len(a), len(b), 1) if normalize and method in {"levenshtein", "edit"} else d
+
+    if not isinstance(ignore_missing, (bool, np.bool_)):
+        raise ValueError("ignore_missing must be TRUE or FALSE")
+    if not isinstance(collapse_repeats, (bool, np.bool_)):
+        raise ValueError("collapse_repeats must be TRUE or FALSE")
+    if not isinstance(missing_label, str) or not missing_label:
+        raise ValueError("missing_label must be a non-empty string")
+
+    costs = np.asarray(
+        [substitution_cost, insertion_cost, deletion_cost],
+        dtype=float,
+    )
+    if not np.isfinite(costs).all() or (costs < 0).any():
+        raise ValueError("Edit costs must be non-negative finite numeric values")
+
+    def prepare(values):
+        out = []
+        for value in values:
+            missing = pd.isna(value) or (isinstance(value, str) and value.strip() == "")
+            if missing:
+                if not ignore_missing:
+                    out.append(missing_label)
+            else:
+                out.append(str(value))
+        if collapse_repeats:
+            out = list(collapse_consecutive(out))
+        return out
+
+    a = prepare(sequence_a)
+    b = prepare(sequence_b)
+
+    n = len(a)
+    m = len(b)
+    d = np.zeros((n + 1, m + 1), dtype=float)
+    d[:, 0] = np.arange(n + 1) * float(deletion_cost)
+    d[0, :] = np.arange(m + 1) * float(insertion_cost)
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0.0 if a[i - 1] == b[j - 1] else float(substitution_cost)
+            d[i, j] = min(
+                d[i - 1, j] + float(deletion_cost),
+                d[i, j - 1] + float(insertion_cost),
+                d[i - 1, j - 1] + cost,
+            )
+
+    distance = float(d[n, m])
+    max_length = max(n, m)
+    normalized_distance = 0.0 if max_length == 0 else distance / max_length
+    return pd.DataFrame(
+        [
+            {
+                "edit_distance": distance,
+                "normalized_distance": float(normalized_distance),
+                "sequence_a_length": n,
+                "sequence_b_length": m,
+                "distance_status": "ok",
+            }
+        ]
+    )
 
 
-def compute_gazepoint_sequence_recurrence(sequence, lag=1) -> dict[str, float]:
-    s = list(sequence)
-    matches = sum(s[i] == s[i - lag] for i in range(lag, len(s))) if len(s) > lag else 0
-    denom = max(len(s) - lag, 0)
-    return {"lag": lag, "n_pairs": denom, "recurrence": matches / denom if denom else np.nan}
+def compute_gazepoint_sequence_recurrence(
+    sequence=None,
+    lag=1,
+    *,
+    data=None,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    min_line=2,
+    include_missing=False,
+    missing_label="missing",
+):
+    """Compute legacy lag recurrence or R v2.3.0 recurrence-plot metrics."""
+    r_mode = (
+        data is not None
+        or aoi_col is not None
+        or group_cols is not None
+        or time_col is not None
+        or min_line != 2
+        or include_missing
+        or missing_label != "missing"
+    )
+    if not r_mode:
+        s = list([] if sequence is None else sequence)
+        matches = sum(s[i] == s[i - lag] for i in range(lag, len(s))) if len(s) > lag else 0
+        denom = max(len(s) - lag, 0)
+        return {"lag": lag, "n_pairs": denom, "recurrence": matches / denom if denom else np.nan}
+
+    if not isinstance(min_line, (int, np.integer)) or min_line < 1:
+        raise ValueError("min_line must be a positive integer")
+    if not isinstance(include_missing, (bool, np.bool_)):
+        raise ValueError("include_missing must be TRUE or FALSE")
+    if not isinstance(missing_label, str) or not missing_label:
+        raise ValueError("missing_label must be a non-empty string")
+
+    def prepare(values):
+        out = []
+        for value in values:
+            missing = pd.isna(value) or (isinstance(value, str) and value.strip() == "")
+            if missing:
+                if include_missing:
+                    out.append(missing_label)
+            else:
+                out.append(str(value))
+        return out
+
+    def one_seq(values):
+        x = prepare(values)
+        n = len(x)
+        if n < 2:
+            return {
+                "sequence_length": n,
+                "recurrence_points": 0,
+                "recurrence_rate": np.nan,
+                "determinism": np.nan,
+                "mean_diagonal_length": np.nan,
+                "recurrence_status": "too_short",
+            }
+        mat = np.equal.outer(x, x)
+        np.fill_diagonal(mat, False)
+        recurrence_points = int(np.triu(mat, k=1).sum())
+        possible = n * (n - 1) // 2
+        recurrence_rate = recurrence_points / possible
+        line_lengths = []
+        for offset in range(1, n):
+            diagonal = np.diag(mat, k=offset)
+            if not len(diagonal):
+                continue
+            start = 0
+            while start < len(diagonal):
+                if not diagonal[start]:
+                    start += 1
+                    continue
+                end = start + 1
+                while end < len(diagonal) and diagonal[end]:
+                    end += 1
+                length = end - start
+                if length >= min_line:
+                    line_lengths.append(length)
+                start = end
+        deterministic_points = int(sum(line_lengths))
+        determinism = deterministic_points / recurrence_points if recurrence_points > 0 else np.nan
+        return {
+            "sequence_length": n,
+            "recurrence_points": recurrence_points,
+            "recurrence_rate": float(recurrence_rate),
+            "determinism": float(determinism) if np.isfinite(determinism) else np.nan,
+            "mean_diagonal_length": float(np.mean(line_lengths)) if line_lengths else np.nan,
+            "recurrence_status": "ok",
+        }
+
+    if data is None:
+        if sequence is None:
+            raise ValueError("Supply either data with aoi_col or sequence")
+        return pd.DataFrame([one_seq(sequence)])
+
+    frame = ensure_dataframe(data, copy=False)
+    if not isinstance(aoi_col, str) or not aoi_col:
+        raise ValueError("aoi_col must be a single non-empty column name")
+    groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    needed = [aoi_col, *groups] + ([time_col] if time_col is not None else [])
+    missing = [column for column in needed if column not in frame.columns]
+    if missing:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+    blocks = [(None, frame)] if not groups else frame.groupby(groups, dropna=True, sort=True)
+    rows = []
+    for key, block in blocks:
+        if time_col is not None:
+            block = block.sort_values(time_col, kind="stable", na_position="last")
+        row = {}
+        if groups:
+            values = key if isinstance(key, tuple) else (key,)
+            row.update(dict(zip(groups, values, strict=True)))
+        row.update(one_seq(block[aoi_col]))
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def compute_gazepoint_scanpath_geometry(
@@ -3296,20 +3686,80 @@ def select_gazepoint_scanpath_clusters(data, max_clusters=6, **kwargs) -> pd.Dat
     return pd.DataFrame(rows)
 
 
-def extract_gazepoint_representative_scanpaths(clustered) -> pd.DataFrame:
-    df = ensure_dataframe(clustered, copy=False)
-    rows = []
-    for cluster, g in df.groupby("cluster", dropna=False):
-        seqs = g.sequence.tolist()
-        n = len(seqs)
-        dist = np.zeros((n, n))
-        for i in range(n):
-            for j in range(i + 1, n):
-                dist[i, j] = dist[j, i] = compute_gazepoint_sequence_distance(seqs[i], seqs[j])
-        med = int(np.argmin(dist.mean(axis=1))) if n else 0
-        rows.append(
-            {"cluster": cluster, "representative_sequence": seqs[med] if n else [], "n_members": n}
+def extract_gazepoint_representative_scanpaths(clustered, n_per_cluster=1) -> pd.DataFrame:
+    """Extract legacy representatives or R v2.3.0 ranked cluster representatives."""
+    if not isinstance(clustered, dict):
+        df = ensure_dataframe(clustered, copy=False)
+        rows = []
+        for cluster, g in df.groupby("cluster", dropna=False):
+            seqs = g.sequence.tolist()
+            n = len(seqs)
+            dist = np.zeros((n, n))
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dist[i, j] = dist[j, i] = compute_gazepoint_sequence_distance(seqs[i], seqs[j])
+            med = int(np.argmin(dist.mean(axis=1))) if n else 0
+            rows.append(
+                {
+                    "cluster": cluster,
+                    "representative_sequence": seqs[med] if n else [],
+                    "n_members": n,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    if not isinstance(n_per_cluster, (int, np.integer)) or int(n_per_cluster) < 1:
+        raise ValueError("n_per_cluster must be one positive integer")
+    n_per_cluster = int(n_per_cluster)
+    required = {"distance", "assignments"}
+    if not required.issubset(clustered):
+        raise ValueError("clustered must be an R-compatible scanpath cluster result")
+
+    distance = clustered["distance"]
+    distance = (
+        distance.copy()
+        if isinstance(distance, pd.DataFrame)
+        else pd.DataFrame(np.asarray(distance, dtype=float))
+    )
+    if distance.shape[0] != distance.shape[1]:
+        raise ValueError("distance must be square")
+    sequence_ids = [str(value) for value in distance.index]
+    assignments = ensure_dataframe(clustered["assignments"], copy=True)
+    if not {"sequence_id", "cluster"}.issubset(assignments.columns):
+        raise ValueError("assignments must contain sequence_id and cluster")
+    assignments["sequence_id"] = assignments["sequence_id"].astype(str)
+    assignments["cluster"] = pd.to_numeric(assignments["cluster"], errors="raise").astype(int)
+    if assignments["sequence_id"].duplicated().any():
+        raise ValueError("Cluster assignments contain duplicated sequence identifiers")
+    missing = [value for value in sequence_ids if value not in set(assignments["sequence_id"])]
+    if missing:
+        raise ValueError(
+            "Cluster assignments are missing sequence identifier(s): " + ", ".join(missing)
         )
+    assignments = assignments.set_index("sequence_id").loc[sequence_ids].reset_index()
+    model_medoids = set(str(value) for value in (clustered.get("medoids") or []))
+
+    rows = []
+    for cluster_id in sorted(assignments["cluster"].unique()):
+        members = assignments.loc[assignments["cluster"].eq(cluster_id), "sequence_id"].tolist()
+        within = distance.loc[members, members]
+        if len(members) == 1:
+            means = pd.Series([0.0], index=members)
+        else:
+            means = within.sum(axis=1) / (len(members) - 1)
+        ordered = sorted(members, key=lambda value: (float(means.loc[value]), value))
+        selected = ordered[: min(n_per_cluster, len(ordered))]
+        for rank, sequence_id in enumerate(selected, 1):
+            rows.append(
+                {
+                    "cluster": int(cluster_id),
+                    "representative_rank": rank,
+                    "sequence_id": sequence_id,
+                    "mean_within_cluster_distance": float(means.loc[sequence_id]),
+                    "cluster_size": len(members),
+                    "is_model_medoid": sequence_id in model_medoids,
+                }
+            )
     return pd.DataFrame(rows)
 
 

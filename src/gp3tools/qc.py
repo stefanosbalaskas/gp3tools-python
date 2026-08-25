@@ -235,29 +235,77 @@ def clean_gazepoint_by_trackloss(
     return df.loc[valid].copy() if drop else df.assign(gp3_track_valid=valid)
 
 
-def summarise_gazepoint_missingness(data, group_cols=None, columns=None) -> pd.DataFrame:
+def summarise_gazepoint_missingness(
+    data,
+    group_cols=None,
+    columns=None,
+    *,
+    cols=None,
+    include_group_cols=False,
+) -> pd.DataFrame:
+    """Summarise missingness with R v2.3.0 fields plus legacy aliases."""
     df = ensure_dataframe(data, copy=False)
-    groups = normalize_group_cols(df, group_cols)
-    columns = list(columns) if columns is not None else list(df.columns)
+    groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    missing_groups = [column for column in groups if column not in df.columns]
+    if missing_groups:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing_groups))
+    if cols is not None and columns is not None:
+        raise TypeError("supply either cols or columns, not both")
+    selected = cols if cols is not None else columns
+    if selected is None:
+        selected = list(df.columns)
+        if not include_group_cols and groups:
+            selected = [column for column in selected if column not in groups]
+    elif isinstance(selected, str):
+        selected = [selected]
+    else:
+        selected = list(selected)
+    if not selected:
+        raise ValueError("cols must identify at least one column")
+    missing_cols = [column for column in selected if column not in df.columns]
+    if missing_cols:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing_cols))
+
+    if groups:
+        group_id = df[groups].astype("string").fillna("<NA>").agg(".".join, axis=1)
+    else:
+        group_id = pd.Series("all", index=df.index)
+
     rows = []
-    iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
-    for key, frame in iterator:
-        if groups and not isinstance(key, tuple):
-            key = (key,)
-        base = {c: v for c, v in zip(groups, key, strict=False)} if groups else {}
-        for col in columns:
-            if col not in frame:
-                continue
-            rows.append(
-                {
-                    **base,
-                    "column": col,
-                    "n": len(frame),
-                    "n_missing": int(frame[col].isna().sum()),
-                    "missing_prop": float(frame[col].isna().mean()),
-                }
-            )
-    return pd.DataFrame(rows)
+    for gid in sorted(group_id.unique()):
+        mask = group_id.eq(gid)
+        block = df.loc[mask]
+        for column in selected:
+            missing = block[column].isna()
+            row = {
+                "group_id": gid,
+                "variable": column,
+                "n_rows": len(block),
+                "n_missing": int(missing.sum()),
+                "n_observed": int((~missing).sum()),
+                "missing_rate": float(missing.mean()),
+                "observed_rate": float((~missing).mean()),
+                # Legacy aliases.
+                "column": column,
+                "n": len(block),
+                "missing_prop": float(missing.mean()),
+            }
+            if groups:
+                first = block.iloc[0]
+                for group in groups:
+                    row[group] = first[group]
+            rows.append(row)
+    result = pd.DataFrame(rows)
+    result.attrs["gp3_missingness_settings"] = {
+        "cols": selected,
+        "group_cols": groups or None,
+        "include_group_cols": bool(include_group_cols),
+    }
+    return result
 
 
 summarize_gazepoint_missingness = summarise_gazepoint_missingness
@@ -271,23 +319,129 @@ def audit_gazepoint_gaze_signal_quality(data, **kwargs) -> dict[str, pd.DataFram
 
 
 def audit_gazepoint_screen_bounds(
-    data, x_col=None, y_col=None, width: float = 1.0, height: float = 1.0, normalized: bool = True
-) -> pd.DataFrame:
+    data,
+    x_col=None,
+    y_col=None,
+    width: float = 1.0,
+    height: float = 1.0,
+    normalized: bool = True,
+    group_cols=None,
+    margin=0,
+    treat_zero_zero_as_out_of_bounds=True,
+):
+    """Audit screen bounds with legacy summary or R v2.3.0 detailed output."""
     df = ensure_dataframe(data, copy=False)
-    x_col, y_col = (
-        infer_column(df, "x", x_col, required=True),
-        infer_column(df, "y", y_col, required=True),
+    x_col = infer_column(df, "x", x_col, required=True)
+    y_col = infer_column(df, "y", y_col, required=True)
+    r_mode = group_cols is not None or margin != 0 or treat_zero_zero_as_out_of_bounds is not True
+
+    if not r_mode:
+        x = finite_numeric(df[x_col])
+        y = finite_numeric(df[y_col])
+        xmax, ymax = (1.0, 1.0) if normalized else (float(width), float(height))
+        inside = x.between(0, xmax) & y.between(0, ymax)
+        return result_table(
+            n=len(df),
+            n_finite=int((x.notna() & y.notna()).sum()),
+            n_inside=int(inside.sum()),
+            n_outside=int((x.notna() & y.notna() & ~inside).sum()),
+            inside_prop=float(inside.mean()),
+        )
+
+    screen_width = float(width)
+    screen_height = float(height)
+    if not np.isfinite(screen_width) or screen_width <= 0:
+        raise ValueError("screen_width must be positive")
+    if not np.isfinite(screen_height) or screen_height <= 0:
+        raise ValueError("screen_height must be positive")
+    if not isinstance(margin, (int, float, np.integer, np.floating)) or margin < 0:
+        raise ValueError("margin must be a single non-negative numeric value")
+
+    groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
     )
-    x, y = finite_numeric(df[x_col]), finite_numeric(df[y_col])
-    xmax, ymax = (1.0, 1.0) if normalized else (float(width), float(height))
-    inside = x.between(0, xmax) & y.between(0, ymax)
-    return result_table(
-        n=len(df),
-        n_finite=int((x.notna() & y.notna()).sum()),
-        n_inside=int(inside.sum()),
-        n_outside=int((x.notna() & y.notna() & ~inside).sum()),
-        inside_prop=float(inside.mean()),
+    missing = [column for column in [x_col, y_col, *groups] if column not in df.columns]
+    if missing:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+    x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(float)
+    y = pd.to_numeric(df[y_col], errors="coerce").to_numpy(float)
+    missing_coordinate = ~(np.isfinite(x) & np.isfinite(y))
+    zero_zero = ~missing_coordinate & (x == 0) & (y == 0)
+    outside_x = ~missing_coordinate & ((x < -margin) | (x > screen_width + margin))
+    outside_y = ~missing_coordinate & ((y < -margin) | (y > screen_height + margin))
+    outside_bounds = outside_x | outside_y
+    invalid_coordinate = missing_coordinate | outside_bounds
+    if treat_zero_zero_as_out_of_bounds:
+        invalid_coordinate = invalid_coordinate | zero_zero
+
+    row_flags = pd.DataFrame(
+        {
+            "row_id": np.arange(1, len(df) + 1),
+            "x": x,
+            "y": y,
+            "missing_coordinate": missing_coordinate,
+            "zero_zero": zero_zero,
+            "outside_x": outside_x,
+            "outside_y": outside_y,
+            "outside_bounds": outside_bounds,
+            "invalid_coordinate": invalid_coordinate,
+        }
     )
+    if groups:
+        group_labels = df[groups].astype("string").fillna("<NA>").agg(".".join, axis=1)
+    else:
+        group_labels = pd.Series("all", index=df.index)
+    row_flags[".gp3_group_id"] = group_labels.to_numpy()
+
+    summary_rows = []
+    for group_id, block in row_flags.groupby(".gp3_group_id", sort=True):
+        summary_rows.append(
+            {
+                "group_id": group_id,
+                "n_rows": len(block),
+                "n_missing_coordinate": int(block["missing_coordinate"].sum()),
+                "n_zero_zero": int(block["zero_zero"].sum()),
+                "n_outside_bounds": int(block["outside_bounds"].sum()),
+                "n_invalid_coordinate": int(block["invalid_coordinate"].sum()),
+                "missing_coordinate_rate": float(block["missing_coordinate"].mean()),
+                "zero_zero_rate": float(block["zero_zero"].mean()),
+                "outside_bounds_rate": float(block["outside_bounds"].mean()),
+                "invalid_coordinate_rate": float(block["invalid_coordinate"].mean()),
+            }
+        )
+    group_summary = pd.DataFrame(summary_rows)
+    overall_summary = pd.DataFrame(
+        [
+            {
+                "n_rows": len(row_flags),
+                "n_missing_coordinate": int(missing_coordinate.sum()),
+                "n_zero_zero": int(zero_zero.sum()),
+                "n_outside_bounds": int(outside_bounds.sum()),
+                "n_invalid_coordinate": int(invalid_coordinate.sum()),
+                "missing_coordinate_rate": float(missing_coordinate.mean()),
+                "zero_zero_rate": float(zero_zero.mean()),
+                "outside_bounds_rate": float(outside_bounds.mean()),
+                "invalid_coordinate_rate": float(invalid_coordinate.mean()),
+            }
+        ]
+    )
+    return {
+        "row_flags": row_flags,
+        "group_summary": group_summary,
+        "overall_summary": overall_summary,
+        "settings": {
+            "x_col": x_col,
+            "y_col": y_col,
+            "screen_width": screen_width,
+            "screen_height": screen_height,
+            "group_cols": groups or None,
+            "margin": margin,
+            "treat_zero_zero_as_out_of_bounds": bool(treat_zero_zero_as_out_of_bounds),
+        },
+    }
 
 
 def harmonize_gazepoint_screen_coordinates(
@@ -648,25 +802,75 @@ def audit_gazepoint_exclusion_flow(data, stages: list[str] | None = None) -> pd.
     return pd.DataFrame(rows)
 
 
-def check_gazepoint_file_pairs(folder: str | Path) -> pd.DataFrame:
+def check_gazepoint_file_pairs(
+    folder,
+    all_gaze_pattern=r"_all_gaze\.csv$",
+    fixation_pattern=r"_fixations\.csv$",
+    recursive=False,
+) -> pd.DataFrame:
+    """Check paired all-gaze/fixation exports with R v2.3.0 diagnostics."""
     root = Path(folder)
-    files = [p.name for p in root.glob("*.csv")]
-    users: dict[str, dict[str, bool]] = {}
-    for name in files:
-        m = pd.Series([name]).str.extract(r"User\s*([^_]+)", expand=False).iloc[0]
-        if pd.isna(m):
-            continue
-        row = users.setdefault(str(m), {"all_gaze": False, "fixations": False})
-        if "all_gaze" in name.lower():
-            row["all_gaze"] = True
-        if "fix" in name.lower():
-            row["fixations"] = True
-    return pd.DataFrame(
-        [
-            {"user": u, **v, "paired": bool(v["all_gaze"] and v["fixations"])}
-            for u, v in sorted(users.items())
-        ]
-    )
+    if not root.is_dir():
+        raise ValueError(f"folder does not exist: {folder}")
+    import re as _re
+
+    files = list(root.rglob("*") if recursive else root.glob("*"))
+    files = [path for path in files if path.is_file()]
+    all_re = _re.compile(all_gaze_pattern)
+    fix_re = _re.compile(fixation_pattern)
+    all_files = [path for path in files if all_re.search(path.name)]
+    fix_files = [path for path in files if fix_re.search(path.name)]
+    if not all_files and not fix_files:
+        raise ValueError(
+            f"No files matching {all_gaze_pattern!r} or {fixation_pattern!r} were found in {folder}"
+        )
+
+    def ids_for(paths, pattern):
+        groups = {}
+        for path in paths:
+            participant = pattern.sub("", path.name)
+            groups.setdefault(participant, []).append(path.name)
+        return groups
+
+    all_groups = ids_for(all_files, all_re)
+    fix_groups = ids_for(fix_files, fix_re)
+    participants = sorted(set(all_groups) | set(fix_groups))
+    rows = []
+    for participant in participants:
+        all_names = sorted(set(all_groups.get(participant, [])))
+        fix_names = sorted(set(fix_groups.get(participant, [])))
+        n_all = len(all_groups.get(participant, []))
+        n_fix = len(fix_groups.get(participant, []))
+        duplicate_all = n_all > 1
+        duplicate_fix = n_fix > 1
+        if n_all == 0:
+            status = "missing_all_gaze"
+        elif n_fix == 0:
+            status = "missing_fixation"
+        elif duplicate_all or duplicate_fix:
+            status = "duplicate_files"
+        else:
+            status = "complete"
+        user_match = _re.search(r"(\d+)", participant)
+        user = user_match.group(1) if user_match else participant
+        rows.append(
+            {
+                "participant": participant,
+                "all_gaze_file": "; ".join(all_names),
+                "fixation_file": "; ".join(fix_names),
+                "n_all_gaze": n_all,
+                "n_fixation": n_fix,
+                "has_all_gaze": n_all > 0,
+                "has_fixation": n_fix > 0,
+                "duplicate_all_gaze": duplicate_all,
+                "duplicate_fixation": duplicate_fix,
+                "status": status,
+                # Legacy additive fields.
+                "user": user,
+                "paired": status == "complete",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def segment_gazepoint_task_phases(
@@ -831,10 +1035,103 @@ def segment_gazepoint_task_phases(
     return df
 
 
-def summarise_gazepoint_phase_coverage(data, phase_col="phase", group_cols=None) -> pd.DataFrame:
+def summarise_gazepoint_phase_coverage(
+    data,
+    phase_col="phase",
+    group_cols=None,
+    time_col=None,
+    value_cols=None,
+) -> pd.DataFrame:
+    """Summarise task-phase coverage with legacy counts or R v2.3.0 diagnostics."""
     df = ensure_dataframe(data, copy=False)
-    groups = normalize_group_cols(df, group_cols) + [phase_col]
-    return df.groupby(groups, dropna=False).size().rename("n_samples").reset_index()
+    r_mode = time_col is not None or value_cols is not None or phase_col == "task_phase"
+    if r_mode and phase_col == "phase" and "phase" not in df.columns and "task_phase" in df.columns:
+        phase_col = "task_phase"
+
+    if not r_mode:
+        groups = normalize_group_cols(df, group_cols) + [phase_col]
+        return df.groupby(groups, dropna=False).size().rename("n_samples").reset_index()
+
+    groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    values = (
+        []
+        if value_cols is None
+        else ([value_cols] if isinstance(value_cols, str) else list(value_cols))
+    )
+    required = [phase_col, *groups, *values] + ([time_col] if time_col is not None else [])
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+    if groups:
+        group_id = df[groups].astype("string").fillna("<NA>").agg(".".join, axis=1)
+    else:
+        group_id = pd.Series("all", index=df.index)
+    phase_value = df[phase_col].astype("string")
+    rows = []
+    keys = pd.DataFrame({"group_id": group_id, "phase": phase_value})
+    for (gid, phase), indices in keys.groupby(
+        ["group_id", "phase"], dropna=False, sort=True
+    ).groups.items():
+        block = df.loc[list(indices)]
+        row = {"group_id": gid, "phase": str(phase), "n_rows": len(block)}
+        if time_col is None:
+            row.update(
+                {
+                    "n_finite_time": np.nan,
+                    "min_time": np.nan,
+                    "max_time": np.nan,
+                    "time_span": np.nan,
+                }
+            )
+        else:
+            time_values = pd.to_numeric(block[time_col], errors="coerce")
+            finite = time_values[np.isfinite(time_values)]
+            if len(finite):
+                minimum = float(finite.min())
+                maximum = float(finite.max())
+                row.update(
+                    {
+                        "n_finite_time": int(len(finite)),
+                        "min_time": minimum,
+                        "max_time": maximum,
+                        "time_span": maximum - minimum,
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "n_finite_time": 0,
+                        "min_time": np.nan,
+                        "max_time": np.nan,
+                        "time_span": np.nan,
+                    }
+                )
+        if values:
+            complete = block[values].notna().all(axis=1)
+            row.update(
+                {
+                    "n_complete_value_rows": int(complete.sum()),
+                    "complete_value_rate": float(complete.mean()),
+                    "n_any_value_missing": int((~complete).sum()),
+                    "any_value_missing_rate": float((~complete).mean()),
+                }
+            )
+        else:
+            row.update(
+                {
+                    "n_complete_value_rows": np.nan,
+                    "complete_value_rate": np.nan,
+                    "n_any_value_missing": np.nan,
+                    "any_value_missing_rate": np.nan,
+                }
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 summarize_gazepoint_phase_coverage = summarise_gazepoint_phase_coverage
@@ -1559,16 +1856,89 @@ def recommend_gazepoint_exclusions(
     }
 
 
-def audit_gazepoint_naming_consistency(names=None) -> dict[str, Any]:
-    names = list(names or [])
-    american = [x for x in names if x.startswith("summarize_")]
-    british = [x for x in names if x.startswith("summarise_")]
+def audit_gazepoint_naming_consistency(exports=None) -> dict[str, Any]:
+    """Audit British/American summary-helper naming pairs."""
+    if exports is None:
+        from ._exports import R_EXPORTS
+
+        exports = list(R_EXPORTS)
+    values = []
+    for value in exports:
+        if value is None:
+            continue
+        text = str(value)
+        if text and text not in values:
+            values.append(text)
+
+    british = [value for value in values if value.startswith("summarise_")]
+    american = [value for value in values if value.startswith("summarize_")]
+    stems = sorted(
+        set(value.removeprefix("summarise_") for value in british)
+        | set(value.removeprefix("summarize_") for value in american)
+    )
+    rows = []
+    for stem in stems:
+        british_name = f"summarise_{stem}"
+        american_name = f"summarize_{stem}"
+        british_exported = british_name in values
+        american_exported = american_name in values
+        status = (
+            "paired"
+            if british_exported and american_exported
+            else "canonical_only"
+            if british_exported
+            else "missing_british_alias"
+        )
+        rows.append(
+            {
+                "stem": stem,
+                "british_name": british_name,
+                "american_name": american_name,
+                "british_exported": british_exported,
+                "american_exported": american_exported,
+                "canonical_name": british_name,
+                "status": status,
+            }
+        )
+    pairs = pd.DataFrame(
+        rows,
+        columns=[
+            "stem",
+            "british_name",
+            "american_name",
+            "british_exported",
+            "american_exported",
+            "canonical_name",
+            "status",
+        ],
+    )
+    summary = pd.DataFrame(
+        [
+            {
+                "status": "needs_review"
+                if len(pairs) and pairs["status"].eq("missing_british_alias").any()
+                else "pass",
+                "n_summary_stems": len(pairs),
+                "n_paired": int(pairs["status"].eq("paired").sum()) if len(pairs) else 0,
+                "n_canonical_only": int(pairs["status"].eq("canonical_only").sum())
+                if len(pairs)
+                else 0,
+                "n_missing_british_alias": int(pairs["status"].eq("missing_british_alias").sum())
+                if len(pairs)
+                else 0,
+                # Legacy Python diagnostics retained as additive fields.
+                "n_names": len(values),
+                "n_alias_pairs": int(pairs["status"].eq("paired").sum()) if len(pairs) else 0,
+                "n_issues": int(pairs["status"].eq("missing_british_alias").sum())
+                if len(pairs)
+                else 0,
+            }
+        ]
+    )
     return {
-        "summary": result_table(
-            n_names=len(names), n_british=len(british), n_american_aliases=len(american)
-        ),
-        "british": british,
-        "american_aliases": american,
+        "summary": summary,
+        "pairs": pairs,
+        "policy": gp3tools_naming_policy(),
     }
 
 

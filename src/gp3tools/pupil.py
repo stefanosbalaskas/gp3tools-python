@@ -22,52 +22,200 @@ from ._utils import (
 
 
 def mean_gazepoint_pupil(
-    data, left_col=None, right_col=None, output_col="pupil_mean", require_both=False
+    data,
+    left_col=None,
+    right_col=None,
+    output_col="pupil_mean",
+    require_both=False,
+    min_eyes=1,
 ) -> pd.DataFrame:
+    """Average binocular pupil values with explicit minimum-eye policy."""
     df = ensure_dataframe(data)
+    if min_eyes not in {1, 2}:
+        raise ValueError("min_eyes must be 1 or 2")
     left_col = infer_column(df, "left_pupil", left_col, required=True)
     right_col = infer_column(df, "right_pupil", right_col, required=True)
-    left, right = finite_numeric(df[left_col]), finite_numeric(df[right_col])
-    if require_both:
-        out = pd.concat([left, right], axis=1).mean(axis=1).where(left.notna() & right.notna())
-    else:
-        out = pd.concat([left, right], axis=1).mean(axis=1, skipna=True)
+    left = finite_numeric(df[left_col])
+    right = finite_numeric(df[right_col])
+    required_eyes = 2 if require_both else int(min_eyes)
+    available = left.notna().astype(int) + right.notna().astype(int)
+    out = pd.concat([left, right], axis=1).mean(axis=1, skipna=True)
+    out = out.where(available >= required_eyes)
     df[output_col] = out
+    df.attrs["gazepoint_mean_pupil"] = {
+        "lp_col": left_col,
+        "rp_col": right_col,
+        "output_col": output_col,
+        "min_eyes": required_eyes,
+    }
     return df
 
 
 def combine_gazepoint_eyes(
-    data, left_col=None, right_col=None, output_col="pupil_combined", policy="available_eye"
+    data,
+    left_col=None,
+    right_col=None,
+    output_col="pupil_combined",
+    policy="available_eye",
+    method=None,
+    valid_min=None,
+    valid_max=None,
 ) -> pd.DataFrame:
+    """Combine left/right eye values with legacy or R v2.3.0 policies."""
     df = ensure_dataframe(data)
     left_col = infer_column(df, "left_pupil", left_col, required=True)
     right_col = infer_column(df, "right_pupil", right_col, required=True)
-    left_values, right_values = finite_numeric(df[left_col]), finite_numeric(df[right_col])
-    if policy in {"mean", "available_eye", "bilateral_mean"}:
-        df[output_col] = pd.concat([left_values, right_values], axis=1).mean(
-            axis=1, skipna=(policy != "bilateral_mean")
-        )
-        if policy == "bilateral_mean":
-            df.loc[left_values.isna() | right_values.isna(), output_col] = np.nan
+    left = finite_numeric(df[left_col]).astype(float)
+    right = finite_numeric(df[right_col]).astype(float)
+
+    def bounded(values):
+        result = values.copy()
+        if valid_min is not None:
+            result = result.where(result >= float(valid_min))
+        if valid_max is not None:
+            result = result.where(result <= float(valid_max))
+        return result
+
+    left = bounded(left)
+    right = bounded(right)
+
+    if method is not None:
+        if method not in {"mean", "left", "right", "prefer_left", "prefer_right", "best"}:
+            raise ValueError("Unknown eye-combination method")
+        if method == "mean":
+            combined = pd.concat([left, right], axis=1).mean(axis=1, skipna=True)
+        elif method == "left":
+            combined = left
+        elif method == "right":
+            combined = right
+        elif method == "prefer_left":
+            combined = left.where(left.notna(), right)
+        elif method == "prefer_right":
+            combined = right.where(right.notna(), left)
+        else:
+            if float(left.isna().mean()) <= float(right.isna().mean()):
+                combined = left.where(left.notna(), right)
+            else:
+                combined = right.where(right.notna(), left)
+        df[output_col] = combined
+        return df
+
+    if policy in {"mean", "available_eye"}:
+        df[output_col] = pd.concat([left, right], axis=1).mean(axis=1, skipna=True)
+    elif policy == "bilateral_mean":
+        df[output_col] = pd.concat([left, right], axis=1).mean(axis=1, skipna=False)
     elif policy == "left_only":
-        df[output_col] = left_values
+        df[output_col] = left
     elif policy == "right_only":
-        df[output_col] = right_values
+        df[output_col] = right
     elif policy == "complete_case":
-        df[output_col] = ((left_values + right_values) / 2).where(
-            left_values.notna() & right_values.notna()
-        )
+        df[output_col] = ((left + right) / 2).where(left.notna() & right.notna())
     else:
         raise ValueError(f"Unknown eye-combination policy: {policy}")
     df["pupil_eye_source"] = np.select(
-        [left_values.notna() & right_values.notna(), left_values.notna(), right_values.notna()],
+        [left.notna() & right.notna(), left.notna(), right.notna()],
         ["both", "left", "right"],
         default="missing",
     )
     return df
 
 
-construct_gazepoint_combined_pupil = combine_gazepoint_eyes
+def construct_gazepoint_combined_pupil(
+    data,
+    left_col,
+    right_col,
+    policy="available_eye",
+    prefix="gp3_binocular",
+    output_col="pupil_combined",
+    status_col="pupil_binocular_status",
+    valid_min=None,
+    valid_max=None,
+    overwrite=False,
+):
+    """Construct a provenance-aware combined pupil series."""
+    if policy == "bilateral_mean":
+        policy = "complete_case"
+    if policy not in {
+        "complete_case",
+        "available_eye",
+        "reconstructed_mean",
+        "left_only",
+        "right_only",
+    }:
+        raise ValueError("Unknown binocular pupil policy")
+    frame = ensure_dataframe(data)
+    if not overwrite:
+        existing = [column for column in (output_col, status_col) if column in frame.columns]
+        if existing:
+            raise ValueError("output column(s) already exist: " + ", ".join(existing))
+
+    def observed(column):
+        values = finite_numeric(frame[column]).astype(float)
+        if valid_min is not None:
+            values = values.where(values >= float(valid_min))
+        if valid_max is not None:
+            values = values.where(values <= float(valid_max))
+        return values
+
+    if policy == "reconstructed_mean":
+        lf = f"{prefix}_left_final"
+        rf = f"{prefix}_right_final"
+        lr = f"{prefix}_left_reconstructed"
+        rr = f"{prefix}_right_reconstructed"
+        missing = [column for column in (lf, rf, lr, rr) if column not in frame.columns]
+        if missing:
+            raise ValueError("reconstruction columns missing: " + ", ".join(missing))
+        left = finite_numeric(frame[lf])
+        right = finite_numeric(frame[rf])
+        left_rec = frame[lr].fillna(False).astype(bool)
+        right_rec = frame[rr].fillna(False).astype(bool)
+    else:
+        left = observed(left_col)
+        right = observed(right_col)
+        left_rec = pd.Series(False, index=frame.index)
+        right_rec = pd.Series(False, index=frame.index)
+
+    left_ok = left.notna()
+    right_ok = right.notna()
+    value = pd.Series(np.nan, index=frame.index, dtype=float)
+    source = pd.Series("unavailable", index=frame.index, dtype=object)
+
+    if policy == "complete_case":
+        both = left_ok & right_ok
+        value.loc[both] = (left.loc[both] + right.loc[both]) / 2
+        source.loc[both] = "bilateral_observed"
+    elif policy in {"available_eye", "reconstructed_mean"}:
+        both = left_ok & right_ok
+        only_left = left_ok & ~right_ok
+        only_right = ~left_ok & right_ok
+        value.loc[both] = (left.loc[both] + right.loc[both]) / 2
+        value.loc[only_left] = left.loc[only_left]
+        value.loc[only_right] = right.loc[only_right]
+        source.loc[both] = "bilateral_observed"
+        source.loc[only_left] = "left_only_observed"
+        source.loc[only_right] = "right_only_observed"
+        if policy == "reconstructed_mean":
+            source.loc[both & (left_rec | right_rec)] = "bilateral_with_reconstruction"
+            source.loc[only_left & left_rec] = "left_reconstructed_only"
+            source.loc[only_right & right_rec] = "right_reconstructed_only"
+    elif policy == "left_only":
+        value.loc[left_ok] = left.loc[left_ok]
+        source.loc[left_ok] = "left_observed"
+    else:
+        value.loc[right_ok] = right.loc[right_ok]
+        source.loc[right_ok] = "right_observed"
+
+    frame[output_col] = value
+    frame[status_col] = source
+    frame.attrs["gp3_binocular_combination"] = {
+        "policy": policy,
+        "left_col": left_col,
+        "right_col": right_col,
+        "prefix": prefix,
+        "output_col": output_col,
+        "status_col": status_col,
+    }
+    return frame
 
 
 def flag_gazepoint_pupil(

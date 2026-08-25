@@ -685,8 +685,56 @@ def summarise_gazepoint_clusters(result) -> pd.DataFrame:
     return result["clusters"].copy() if isinstance(result, dict) else ensure_dataframe(result)
 
 
-def summarize_gazepoint_time_clusters(result) -> pd.DataFrame:
-    return summarise_gazepoint_clusters(result)
+def summarize_gazepoint_time_clusters(result, alpha=None) -> pd.DataFrame:
+    """Return legacy cluster rows or R v2.3.0 cluster summaries."""
+    if alpha is None:
+        return summarise_gazepoint_clusters(result)
+    if not isinstance(result, dict) or "clusters" not in result:
+        raise ValueError("result must contain a clusters element")
+    alpha = float(alpha)
+    if not np.isfinite(alpha) or not (0 < alpha < 1):
+        raise ValueError("alpha must be a numeric scalar between 0 and 1")
+    clusters = ensure_dataframe(result["clusters"], copy=False)
+    columns = [
+        "cluster_id",
+        "cluster_direction",
+        "start_time_bin",
+        "end_time_bin",
+        "n_time_bins",
+        "cluster_statistic",
+        "p_value",
+        "cluster_significant",
+        "cluster_summary_status",
+    ]
+    if clusters.empty:
+        return pd.DataFrame(columns=columns)
+    required = ["cluster_id", "start_time_bin", "end_time_bin", "p_value"]
+    missing = [column for column in required if column not in clusters.columns]
+    if missing:
+        raise ValueError("clusters is missing required column(s): " + ", ".join(missing))
+    start = pd.to_numeric(clusters["start_time_bin"], errors="coerce")
+    end = pd.to_numeric(clusters["end_time_bin"], errors="coerce")
+    out = pd.DataFrame(
+        {
+            "cluster_id": clusters["cluster_id"].to_numpy(),
+            "cluster_direction": clusters.get(
+                "cluster_direction", pd.Series(pd.NA, index=clusters.index)
+            )
+            .astype("string")
+            .to_numpy(),
+            "start_time_bin": start.to_numpy(),
+            "end_time_bin": end.to_numpy(),
+            "n_time_bins": (end - start + 1).astype("Int64").to_numpy(),
+            "cluster_statistic": pd.to_numeric(
+                clusters.get("cluster_statistic", pd.Series(np.nan, index=clusters.index)),
+                errors="coerce",
+            ).to_numpy(),
+            "p_value": pd.to_numeric(clusters["p_value"], errors="coerce").to_numpy(),
+        }
+    )
+    out["cluster_significant"] = out["p_value"] < alpha
+    out["cluster_summary_status"] = "ok"
+    return out[columns]
 
 
 def summarise_gazepoint_time_clusters(result) -> pd.DataFrame:
@@ -806,7 +854,46 @@ def summarise_gazepoint_multiverse_results(data) -> pd.DataFrame:
     )
 
 
-def report_gazepoint_cluster_permutation(result) -> str:
-    c = summarise_gazepoint_clusters(result)
-    sig = int(c.get("significant", pd.Series(dtype=bool)).sum()) if len(c) else 0
-    return f"Cluster-permutation analysis identified {len(c)} cluster(s), of which {sig} met the configured significance criterion."
+def report_gazepoint_cluster_permutation(result, alpha=None):
+    """Return the legacy text report or an R v2.3.0 structured report."""
+    if alpha is None:
+        c = summarise_gazepoint_clusters(result)
+        sig = int(c.get("significant", pd.Series(dtype=bool)).sum()) if len(c) else 0
+        return (
+            f"Cluster-permutation analysis identified {len(c)} cluster(s), "
+            f"of which {sig} met the configured significance criterion."
+        )
+
+    clusters = summarize_gazepoint_time_clusters(result, alpha=alpha)
+    significant = clusters.loc[clusters["cluster_significant"]]
+    settings = result.get("settings", {}) if isinstance(result, dict) else {}
+    if clusters.empty:
+        text = (
+            "The cluster-permutation workflow did not identify any supra-threshold "
+            "time clusters under the specified settings. This should be interpreted as "
+            "absence of detected cluster-level evidence in this analysis, not as evidence "
+            "for absence of any effect."
+        )
+    elif significant.empty:
+        text = (
+            "Supra-threshold time clusters were observed, but none reached the specified "
+            "cluster-level alpha threshold. Time ranges should be treated as descriptive "
+            "unless supported by the permutation-adjusted cluster result."
+        )
+    else:
+        ranges = "; ".join(
+            f"{row.start_time_bin}-{row.end_time_bin} (p = {row.p_value:.3g})"
+            for row in significant.itertuples(index=False)
+        )
+        text = (
+            f"The cluster-permutation workflow identified {len(significant)} cluster(s) "
+            f"below alpha = {alpha} over the following time-bin range(s): {ranges}. "
+            "These ranges should be reported as cluster-level time intervals, not as "
+            "precise effect-onset or effect-offset estimates."
+        )
+    return {
+        "cluster_table": clusters,
+        "settings": settings,
+        "report_text": text,
+        "report_status": "ok",
+    }

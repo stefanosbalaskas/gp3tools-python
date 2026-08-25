@@ -78,20 +78,71 @@ def simulate_gazepoint_cluster_timecourse_data(
     effect_window=(30, 50),
     effect_size: float = 0.35,
     random_state: int = 123,
+    *,
+    n_time_bins=None,
+    conditions=None,
+    effect_start=None,
+    effect_end=None,
+    subject_sd=None,
+    noise_sd=None,
+    seed=None,
 ) -> pd.DataFrame:
-    rng = np.random.default_rng(random_state)
+    """Simulate legacy timecourses or the R v2.3.0 cluster fixture."""
+    r_mode = any(
+        value is not None
+        for value in (n_time_bins, conditions, effect_start, effect_end, subject_sd, noise_sd, seed)
+    )
+    if not r_mode:
+        rng = np.random.default_rng(random_state)
+        rows = []
+        for s in range(n_subjects):
+            subj = rng.normal(0, 0.15)
+            for cond in [0, 1]:
+                for ti in range(n_time):
+                    effect = (
+                        effect_size * cond if effect_window[0] <= ti <= effect_window[1] else 0.0
+                    )
+                    rows.append(
+                        {
+                            "subject": f"S{s + 1:02d}",
+                            "condition": "B" if cond else "A",
+                            "time_bin": ti,
+                            "value": subj + effect + rng.normal(0, 0.25),
+                        }
+                    )
+        return pd.DataFrame(rows)
+
+    n_time_bins = 60 if n_time_bins is None else int(n_time_bins)
+    conditions = ["control", "treatment"] if conditions is None else list(conditions)
+    effect_start = 25 if effect_start is None else effect_start
+    effect_end = 40 if effect_end is None else effect_end
+    subject_sd = 0.3 if subject_sd is None else float(subject_sd)
+    noise_sd = 0.4 if noise_sd is None else float(noise_sd)
+    if int(n_subjects) < 2 or n_time_bins < 2:
+        raise ValueError("n_subjects and n_time_bins must be at least 2")
+    if len(conditions) != 2 or any(not str(value) for value in conditions):
+        raise ValueError("conditions must be a character vector of length two")
+
+    rng = np.random.default_rng(seed)
+    subjects = [f"S{i:03d}" for i in range(1, int(n_subjects) + 1)]
+    subject_shift = dict(zip(subjects, rng.normal(0, subject_sd, len(subjects)), strict=True))
     rows = []
-    for s in range(n_subjects):
-        subj = rng.normal(0, 0.15)
-        for cond in [0, 1]:
-            for ti in range(n_time):
-                effect = effect_size * cond if effect_window[0] <= ti <= effect_window[1] else 0.0
+    # R expand.grid varies subject fastest, then condition, then time_bin.
+    for time_bin in range(1, n_time_bins + 1):
+        for condition in conditions:
+            for subject in subjects:
+                baseline = 0.15 * np.sin(time_bin / n_time_bins * 2 * np.pi)
+                treatment = condition == conditions[1]
+                in_window = effect_start <= time_bin <= effect_end
                 rows.append(
                     {
-                        "subject": f"S{s + 1:02d}",
-                        "condition": "B" if cond else "A",
-                        "time_bin": ti,
-                        "value": subj + effect + rng.normal(0, 0.25),
+                        "subject": subject,
+                        "condition": condition,
+                        "time_bin": time_bin,
+                        "outcome": baseline
+                        + subject_shift[subject]
+                        + (effect_size if treatment and in_window else 0)
+                        + rng.normal(0, noise_sd),
                     }
                 )
     return pd.DataFrame(rows)

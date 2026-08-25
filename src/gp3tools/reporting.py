@@ -60,7 +60,8 @@ def write_gazepoint_outputs(results, output_dir, prefix="gazepoint", **kwargs):
     return written
 
 
-def export_gazepoint_master_audit(data, output_dir, prefix="master_audit", **kwargs):
+def export_gazepoint_master_audit(data, output_dir=".", prefix="master_audit", **kwargs):
+    """Export the current Python master audit; output_dir now matches R optionality."""
     from .qc import audit_gazepoint_master
 
     return export_gazepoint_tables(audit_gazepoint_master(data), output_dir, prefix=prefix)
@@ -141,15 +142,171 @@ def create_gazepoint_report(
     return p
 
 
-def report_gazepoint_missingness(data) -> str:
-    df = ensure_dataframe(data)
-    p = float(df.isna().mean().mean())
-    return f"Across {len(df)} rows and {df.shape[1]} columns, the mean cell-level missingness proportion was {p:.3f}."
+def report_gazepoint_missingness(
+    data,
+    cols=None,
+    group_cols=None,
+    digits=None,
+    max_variables=None,
+):
+    """Return legacy text or the R v2.3.0 structured missingness report."""
+    if cols is None and group_cols is None and digits is None and max_variables is None:
+        from .qc import summarise_gazepoint_missingness
+
+        summary = summarise_gazepoint_missingness(data)
+        if summary.empty:
+            return "No missingness summary available."
+        column_name = "column" if "column" in summary else "variable"
+        rate_name = "missing_prop" if "missing_prop" in summary else "missing_rate"
+        top = summary.sort_values(rate_name, ascending=False).iloc[0]
+        return f"Highest missingness: {top[column_name]} ({top[rate_name]:.1%})."
+
+    from .qc import summarise_gazepoint_missingness
+
+    digits = 1 if digits is None else int(digits)
+    max_variables = 5 if max_variables is None else int(max_variables)
+    if digits < 0 or max_variables < 1:
+        raise ValueError("digits must be non-negative and max_variables positive")
+    if isinstance(data, pd.DataFrame) and {
+        "group_id",
+        "variable",
+        "n_rows",
+        "n_missing",
+        "missing_rate",
+    }.issubset(data.columns):
+        summary = data.copy()
+    else:
+        summary = summarise_gazepoint_missingness(data, cols=cols, group_cols=group_cols)
+    variable_summary = (
+        summary.groupby("variable", dropna=False, sort=False)[["n_rows", "n_missing"]]
+        .sum()
+        .reset_index()
+    )
+    variable_summary["missing_rate"] = np.where(
+        variable_summary["n_rows"] > 0,
+        variable_summary["n_missing"] / variable_summary["n_rows"],
+        np.nan,
+    )
+    variable_summary = variable_summary.sort_values("missing_rate", ascending=False)
+    total_rows = float(variable_summary["n_rows"].sum())
+    total_missing = float(variable_summary["n_missing"].sum())
+    overall_rate = total_missing / total_rows if total_rows > 0 else np.nan
+    top = variable_summary.head(max_variables)
+    top_text = (
+        ", ".join(
+            f"{row.variable} ({round(100 * row.missing_rate, digits)}%)"
+            for row in top.itertuples(index=False)
+        )
+        or "no variables"
+    )
+    text = (
+        f"Missingness was summarized across {summary['variable'].nunique()} variable(s). "
+        f"The overall cell-level missingness rate was {round(100 * overall_rate, digits)}%. "
+        f"The highest missingness variable(s) were: {top_text}. These values are descriptive "
+        "data-coverage diagnostics and do not by themselves define exclusion decisions."
+    )
+    overall = pd.DataFrame(
+        [
+            {
+                "n_variables": int(summary["variable"].nunique()),
+                "n_groups": int(summary["group_id"].nunique()),
+                "total_cells": total_rows,
+                "total_missing": total_missing,
+                "overall_missing_rate": overall_rate,
+            }
+        ]
+    )
+    return {
+        "summary": summary,
+        "overall": overall,
+        "variable_summary": variable_summary,
+        "report_text": text,
+    }
 
 
-def report_gazepoint_phase_coverage(data) -> str:
-    df = ensure_dataframe(data)
-    return f"Phase-coverage table contains {len(df)} row(s)."
+def report_gazepoint_phase_coverage(
+    data,
+    phase_col="task_phase",
+    group_cols=None,
+    time_col=None,
+    value_cols=None,
+    digits=None,
+):
+    """Return legacy text or the R v2.3.0 structured phase-coverage report."""
+    if group_cols is None and time_col is None and value_cols is None and digits is None:
+        df = ensure_dataframe(data, copy=False)
+        if phase_col not in df:
+            return "No task-phase column available."
+        counts = df[phase_col].value_counts(dropna=False)
+        return f"Task-phase coverage: {len(counts)} phase(s) across {len(df)} row(s)."
+
+    from .qc import summarise_gazepoint_phase_coverage
+
+    digits = 1 if digits is None else int(digits)
+    if digits < 0:
+        raise ValueError("digits must be non-negative")
+    required_summary = {"group_id", "phase", "n_rows"}
+    summary = (
+        data.copy()
+        if isinstance(data, pd.DataFrame) and required_summary.issubset(data.columns)
+        else summarise_gazepoint_phase_coverage(
+            data,
+            phase_col=phase_col,
+            group_cols=group_cols,
+            time_col=time_col,
+            value_cols=value_cols,
+        )
+    )
+    phase_totals = (
+        summary.groupby("phase", dropna=False, sort=False)["n_rows"]
+        .sum()
+        .reset_index()
+        .sort_values("n_rows", ascending=False)
+    )
+    total_rows = int(phase_totals["n_rows"].sum())
+    n_phases = int(summary["phase"].nunique(dropna=False))
+    n_groups = int(summary["group_id"].nunique(dropna=False))
+    least = phase_totals.sort_values("n_rows", ascending=True).iloc[0]
+    if "complete_value_rate" in summary:
+        rates = pd.to_numeric(summary["complete_value_rate"], errors="coerce")
+        weights = pd.to_numeric(summary["n_rows"], errors="coerce")
+        valid = rates.notna() & weights.notna()
+        weighted_complete = (
+            float(np.average(rates[valid], weights=weights[valid])) if valid.any() else np.nan
+        )
+    else:
+        weighted_complete = np.nan
+    complete_text = (
+        f" The weighted complete-value rate across summarized phases was "
+        f"{round(100 * weighted_complete, digits)}%."
+        if np.isfinite(weighted_complete)
+        else ""
+    )
+    report_text = (
+        f"Task-phase coverage was summarized across {n_phases} phase(s) and {n_groups} "
+        f"group(s), representing {total_rows} row(s). The least represented phase was "
+        f"'{least['phase']}' with {int(least['n_rows'])} row(s).{complete_text} "
+        "These values are descriptive data-coverage diagnostics and do not by themselves "
+        "define exclusion decisions."
+    )
+    overall = pd.DataFrame(
+        [
+            {
+                "n_phases": n_phases,
+                "n_groups": n_groups,
+                "total_rows": total_rows,
+                "least_represented_phase": least["phase"],
+                "least_represented_phase_rows": int(least["n_rows"]),
+                "weighted_complete_value_rate": weighted_complete,
+            }
+        ]
+    )
+    return {
+        "summary": summary,
+        "overall": overall,
+        "phase_totals": phase_totals,
+        "report_text": report_text,
+    }
 
 
 def report_gazepoint_qc_overview(data) -> str:

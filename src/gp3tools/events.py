@@ -105,48 +105,140 @@ def classify_gazepoint_events_hmm(
 
 
 def compute_gazepoint_saccade_metrics(
-    data, x_col=None, y_col=None, time_col=None, event_col="event_state", group_cols=None
+    data,
+    x_col=None,
+    y_col=None,
+    time_col=None,
+    event_col="event_state",
+    group_cols=None,
+    start_time_col=None,
+    end_time_col=None,
+    distance_scale=1,
+    drop_missing=True,
 ) -> pd.DataFrame:
-    """Summarise saccade amplitude, duration, and peak velocity."""
-    df = ensure_dataframe(data)
-    x_col = x_col or infer_column(df, "x")
-    y_col = y_col or infer_column(df, "y")
-    time_col = time_col or infer_column(df, "time")
-    if event_col not in df:
-        df = classify_gazepoint_events_hmm(df, x_col=x_col, y_col=y_col, time_col=time_col)
-    groups = normalize_group_cols(df, group_cols)
-    work = df.loc[df[event_col].astype(str).str.lower().eq("saccade")].copy()
-    if work.empty:
-        return pd.DataFrame(
-            columns=[*groups, "n_samples", "duration_ms", "amplitude", "peak_velocity"]
-        )
-    work["_velocity"] = _velocity(work, x_col, y_col, time_col)
+    """Compute legacy event summaries or R v2.3.0 fixation-to-fixation saccades."""
+    r_mode = (
+        start_time_col is not None
+        or end_time_col is not None
+        or distance_scale != 1
+        or drop_missing is not True
+    )
+
+    if not r_mode:
+        df = ensure_dataframe(data)
+        x_col = x_col or infer_column(df, "x")
+        y_col = y_col or infer_column(df, "y")
+        time_col = time_col or infer_column(df, "time")
+        if event_col not in df:
+            df = classify_gazepoint_events_hmm(df, x_col=x_col, y_col=y_col, time_col=time_col)
+        groups = normalize_group_cols(df, group_cols)
+        work = df.loc[df[event_col].astype(str).str.lower().eq("saccade")].copy()
+        if work.empty:
+            return pd.DataFrame(
+                columns=[*groups, "n_samples", "duration_ms", "amplitude", "peak_velocity"]
+            )
+        work["_velocity"] = _velocity(work, x_col, y_col, time_col)
+        rows = []
+        iterator = work.groupby(groups, dropna=False, sort=False) if groups else [(None, work)]
+        for key, g in iterator:
+            t = time_to_seconds(g[time_col])
+            amp = np.sqrt(
+                (
+                    pd.to_numeric(g[x_col], errors="coerce").iloc[-1]
+                    - pd.to_numeric(g[x_col], errors="coerce").iloc[0]
+                )
+                ** 2
+                + (
+                    pd.to_numeric(g[y_col], errors="coerce").iloc[-1]
+                    - pd.to_numeric(g[y_col], errors="coerce").iloc[0]
+                )
+                ** 2
+            )
+            row = {
+                "n_samples": len(g),
+                "duration_ms": float((t.max() - t.min()) * 1000),
+                "amplitude": float(amp),
+                "peak_velocity": float(np.nanmax(g["_velocity"])),
+            }
+            if groups:
+                vals = key if isinstance(key, tuple) else (key,)
+                row.update(dict(zip(groups, vals, strict=False)))
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    frame = ensure_dataframe(data, copy=False)
+    if not isinstance(x_col, str) or not x_col or not isinstance(y_col, str) or not y_col:
+        raise ValueError("x_col and y_col must be supplied in R-compatible mode")
+    groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    needed = [x_col, y_col, *groups]
+    for value in (time_col, start_time_col, end_time_col):
+        if value is not None:
+            needed.append(value)
+    missing = [column for column in needed if column not in frame.columns]
+    if missing:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing))
+    if not np.isfinite(distance_scale) or float(distance_scale) <= 0:
+        raise ValueError("distance_scale must be a positive number")
+
+    blocks = [(None, frame)] if not groups else frame.groupby(groups, dropna=True, sort=True)
     rows = []
-    iterator = work.groupby(groups, dropna=False, sort=False) if groups else [(None, work)]
-    for key, g in iterator:
-        t = time_to_seconds(g[time_col])
-        amp = np.sqrt(
-            (
-                pd.to_numeric(g[x_col], errors="coerce").iloc[-1]
-                - pd.to_numeric(g[x_col], errors="coerce").iloc[0]
-            )
-            ** 2
-            + (
-                pd.to_numeric(g[y_col], errors="coerce").iloc[-1]
-                - pd.to_numeric(g[y_col], errors="coerce").iloc[0]
-            )
-            ** 2
-        )
-        row = {
-            "n_samples": len(g),
-            "duration_ms": float((t.max() - t.min()) * 1000),
-            "amplitude": float(amp),
-            "peak_velocity": float(np.nanmax(g["_velocity"])),
-        }
+    for key, block in blocks:
+        if time_col is not None:
+            block = block.sort_values(time_col, kind="stable", na_position="last")
+        if drop_missing:
+            block = block.loc[block[x_col].notna() & block[y_col].notna()]
+        if len(block) < 2:
+            continue
+        x = pd.to_numeric(block[x_col], errors="coerce").to_numpy(float)
+        y = pd.to_numeric(block[y_col], errors="coerce").to_numpy(float)
+        dx = np.diff(x)
+        dy = np.diff(y)
+        amp = np.sqrt(dx**2 + dy**2) * float(distance_scale)
+        angle_rad = np.arctan2(dy, dx)
+        angle_deg = np.degrees(angle_rad)
+        time_delta = np.full(len(block) - 1, np.nan)
+        time_kind = np.full(len(block) - 1, None, dtype=object)
+        if start_time_col is not None and end_time_col is not None:
+            start = pd.to_numeric(block[start_time_col], errors="coerce").to_numpy(float)
+            end = pd.to_numeric(block[end_time_col], errors="coerce").to_numpy(float)
+            time_delta = start[1:] - end[:-1]
+            time_kind[:] = "next_start_minus_current_end"
+        elif time_col is not None:
+            time_values = pd.to_numeric(block[time_col], errors="coerce").to_numpy(float)
+            time_delta = np.diff(time_values)
+            time_kind[:] = "successive_time_difference"
+        speed = np.where(np.isfinite(time_delta) & (time_delta > 0), amp / time_delta, np.nan)
+        base = {}
         if groups:
-            vals = key if isinstance(key, tuple) else (key,)
-            row.update(dict(zip(groups, vals, strict=False)))
-        rows.append(row)
+            values = key if isinstance(key, tuple) else (key,)
+            base = dict(zip(groups, values, strict=True))
+        for i in range(len(block) - 1):
+            rows.append(
+                {
+                    **base,
+                    "saccade_index": i + 1,
+                    "from_fixation_index": i + 1,
+                    "to_fixation_index": i + 2,
+                    "from_x": x[i],
+                    "from_y": y[i],
+                    "to_x": x[i + 1],
+                    "to_y": y[i + 1],
+                    "dx": dx[i],
+                    "dy": dy[i],
+                    "saccade_amplitude": amp[i],
+                    "saccade_angle_rad": angle_rad[i],
+                    "saccade_angle_deg": angle_deg[i],
+                    "time_delta": time_delta[i],
+                    "time_delta_kind": time_kind[i],
+                    "saccade_speed": speed[i],
+                    "n_fixations": len(block),
+                    "saccade_status": "ok",
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -158,9 +250,51 @@ def summarise_fixations(
     y_col=None,
     time_col=None,
     group_cols=None,
+    aoi_col=None,
 ) -> pd.DataFrame:
-    """Collapse fixation-classified samples to one row per fixation."""
+    """Summarise fixation exports or collapse fixation-classified samples."""
     df = ensure_dataframe(data)
+    r_mode = {"FPOGD", "FPOGS"}.issubset(df.columns)
+
+    if r_mode:
+        resolved_aoi = "AOI" if aoi_col is None else aoi_col
+        groups = (
+            ["MEDIA_ID"]
+            if group_cols is None
+            else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+        )
+        needed = [*groups, resolved_aoi, "FPOGD", "FPOGS"]
+        missing = [column for column in needed if column not in df.columns]
+        if missing:
+            raise ValueError("Missing columns: " + ", ".join(missing))
+        work = df.loc[df[resolved_aoi].notna() & df[resolved_aoi].astype(str).ne("")].copy()
+        work["_FPOGD"] = pd.to_numeric(work["FPOGD"], errors="coerce")
+        work["_FPOGS"] = pd.to_numeric(work["FPOGS"], errors="coerce")
+        rows = []
+        keys = [*groups, resolved_aoi]
+        for key, block in work.groupby(keys, dropna=False, sort=True):
+            values = key if isinstance(key, tuple) else (key,)
+            row = dict(zip(keys, values, strict=True))
+            row.update(
+                {
+                    "fixation_count": int(len(block)),
+                    "fixation_duration_sum_sec": float(block["_FPOGD"].sum(skipna=True)),
+                    "fixation_duration_mean_ms": float(block["_FPOGD"].mean(skipna=True) * 1000),
+                    "fixation_ttff_sec": float(block["_FPOGS"].min(skipna=True)),
+                }
+            )
+            rows.append(row)
+        return pd.DataFrame(
+            rows,
+            columns=[
+                *keys,
+                "fixation_count",
+                "fixation_duration_sum_sec",
+                "fixation_duration_mean_ms",
+                "fixation_ttff_sec",
+            ],
+        )
+
     if fixation_id_col not in df:
         df = detect_gazepoint_fixations_velocity(
             df, x_col=x_col, y_col=y_col, time_col=time_col, group_cols=group_cols
