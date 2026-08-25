@@ -197,42 +197,608 @@ def benchmark_gazepoint_export_performance(data, repeats=3, **kwargs) -> pd.Data
     return pd.DataFrame(rows)
 
 
+def _gp3_perf_summarise_trials(results) -> pd.DataFrame:
+    df = ensure_dataframe(results, copy=False)
+
+    if not len(df):
+        return pd.DataFrame()
+
+    required = {
+        "scale_id",
+        "total_rows",
+        "n_files",
+        "rows_per_file",
+        "operation",
+        "status",
+        "elapsed_s",
+        "heap_delta_mb",
+        "output_size_mb",
+    }
+
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError("trial benchmark data is missing: " + ", ".join(sorted(missing)))
+
+    group_cols = [
+        "scale_id",
+        "total_rows",
+        "n_files",
+        "rows_per_file",
+        "operation",
+    ]
+
+    rows = []
+
+    for keys, part in df.groupby(
+        group_cols,
+        dropna=False,
+        sort=False,
+    ):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        values = dict(zip(group_cols, keys, strict=True))
+        ok = part["status"].astype("string").eq("ok")
+
+        elapsed = pd.to_numeric(
+            part.loc[ok, "elapsed_s"],
+            errors="coerce",
+        )
+
+        heap = pd.to_numeric(
+            part.loc[ok, "heap_delta_mb"],
+            errors="coerce",
+        )
+
+        output = pd.to_numeric(
+            part.loc[ok, "output_size_mb"],
+            errors="coerce",
+        )
+
+        def median_or_nan(x):
+            x = x[np.isfinite(x)]
+            return float(x.median()) if len(x) else np.nan
+
+        def min_or_nan(x):
+            x = x[np.isfinite(x)]
+            return float(x.min()) if len(x) else np.nan
+
+        def max_or_nan(x):
+            x = x[np.isfinite(x)]
+            return float(x.max()) if len(x) else np.nan
+
+        rows.append(
+            {
+                **values,
+                "n_trials": int(len(part)),
+                "n_success": int(ok.sum()),
+                "median_elapsed_s": median_or_nan(elapsed),
+                "minimum_elapsed_s": min_or_nan(elapsed),
+                "maximum_elapsed_s": max_or_nan(elapsed),
+                "median_heap_delta_mb": median_or_nan(heap),
+                "maximum_heap_delta_mb": max_or_nan(heap),
+                "median_output_size_mb": median_or_nan(output),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+
+    return out.sort_values(
+        [
+            "operation",
+            "total_rows",
+            "n_files",
+        ],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def _gp3_perf_as_summary(x) -> pd.DataFrame:
+    if isinstance(x, dict):
+        if "summary" not in x:
+            raise TypeError("benchmark dictionary must contain a 'summary' table")
+
+        return ensure_dataframe(
+            x["summary"],
+            copy=False,
+        ).copy()
+
+    df = ensure_dataframe(
+        x,
+        copy=False,
+    )
+
+    if {
+        "trial",
+        "elapsed_s",
+        "status",
+    }.issubset(df.columns):
+        return _gp3_perf_summarise_trials(df)
+
+    return df.copy()
+
+
+def _gp3_perf_validate_limits(limits) -> pd.DataFrame:
+    df = ensure_dataframe(
+        limits,
+        copy=False,
+    )
+
+    required = {
+        "operation",
+        "max_seconds_per_million_rows",
+        "max_heap_delta_mb_per_million_rows",
+        "max_scaling_exponent",
+    }
+
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError("limits is missing: " + ", ".join(sorted(missing)))
+
+    return df.copy()
+
+
+def _gp3_perf_positive_scalar(value, argument: str) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{argument} must be one positive finite number") from exc
+
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"{argument} must be one positive finite number")
+
+    return value
+
+
+def _gp3_perf_scaling_exponents(summary) -> pd.DataFrame:
+    df = ensure_dataframe(
+        summary,
+        copy=False,
+    )
+
+    rows = []
+
+    for operation in pd.unique(df["operation"]):
+        part = df.loc[df["operation"].eq(operation)].copy()
+
+        elapsed = pd.to_numeric(
+            part["median_elapsed_s"],
+            errors="coerce",
+        )
+
+        total_rows = pd.to_numeric(
+            part["total_rows"],
+            errors="coerce",
+        )
+
+        valid = np.isfinite(elapsed) & (elapsed > 0) & np.isfinite(total_rows) & (total_rows > 0)
+
+        elapsed = elapsed[valid].to_numpy(float)
+        total_rows = total_rows[valid].to_numpy(float)
+
+        exponent = np.nan
+
+        if len(np.unique(total_rows)) >= 2:
+            exponent = float(
+                np.polyfit(
+                    np.log(total_rows),
+                    np.log(elapsed),
+                    1,
+                )[0]
+            )
+
+        rows.append(
+            {
+                "operation": operation,
+                "scaling_exponent": exponent,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _gp3_perf_check_rows(
+    current,
+    check: str,
+    passed,
+) -> pd.DataFrame:
+    df = ensure_dataframe(
+        current,
+        copy=False,
+    )
+
+    passed = pd.Series(
+        passed,
+        index=df.index,
+    ).fillna(False)
+
+    return pd.DataFrame(
+        {
+            "operation": df["operation"].to_numpy(),
+            "total_rows": df["total_rows"].to_numpy(),
+            "n_files": df["n_files"].to_numpy(),
+            "check": check,
+            "status": np.where(
+                passed.to_numpy(bool),
+                "pass",
+                "fail",
+            ),
+        }
+    )
+
+
 def gp3tools_performance_limits() -> pd.DataFrame:
+    """Return the R gp3tools v2.3.0 performance thresholds."""
     return pd.DataFrame(
         {
             "operation": [
-                "CSV import",
-                "sample QC",
-                "pupil preprocessing",
-                "AOI assignment",
-                "plotting",
+                "generate",
+                "import",
+                "master",
+                "sampling",
+                "quality",
             ],
-            "guidance": [
-                "stream/chunk very large files",
-                "vectorized native path",
-                "group-aware interpolation",
-                "prefer vectorized geometry",
-                "downsample for display",
+            "max_seconds_per_million_rows": [
+                90.0,
+                240.0,
+                240.0,
+                180.0,
+                180.0,
             ],
-            "note": ["No hard row limit"] * 5,
+            "max_heap_delta_mb_per_million_rows": [
+                1200.0,
+                1800.0,
+                1800.0,
+                1200.0,
+                1200.0,
+            ],
+            "max_scaling_exponent": [
+                1.6,
+                1.6,
+                1.6,
+                1.6,
+                1.6,
+            ],
         }
     )
 
 
 def check_gazepoint_performance_regression(
-    current, baseline, tolerance=0.20, metric="elapsed_seconds"
-) -> pd.DataFrame:
-    c = float(ensure_dataframe(current)[metric].mean())
-    b = float(ensure_dataframe(baseline)[metric].mean())
-    change = (c - b) / b if b else np.nan
-    return pd.DataFrame(
+    current=None,
+    baseline=None,
+    tolerance=0.20,
+    metric="elapsed_seconds",
+    *,
+    x=None,
+    limits=None,
+    elapsed_ratio_limit=1.5,
+    memory_ratio_limit=1.5,
+):
+    """Check performance regressions.
+
+    ``x`` activates the R gp3tools v2.3.0 benchmark-regression
+    interface. The historical Python ``current``/``baseline`` interface
+    remains available for backward compatibility.
+
+    A single positional R-style summary is also accepted when ``baseline``
+    is omitted and the table has the R performance-summary columns.
+    """
+    if x is not None:
+        if current is not None:
+            raise TypeError("supply either current or x, not both")
+
+        current = x
+        r_mode = True
+    else:
+        r_required = {
+            "operation",
+            "total_rows",
+            "n_files",
+            "median_elapsed_s",
+            "median_heap_delta_mb",
+            "n_success",
+            "n_trials",
+        }
+
+        r_mode = False
+
+        if current is not None:
+            try:
+                candidate = _gp3_perf_as_summary(current)
+                r_mode = r_required.issubset(candidate.columns)
+            except Exception:
+                r_mode = False
+
+    if not r_mode:
+        if current is None or baseline is None:
+            raise TypeError("current and baseline are required for the legacy Python interface")
+
+        current_df = ensure_dataframe(
+            current,
+            copy=False,
+        )
+
+        baseline_df = ensure_dataframe(
+            baseline,
+            copy=False,
+        )
+
+        if metric not in current_df:
+            raise ValueError(f"current is missing metric {metric!r}")
+
+        if metric not in baseline_df:
+            raise ValueError(f"baseline is missing metric {metric!r}")
+
+        c = float(
+            pd.to_numeric(
+                current_df[metric],
+                errors="coerce",
+            ).mean()
+        )
+
+        b = float(
+            pd.to_numeric(
+                baseline_df[metric],
+                errors="coerce",
+            ).mean()
+        )
+
+        change = (c - b) / b if b else np.nan
+
+        return pd.DataFrame(
+            {
+                "current": [c],
+                "baseline": [b],
+                "relative_change": [change],
+                "regression": [bool(np.isfinite(change) and change > tolerance)],
+            }
+        )
+
+    if current is None:
+        raise TypeError("x is required for the R-compatible interface")
+
+    if limits is None:
+        limits = gp3tools_performance_limits()
+
+    limits = _gp3_perf_validate_limits(limits)
+
+    elapsed_ratio_limit = _gp3_perf_positive_scalar(
+        elapsed_ratio_limit,
+        "elapsed_ratio_limit",
+    )
+
+    memory_ratio_limit = _gp3_perf_positive_scalar(
+        memory_ratio_limit,
+        "memory_ratio_limit",
+    )
+
+    evaluated = _gp3_perf_as_summary(current)
+
+    required = {
+        "operation",
+        "total_rows",
+        "n_files",
+        "median_elapsed_s",
+        "median_heap_delta_mb",
+        "n_success",
+        "n_trials",
+    }
+
+    missing = required - set(evaluated.columns)
+
+    if missing:
+        raise ValueError("x is missing required columns: " + ", ".join(sorted(missing)))
+
+    evaluated = evaluated.copy()
+
+    total_rows = pd.to_numeric(
+        evaluated["total_rows"],
+        errors="coerce",
+    )
+
+    elapsed = pd.to_numeric(
+        evaluated["median_elapsed_s"],
+        errors="coerce",
+    )
+
+    heap = pd.to_numeric(
+        evaluated["median_heap_delta_mb"],
+        errors="coerce",
+    )
+
+    denominator = np.maximum(
+        total_rows.to_numpy(float) / 1_000_000.0,
+        np.finfo(float).eps,
+    )
+
+    evaluated["seconds_per_million_rows"] = elapsed.to_numpy(float) / denominator
+
+    evaluated["heap_mb_per_million_rows"] = heap.to_numpy(float) / denominator
+
+    evaluated = evaluated.merge(
+        limits,
+        on="operation",
+        how="left",
+        sort=False,
+    )
+
+    scaling = _gp3_perf_scaling_exponents(evaluated)
+
+    evaluated = evaluated.merge(
+        scaling,
+        on="operation",
+        how="left",
+        sort=False,
+    )
+
+    elapsed_limit = pd.to_numeric(
+        evaluated["max_seconds_per_million_rows"],
+        errors="coerce",
+    )
+
+    memory_limit = pd.to_numeric(
+        evaluated["max_heap_delta_mb_per_million_rows"],
+        errors="coerce",
+    )
+
+    scaling_limit = pd.to_numeric(
+        evaluated["max_scaling_exponent"],
+        errors="coerce",
+    )
+
+    scaling_value = pd.to_numeric(
+        evaluated["scaling_exponent"],
+        errors="coerce",
+    )
+
+    evaluated["elapsed_limit_pass"] = elapsed_limit.isna() | (
+        evaluated["seconds_per_million_rows"] <= elapsed_limit
+    )
+
+    evaluated["memory_limit_pass"] = memory_limit.isna() | (
+        evaluated["heap_mb_per_million_rows"] <= memory_limit
+    )
+
+    evaluated["scaling_limit_pass"] = (
+        scaling_limit.isna() | scaling_value.isna() | (scaling_value <= scaling_limit)
+    )
+
+    evaluated["operation_success"] = pd.to_numeric(
+        evaluated["n_success"],
+        errors="coerce",
+    ) == pd.to_numeric(
+        evaluated["n_trials"],
+        errors="coerce",
+    )
+
+    baseline_used = baseline is not None
+
+    if baseline_used:
+        baseline_summary = _gp3_perf_as_summary(baseline)
+
+        baseline_keys = [
+            "operation",
+            "total_rows",
+            "n_files",
+        ]
+
+        baseline_required = set(
+            baseline_keys
+            + [
+                "median_elapsed_s",
+                "median_heap_delta_mb",
+            ]
+        )
+
+        baseline_missing = baseline_required - set(baseline_summary.columns)
+
+        if baseline_missing:
+            raise ValueError(
+                "baseline is missing required columns: " + ", ".join(sorted(baseline_missing))
+            )
+
+        baseline_keep = baseline_summary[
+            baseline_keys
+            + [
+                "median_elapsed_s",
+                "median_heap_delta_mb",
+            ]
+        ].rename(
+            columns={
+                "median_elapsed_s": "baseline_elapsed_s",
+                "median_heap_delta_mb": "baseline_heap_delta_mb",
+            }
+        )
+
+        evaluated = evaluated.merge(
+            baseline_keep,
+            on=baseline_keys,
+            how="left",
+            sort=False,
+        )
+
+        evaluated["elapsed_ratio"] = evaluated["median_elapsed_s"] / evaluated["baseline_elapsed_s"]
+
+        evaluated["memory_ratio"] = (
+            evaluated["median_heap_delta_mb"] / evaluated["baseline_heap_delta_mb"]
+        )
+
+        evaluated["baseline_elapsed_pass"] = evaluated["elapsed_ratio"].isna() | (
+            evaluated["elapsed_ratio"] <= elapsed_ratio_limit
+        )
+
+        evaluated["baseline_memory_pass"] = evaluated["memory_ratio"].isna() | (
+            evaluated["memory_ratio"] <= memory_ratio_limit
+        )
+
+    else:
+        evaluated["baseline_elapsed_s"] = np.nan
+        evaluated["baseline_heap_delta_mb"] = np.nan
+        evaluated["elapsed_ratio"] = np.nan
+        evaluated["memory_ratio"] = np.nan
+        evaluated["baseline_elapsed_pass"] = True
+        evaluated["baseline_memory_pass"] = True
+
+    checks = pd.concat(
+        [
+            _gp3_perf_check_rows(
+                evaluated,
+                "operation_completed",
+                evaluated["operation_success"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "elapsed_absolute_limit",
+                evaluated["elapsed_limit_pass"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "memory_absolute_limit",
+                evaluated["memory_limit_pass"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "scaling_exponent_limit",
+                evaluated["scaling_limit_pass"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "elapsed_baseline_ratio",
+                evaluated["baseline_elapsed_pass"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "memory_baseline_ratio",
+                evaluated["baseline_memory_pass"],
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    n_pass = int(checks["status"].eq("pass").sum())
+
+    n_fail = int(checks["status"].eq("fail").sum())
+
+    overall = pd.DataFrame(
         {
-            "current": [c],
-            "baseline": [b],
-            "relative_change": [change],
-            "regression": [bool(np.isfinite(change) and change > tolerance)],
+            "pass": [n_fail == 0],
+            "n_checks": [int(len(checks))],
+            "n_pass": [n_pass],
+            "n_fail": [n_fail],
         }
     )
+
+    return {
+        "overall": overall,
+        "checks": checks,
+        "evaluated": evaluated,
+        "limits": limits,
+        "baseline_used": baseline_used,
+        "elapsed_ratio_limit": elapsed_ratio_limit,
+        "memory_ratio_limit": memory_ratio_limit,
+    }
 
 
 def write_gazepoint_performance_benchmark(
