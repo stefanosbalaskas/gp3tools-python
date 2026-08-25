@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -839,15 +840,571 @@ def summarise_gazepoint_phase_coverage(data, phase_col="phase", group_cols=None)
 summarize_gazepoint_phase_coverage = summarise_gazepoint_phase_coverage
 
 
-def collect_gazepoint_qc_summaries(data) -> dict[str, Any]:
+def _gp3_qc_has_overview(obj) -> bool:
+    return (
+        isinstance(obj, dict)
+        and "overview" in obj
+        and isinstance(
+            obj["overview"],
+            pd.DataFrame,
+        )
+    )
+
+
+def _gp3_qc_normalise_objects(objects):
+    if objects is None:
+        raise ValueError("objects must contain at least one object")
+
+    if isinstance(objects, pd.DataFrame):
+        return [("", objects)]
+
+    if _gp3_qc_has_overview(objects):
+        return [("", objects)]
+
+    if isinstance(objects, dict):
+        if not objects:
+            raise ValueError("objects must contain at least one object")
+
+        return [(str(name), obj) for name, obj in objects.items()]
+
+    if isinstance(objects, (list, tuple)):
+        if not objects:
+            raise ValueError("objects must contain at least one object")
+
+        return [("", obj) for obj in objects]
+
+    return [("", objects)]
+
+
+def _gp3_qc_extract_overview(obj):
+    if isinstance(obj, pd.DataFrame):
+        return obj
+
+    if _gp3_qc_has_overview(obj):
+        return obj["overview"]
+
+    return None
+
+
+def _gp3_qc_status_columns(overview):
+    status_pattern = re.compile(
+        r"status|decision|ready|valid|passed|complete|"
+        r"review|flag|warn|fail|error",
+        re.IGNORECASE,
+    )
+
+    message_pattern = re.compile(
+        r"message|reason|recommendation|caution|note|evidence",
+        re.IGNORECASE,
+    )
+
+    candidates = [str(col) for col in overview.columns if status_pattern.search(str(col))]
+
+    return [col for col in candidates if not message_pattern.search(col)]
+
+
+def _gp3_qc_message_columns(overview):
+    pattern = re.compile(
+        r"message|reason|recommendation|caution|note|evidence",
+        re.IGNORECASE,
+    )
+
+    return [str(col) for col in overview.columns if pattern.search(str(col))]
+
+
+def _gp3_qc_worse_status(current, candidate):
+    severity = {
+        "pass": 0,
+        "info": 1,
+        "unknown": 1,
+        "warn": 2,
+        "fail": 3,
+    }
+
+    if severity[candidate] > severity[current]:
+        return candidate
+
+    return current
+
+
+def _gp3_qc_status_from_overview(
+    overview,
+    status_cols,
+):
+    if not status_cols or not len(overview):
+        return "unknown"
+
+    worst = "pass"
+
+    for col in status_cols:
+        values = overview[col]
+        col_lower = col.lower()
+
+        non_missing = values.dropna()
+
+        logical_column = pd.api.types.is_bool_dtype(values.dtype) or (
+            len(non_missing)
+            and non_missing.map(
+                lambda value: isinstance(
+                    value,
+                    (bool, np.bool_),
+                )
+            ).all()
+        )
+
+        if logical_column:
+            bool_values = non_missing.astype(bool)
+
+            if bool_values.eq(True).any() and re.search(
+                r"review|flag|warn|fail|error|exclude|problem",
+                col_lower,
+            ):
+                worst = _gp3_qc_worse_status(
+                    worst,
+                    "warn",
+                )
+
+            if bool_values.eq(False).any() and re.search(
+                r"ready|valid|passed|complete",
+                col_lower,
+            ):
+                worst = _gp3_qc_worse_status(
+                    worst,
+                    "fail",
+                )
+
+            continue
+
+        char_values = values.astype("string").dropna().str.strip().str.lower()
+
+        char_values = char_values[char_values.ne("")]
+
+        if not len(char_values):
+            continue
+
+        if char_values.str.contains(
+            r"fail|failed|error|invalid|not_ready|not ready|blocked",
+            regex=True,
+        ).any():
+            candidate = "fail"
+
+        elif char_values.str.contains(
+            r"warn|warning|review|caution|partial|"
+            r"incomplete|singular|conditional",
+            regex=True,
+        ).any():
+            candidate = "warn"
+
+        elif char_values.str.contains(
+            r"info|unknown|not_run|not run|missing",
+            regex=True,
+        ).any():
+            candidate = "info"
+
+        elif char_values.str.contains(
+            r"pass|passed|ok|ready|valid|complete|completed|"
+            r"clean|true|yes",
+            regex=True,
+        ).any():
+            candidate = "pass"
+
+        else:
+            candidate = "info"
+
+        worst = _gp3_qc_worse_status(
+            worst,
+            candidate,
+        )
+
+    return worst
+
+
+def _gp3_qc_message_from_overview(
+    overview,
+    message_cols,
+    qc_status,
+):
+    fallback = f"QC status interpreted as '{qc_status}'."
+
+    if not message_cols or not len(overview):
+        return fallback
+
+    values = []
+
+    for col in message_cols:
+        for value in overview[col]:
+            if pd.isna(value):
+                continue
+
+            text = str(value)
+
+            if text:
+                values.append(text)
+
+    if not values:
+        return fallback
+
+    unique = list(dict.fromkeys(values))
+
+    return " | ".join(unique[:3])
+
+
+def _gp3_qc_collapse(values):
+    if not values:
+        return np.nan
+
+    return ", ".join(dict.fromkeys(str(value) for value in values))
+
+
+def _gp3_qc_prepare_overview_rows(
+    overview,
+    object_name,
+    index,
+):
+    out = overview.copy()
+
+    out.insert(
+        0,
+        ".gp3_qc_row",
+        np.arange(
+            1,
+            len(out) + 1,
+            dtype=int,
+        ),
+    )
+
+    out.insert(
+        0,
+        ".gp3_qc_object_index",
+        int(index),
+    )
+
+    out.insert(
+        0,
+        ".gp3_qc_object_name",
+        object_name,
+    )
+
+    return out
+
+
+def _gp3_qc_bind_overview_rows(rows):
+    frames = [
+        frame
+        for frame in rows
+        if isinstance(
+            frame,
+            pd.DataFrame,
+        )
+        and len(frame)
+    ]
+
+    if not frames:
+        return pd.DataFrame()
+
+    columns = []
+
+    for frame in frames:
+        for col in frame.columns:
+            if col not in columns:
+                columns.append(col)
+
+    normalized = []
+
+    for frame in frames:
+        current = frame.copy()
+
+        for col in columns:
+            if col not in current.columns:
+                current[col] = np.nan
+
+        normalized.append(current[columns])
+
+    return pd.concat(
+        normalized,
+        ignore_index=True,
+    )
+
+
+def _gp3_qc_object_class(obj):
+    if isinstance(obj, pd.DataFrame):
+        return "data.frame"
+
+    if isinstance(obj, dict):
+        return "list"
+
+    return type(obj).__name__
+
+
+def _gp3_qc_collect_one(
+    obj,
+    object_name,
+    index,
+):
+    overview = _gp3_qc_extract_overview(obj)
+
+    object_class = _gp3_qc_object_class(obj)
+
+    if overview is None:
+        object_summary = pd.DataFrame(
+            {
+                "object_name": [object_name],
+                "object_index": [int(index)],
+                "object_class": [object_class],
+                "overview_available": [False],
+                "n_overview_rows": [0],
+                "status_columns": [np.nan],
+                "message_columns": [np.nan],
+                "qc_status": ["unknown"],
+                "qc_message": ["Object had no interpretable overview data frame."],
+            }
+        )
+
+        return {
+            "object_summary": object_summary,
+            "overview_rows": pd.DataFrame(),
+        }
+
+    status_cols = _gp3_qc_status_columns(overview)
+
+    message_cols = _gp3_qc_message_columns(overview)
+
+    qc_status = _gp3_qc_status_from_overview(
+        overview,
+        status_cols,
+    )
+
+    qc_message = _gp3_qc_message_from_overview(
+        overview,
+        message_cols,
+        qc_status,
+    )
+
+    object_summary = pd.DataFrame(
+        {
+            "object_name": [object_name],
+            "object_index": [int(index)],
+            "object_class": [object_class],
+            "overview_available": [True],
+            "n_overview_rows": [int(len(overview))],
+            "status_columns": [_gp3_qc_collapse(status_cols)],
+            "message_columns": [_gp3_qc_collapse(message_cols)],
+            "qc_status": [qc_status],
+            "qc_message": [qc_message],
+        }
+    )
+
     return {
-        "master": audit_gazepoint_master(data),
-        "tracking": summarise_tracking_quality(data),
-        "missingness": summarise_gazepoint_missingness(data),
-        "screen": audit_gazepoint_screen_bounds(data)
-        if infer_column(ensure_dataframe(data, copy=False), "x")
-        and infer_column(ensure_dataframe(data, copy=False), "y")
-        else None,
+        "object_summary": object_summary,
+        "overview_rows": _gp3_qc_prepare_overview_rows(
+            overview,
+            object_name,
+            index,
+        ),
+    }
+
+
+def _gp3_qc_status_counts(status):
+    values = pd.Series(status).astype("string")
+
+    levels = [
+        "pass",
+        "warn",
+        "fail",
+        "info",
+        "unknown",
+    ]
+
+    return pd.DataFrame(
+        {
+            "qc_status": levels,
+            "n_objects": [int(values.eq(level).sum()) for level in levels],
+        }
+    )
+
+
+def _gp3_qc_overall_status(status):
+    values = set(pd.Series(status).dropna().astype(str))
+
+    if "fail" in values:
+        return "fail"
+
+    if "warn" in values:
+        return "warn"
+
+    if "info" in values or "unknown" in values:
+        return "info"
+
+    return "pass"
+
+
+def collect_gazepoint_qc_summaries(
+    data=None,
+    *,
+    objects=None,
+    object_names=None,
+    name="gazepoint_qc_summary_bundle",
+    include_overview_rows=True,
+) -> dict[str, Any]:
+    """Collect Gazepoint QC summaries.
+
+    Explicit ``objects=`` activates the R gp3tools v2.3.0 QC-summary
+    bundle interface. Passing a raw DataFrame positionally retains the
+    historical Python convenience workflow.
+    """
+    if objects is None:
+        if data is None:
+            raise TypeError("data or objects must be supplied")
+
+        df = ensure_dataframe(
+            data,
+            copy=False,
+        )
+
+        return {
+            "master": audit_gazepoint_master(df),
+            "tracking": summarise_tracking_quality(df),
+            "missingness": summarise_gazepoint_missingness(df),
+            "screen": audit_gazepoint_screen_bounds(df)
+            if (infer_column(df, "x") and infer_column(df, "y"))
+            else None,
+        }
+
+    if data is not None:
+        raise TypeError("supply either data or objects, not both")
+
+    if not isinstance(name, str) or not name:
+        raise ValueError("name must be a single non-empty string")
+
+    if not isinstance(
+        include_overview_rows,
+        (bool, np.bool_),
+    ):
+        raise ValueError("include_overview_rows must be True or False")
+
+    normalized = _gp3_qc_normalise_objects(objects)
+
+    if object_names is not None:
+        if (
+            isinstance(
+                object_names,
+                str,
+            )
+            or not isinstance(
+                object_names,
+                (list, tuple),
+            )
+            or len(object_names) != len(normalized)
+        ):
+            raise ValueError("object_names must contain one name per object")
+
+        normalized = [
+            (
+                str(object_names[index]),
+                obj,
+            )
+            for index, (_, obj) in enumerate(normalized)
+        ]
+
+    named_objects = []
+
+    for index, (
+        object_name,
+        obj,
+    ) in enumerate(
+        normalized,
+        start=1,
+    ):
+        if not object_name:
+            object_name = f"object_{index}"
+
+        named_objects.append(
+            (
+                object_name,
+                obj,
+            )
+        )
+
+    object_summaries = []
+    overview_frames = []
+
+    for index, (
+        object_name,
+        obj,
+    ) in enumerate(
+        named_objects,
+        start=1,
+    ):
+        collected = _gp3_qc_collect_one(
+            obj,
+            object_name,
+            index,
+        )
+
+        object_summaries.append(collected["object_summary"])
+
+        if include_overview_rows:
+            overview_frames.append(collected["overview_rows"])
+
+    object_summary = pd.concat(
+        object_summaries,
+        ignore_index=True,
+    )
+
+    if include_overview_rows:
+        overview_rows = _gp3_qc_bind_overview_rows(overview_frames)
+    else:
+        overview_rows = pd.DataFrame()
+
+    status_counts = _gp3_qc_status_counts(object_summary["qc_status"])
+
+    overall_status = _gp3_qc_overall_status(object_summary["qc_status"])
+
+    def count_status(value):
+        return int(object_summary["qc_status"].eq(value).sum())
+
+    overview = pd.DataFrame(
+        {
+            "object_name": [name],
+            "n_objects": [int(len(object_summary))],
+            "n_overview_rows": [
+                int(
+                    pd.to_numeric(
+                        object_summary["n_overview_rows"],
+                        errors="coerce",
+                    )
+                    .fillna(0)
+                    .sum()
+                )
+            ],
+            "n_pass": [count_status("pass")],
+            "n_warn": [count_status("warn")],
+            "n_fail": [count_status("fail")],
+            "n_info": [count_status("info")],
+            "n_unknown": [count_status("unknown")],
+            "qc_bundle_status": [overall_status],
+        }
+    )
+
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "name",
+                "include_overview_rows",
+            ],
+            "value": [
+                name,
+                ("TRUE" if include_overview_rows else "FALSE"),
+            ],
+        }
+    )
+
+    return {
+        "overview": overview,
+        "object_summary": object_summary,
+        "status_counts": status_counts,
+        "overview_rows": overview_rows,
+        "settings": settings,
     }
 
 
