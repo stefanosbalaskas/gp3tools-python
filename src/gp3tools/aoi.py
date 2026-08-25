@@ -58,35 +58,538 @@ def add_gazepoint_aoi(
     return df
 
 
-def add_gazepoint_polygon_aoi(
-    data, polygons, x_col=None, y_col=None, output_col="aoi_current", outside_label="outside"
-) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    x_col = infer_column(df, "x", x_col, required=True)
-    y_col = infer_column(df, "y", y_col, required=True)
-    items = []
-    if isinstance(polygons, dict):
-        items = list(polygons.items())
-    else:
-        g = ensure_dataframe(polygons, copy=False)
-        name_col = next((c for c in ("aoi", "name", "label") if c in g), None)
-        poly_col = next((c for c in ("polygon", "vertices", "geometry") if c in g), None)
-        if not name_col or not poly_col:
-            raise ValueError("Polygon table must contain aoi/name and polygon/vertices columns")
-        items = [(row[name_col], row[poly_col]) for _, row in g.iterrows()]
-    shp = []
-    for name, vertices in items:
-        shp.append((name, vertices if isinstance(vertices, Polygon) else Polygon(vertices)))
-    labels = []
-    for xv, yv in zip(finite_numeric(df[x_col]), finite_numeric(df[y_col]), strict=False):
-        if not np.isfinite(xv) or not np.isfinite(yv):
-            labels.append(pd.NA)
+def _gp3_polygon_r_prepare(
+    vertices,
+    *,
+    aoi_col,
+    vertex_x_col,
+    vertex_y_col,
+    vertex_order_col,
+):
+    required = [
+        aoi_col,
+        vertex_x_col,
+        vertex_y_col,
+    ]
+
+    if vertex_order_col is not None:
+        required.append(vertex_order_col)
+
+    missing = [column for column in required if column not in vertices.columns]
+
+    if missing:
+        raise ValueError("vertices is missing required column(s): " + ", ".join(missing))
+
+    names = vertices[aoi_col]
+
+    if names.isna().any() or names.astype(str).eq("").any():
+        raise ValueError("Polygon AOI names must be non-missing and non-empty")
+
+    definitions = []
+
+    for name in sorted(names.astype(str).unique()):
+        block = vertices.loc[names.astype(str).eq(name)].copy()
+
+        if vertex_order_col is not None:
+            block = block.sort_values(
+                vertex_order_col,
+                kind="stable",
+                na_position="last",
+            )
+
+        x = pd.to_numeric(
+            block[vertex_x_col],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+
+        y = pd.to_numeric(
+            block[vertex_y_col],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+
+        if not np.isfinite(x).all() or not np.isfinite(y).all():
+            raise ValueError(f"Polygon `{name}` contains non-finite vertices")
+
+        points = (
+            pd.DataFrame(
+                {
+                    "x": x,
+                    "y": y,
+                }
+            )
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+
+        if len(points) < 3:
+            raise ValueError(f"Polygon `{name}` must contain at least three unique vertices")
+
+        definitions.append(
+            {
+                "name": name,
+                "x": points["x"].to_numpy(dtype=float),
+                "y": points["y"].to_numpy(dtype=float),
+            }
+        )
+
+    return definitions
+
+
+def _gp3_polygon_r_point_on_segment(
+    point_x,
+    point_y,
+    x1,
+    y1,
+    x2,
+    y2,
+    tolerance,
+):
+    cross = (point_y - y1) * (x2 - x1) - (point_x - x1) * (y2 - y1)
+
+    if abs(cross) > tolerance:
+        return False
+
+    within_x = point_x >= min(x1, x2) - tolerance and point_x <= max(x1, x2) + tolerance
+
+    within_y = point_y >= min(y1, y2) - tolerance and point_y <= max(y1, y2) + tolerance
+
+    return within_x and within_y
+
+
+def _gp3_polygon_r_points_in_polygon(
+    x,
+    y,
+    polygon_x,
+    polygon_y,
+    *,
+    boundary,
+):
+    output = np.zeros(
+        len(x),
+        dtype=bool,
+    )
+
+    valid = np.isfinite(x) & np.isfinite(y)
+
+    if not valid.any():
+        return output
+
+    scale_values = np.concatenate(
+        [
+            np.abs(x[valid]),
+            np.abs(y[valid]),
+            np.abs(polygon_x),
+            np.abs(polygon_y),
+        ]
+    )
+
+    tolerance = np.sqrt(np.finfo(float).eps) * max(
+        1.0,
+        float(np.max(scale_values)),
+    )
+
+    n_vertices = len(polygon_x)
+
+    for point_index in np.flatnonzero(valid):
+        point_x = float(x[point_index])
+
+        point_y = float(y[point_index])
+
+        on_boundary = False
+
+        for vertex_index in range(n_vertices):
+            next_index = 0 if vertex_index == n_vertices - 1 else vertex_index + 1
+
+            if _gp3_polygon_r_point_on_segment(
+                point_x,
+                point_y,
+                polygon_x[vertex_index],
+                polygon_y[vertex_index],
+                polygon_x[next_index],
+                polygon_y[next_index],
+                tolerance,
+            ):
+                on_boundary = True
+                break
+
+        if on_boundary:
+            output[point_index] = boundary == "inside"
             continue
-        p = Point(float(xv), float(yv))
-        hits = [name for name, poly in shp if poly.contains(p) or poly.touches(p)]
-        labels.append(hits[-1] if hits else outside_label)
-    df[output_col] = labels
-    return df
+
+        inside = False
+        previous = n_vertices - 1
+
+        for current in range(n_vertices):
+            yi = polygon_y[current]
+            yj = polygon_y[previous]
+            xi = polygon_x[current]
+            xj = polygon_x[previous]
+
+            crosses = (yi > point_y) != (yj > point_y)
+
+            if crosses:
+                intersection_x = ((xj - xi) * (point_y - yi) / (yj - yi)) + xi
+
+                if point_x < intersection_x:
+                    inside = not inside
+
+            previous = current
+
+        output[point_index] = inside
+
+    return output
+
+
+def _gp3_polygon_r_membership(
+    x,
+    y,
+    definitions,
+    *,
+    boundary,
+):
+    return pd.DataFrame(
+        {
+            definition["name"]: _gp3_polygon_r_points_in_polygon(
+                x,
+                y,
+                definition["x"],
+                definition["y"],
+                boundary=boundary,
+            )
+            for definition in definitions
+        }
+    )
+
+
+def _gp3_polygon_r_make_names(names):
+    import keyword
+    import re
+
+    output = []
+    counts = {}
+
+    for value in names:
+        name = re.sub(
+            r"[^A-Za-z0-9_.]",
+            ".",
+            str(value),
+        )
+
+        if (
+            not name
+            or name[0].isdigit()
+            or (name.startswith(".") and len(name) > 1 and name[1].isdigit())
+        ):
+            name = "X" + name
+
+        if keyword.iskeyword(name):
+            name += "."
+
+        base = name
+        occurrence = counts.get(
+            base,
+            0,
+        )
+
+        if occurrence:
+            name = f"{base}.{occurrence}"
+
+        counts[base] = occurrence + 1
+        output.append(name)
+
+    return output
+
+
+def add_gazepoint_polygon_aoi(
+    data=None,
+    polygons=None,
+    x_col=None,
+    y_col=None,
+    output_col="aoi_current",
+    outside_label="outside",
+    *,
+    master_df=None,
+    vertices=None,
+    aoi_col="aoi_name",
+    vertex_x_col="vertex_x",
+    vertex_y_col="vertex_y",
+    vertex_order_col=None,
+    output=None,
+    prefix="aoi_",
+    label_col=None,
+    overlap="first",
+    boundary="inside",
+    include_overlap_count=True,
+) -> pd.DataFrame:
+    """Assign polygon AOIs using legacy Python or R v2.3.0 semantics."""
+    looks_like_r_vertices = isinstance(
+        polygons,
+        pd.DataFrame,
+    ) and {
+        aoi_col,
+        vertex_x_col,
+        vertex_y_col,
+    }.issubset(polygons.columns)
+
+    r_mode = (
+        master_df is not None
+        or vertices is not None
+        or looks_like_r_vertices
+        or output is not None
+        or aoi_col != "aoi_name"
+        or vertex_x_col != "vertex_x"
+        or vertex_y_col != "vertex_y"
+        or vertex_order_col is not None
+        or prefix != "aoi_"
+        or label_col is not None
+        or overlap != "first"
+        or boundary != "inside"
+        or include_overlap_count is not True
+    )
+
+    if not r_mode:
+        df = ensure_dataframe(data)
+
+        x_col = infer_column(
+            df,
+            "x",
+            x_col,
+            required=True,
+        )
+
+        y_col = infer_column(
+            df,
+            "y",
+            y_col,
+            required=True,
+        )
+
+        if isinstance(
+            polygons,
+            dict,
+        ):
+            items = list(polygons.items())
+        else:
+            geometry = ensure_dataframe(
+                polygons,
+                copy=False,
+            )
+
+            name_col = next(
+                (
+                    column
+                    for column in (
+                        "aoi",
+                        "name",
+                        "label",
+                    )
+                    if column in geometry
+                ),
+                None,
+            )
+
+            poly_col = next(
+                (
+                    column
+                    for column in (
+                        "polygon",
+                        "vertices",
+                        "geometry",
+                    )
+                    if column in geometry
+                ),
+                None,
+            )
+
+            if not name_col or not poly_col:
+                raise ValueError("Polygon table must contain aoi/name and polygon/vertices columns")
+
+            items = [
+                (
+                    row[name_col],
+                    row[poly_col],
+                )
+                for _, row in geometry.iterrows()
+            ]
+
+        shapes = [
+            (
+                name,
+                vertices_value
+                if isinstance(
+                    vertices_value,
+                    Polygon,
+                )
+                else Polygon(vertices_value),
+            )
+            for (
+                name,
+                vertices_value,
+            ) in items
+        ]
+
+        labels = []
+
+        for xv, yv in zip(
+            finite_numeric(df[x_col]),
+            finite_numeric(df[y_col]),
+            strict=False,
+        ):
+            if not np.isfinite(xv) or not np.isfinite(yv):
+                labels.append(pd.NA)
+                continue
+
+            point = Point(
+                float(xv),
+                float(yv),
+            )
+
+            hits = [
+                name
+                for name, polygon in shapes
+                if (polygon.contains(point) or polygon.touches(point))
+            ]
+
+            labels.append(hits[-1] if hits else outside_label)
+
+        df[output_col] = labels
+        return df
+
+    if master_df is not None and data is not None:
+        raise TypeError("supply either data or master_df, not both")
+
+    if vertices is not None and polygons is not None:
+        raise TypeError("supply either polygons or vertices, not both")
+
+    frame = ensure_dataframe(
+        master_df if master_df is not None else data,
+        copy=False,
+    )
+
+    vertex_frame = ensure_dataframe(
+        vertices if vertices is not None else polygons,
+        copy=False,
+    )
+
+    x_col = "FPOGX" if x_col is None else x_col
+
+    y_col = "FPOGY" if y_col is None else y_col
+
+    output = "label" if output is None else output
+
+    label_col = output_col if label_col is None else label_col
+
+    if output not in {
+        "label",
+        "logical",
+        "both",
+    }:
+        raise ValueError("output must be 'label', 'logical', or 'both'")
+
+    if overlap not in {
+        "first",
+        "last",
+        "error",
+    }:
+        raise ValueError("overlap must be 'first', 'last', or 'error'")
+
+    if boundary not in {
+        "inside",
+        "outside",
+    }:
+        raise ValueError("boundary must be 'inside' or 'outside'")
+
+    missing = [
+        column
+        for column in (
+            x_col,
+            y_col,
+        )
+        if column not in frame.columns
+    ]
+
+    if missing:
+        raise ValueError("master_df is missing required column(s): " + ", ".join(missing))
+
+    definitions = _gp3_polygon_r_prepare(
+        vertex_frame,
+        aoi_col=aoi_col,
+        vertex_x_col=vertex_x_col,
+        vertex_y_col=vertex_y_col,
+        vertex_order_col=vertex_order_col,
+    )
+
+    x = pd.to_numeric(
+        frame[x_col],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    y = pd.to_numeric(
+        frame[y_col],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    membership = _gp3_polygon_r_membership(
+        x,
+        y,
+        definitions,
+        boundary=boundary,
+    )
+
+    overlap_count = membership.sum(axis=1).astype(int)
+
+    if overlap == "error" and (overlap_count > 1).any():
+        n_overlap = int((overlap_count > 1).sum())
+
+        raise ValueError(f"{n_overlap} sample(s) fall inside overlapping AOIs")
+
+    result = frame.copy()
+
+    if output in {
+        "logical",
+        "both",
+    }:
+        logical_names = [prefix + value for value in _gp3_polygon_r_make_names(membership.columns)]
+
+        for source_name, target_name in zip(
+            membership.columns,
+            logical_names,
+            strict=True,
+        ):
+            result[target_name] = membership[source_name].to_numpy(dtype=bool)
+
+    if output in {
+        "label",
+        "both",
+    }:
+        labels = np.full(
+            len(frame),
+            outside_label,
+            dtype=object,
+        )
+
+        valid_xy = np.isfinite(x) & np.isfinite(y)
+
+        labels[~valid_xy] = pd.NA
+
+        for name in membership.columns:
+            hit = membership[name].to_numpy(dtype=bool)
+
+            if overlap == "last":
+                labels[hit] = name
+            else:
+                assign = hit & pd.Series(labels).eq(outside_label).fillna(False).to_numpy()
+
+                labels[assign] = name
+
+        result[label_col] = labels
+
+    if include_overlap_count is True:
+        result["aoi_overlap_count"] = overlap_count.to_numpy()
+
+    result.attrs["gazepoint_polygon_aoi_definitions"] = definitions
+
+    return result
 
 
 def add_gazepoint_dynamic_aoi(
@@ -1514,22 +2017,338 @@ def compute_gazepoint_scanpath_similarity(
     return pd.DataFrame(rows)
 
 
-def compute_gazepoint_transition_network_metrics(matrix) -> pd.DataFrame:
-    if isinstance(matrix, pd.DataFrame):
-        G = nx.from_pandas_adjacency(matrix, create_using=nx.DiGraph)
+def _gp3_transition_r_scalar_string(
+    value,
+    name,
+):
+    if (
+        value is None
+        or not isinstance(
+            value,
+            str,
+        )
+        or value == ""
+    ):
+        raise ValueError(f"{name} must be a single non-empty column name")
+
+    return value
+
+
+def _gp3_transition_r_group_cols(
+    value,
+):
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        str,
+    ):
+        value = [value]
     else:
-        G = nx.from_numpy_array(np.asarray(matrix), create_using=nx.DiGraph)
+        value = list(value)
+
+    if not value or any(item is None or str(item) == "" for item in value):
+        raise ValueError("group_cols must contain one or more non-empty column names")
+
+    return [str(item) for item in value]
+
+
+def _gp3_transition_r_prepare_aoi(
+    values,
+):
+    output = []
+
+    for value in values:
+        if pd.isna(value):
+            continue
+
+        value = str(value)
+
+        if value.strip() == "":
+            continue
+
+        output.append(value)
+
+    return output
+
+
+def compute_gazepoint_transition_network_metrics(
+    matrix=None,
+    *,
+    data=None,
+    aoi_col=None,
+    from_col=None,
+    to_col=None,
+    group_cols=None,
+    time_col=None,
+    include_self_loops=True,
+):
+    """Compute legacy NetworkX or R v2.3.0 transition metrics."""
+    r_mode = (
+        data is not None
+        or aoi_col is not None
+        or from_col is not None
+        or to_col is not None
+        or group_cols is not None
+        or time_col is not None
+        or include_self_loops is not True
+    )
+
+    if not r_mode:
+        if isinstance(
+            matrix,
+            pd.DataFrame,
+        ):
+            graph = nx.from_pandas_adjacency(
+                matrix,
+                create_using=nx.DiGraph,
+            )
+        else:
+            graph = nx.from_numpy_array(
+                np.asarray(matrix),
+                create_using=nx.DiGraph,
+            )
+
+        pagerank = nx.pagerank(
+            graph,
+            weight="weight",
+        )
+
+        return pd.DataFrame(
+            [
+                {
+                    "node": node,
+                    "in_degree": graph.in_degree(
+                        node,
+                        weight="weight",
+                    ),
+                    "out_degree": graph.out_degree(
+                        node,
+                        weight="weight",
+                    ),
+                    "pagerank": pagerank.get(
+                        node,
+                        np.nan,
+                    ),
+                }
+                for node in graph.nodes
+            ]
+        )
+
+    if data is not None and matrix is not None:
+        raise TypeError("supply either matrix or data, not both")
+
+    frame = ensure_dataframe(
+        data if data is not None else matrix,
+        copy=False,
+    )
+
+    groups = _gp3_transition_r_group_cols(group_cols)
+
+    transitions = []
+
+    if from_col is not None and to_col is not None:
+        from_col = _gp3_transition_r_scalar_string(
+            from_col,
+            "from_col",
+        )
+
+        to_col = _gp3_transition_r_scalar_string(
+            to_col,
+            "to_col",
+        )
+
+        missing = [
+            column
+            for column in (
+                from_col,
+                to_col,
+            )
+            if column not in frame.columns
+        ]
+
+        if missing:
+            raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+        for from_value, to_value in zip(
+            frame[from_col],
+            frame[to_col],
+            strict=False,
+        ):
+            if pd.isna(from_value) or pd.isna(to_value):
+                continue
+
+            transitions.append(
+                (
+                    str(from_value),
+                    str(to_value),
+                )
+            )
+
+    else:
+        aoi_col = _gp3_transition_r_scalar_string(
+            aoi_col,
+            "aoi_col",
+        )
+
+        if time_col is not None:
+            time_col = _gp3_transition_r_scalar_string(
+                time_col,
+                "time_col",
+            )
+
+        required = [
+            aoi_col,
+        ]
+
+        if groups:
+            required.extend(groups)
+
+        if time_col is not None:
+            required.append(time_col)
+
+        missing = [column for column in required if column not in frame.columns]
+
+        if missing:
+            raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+        if groups:
+            blocks = [
+                block
+                for _, block in frame.groupby(
+                    groups,
+                    sort=True,
+                    dropna=True,
+                )
+            ]
+        else:
+            blocks = [frame]
+
+        for block in blocks:
+            if time_col is not None:
+                block = block.sort_values(
+                    time_col,
+                    kind="stable",
+                    na_position="last",
+                )
+
+            states = _gp3_transition_r_prepare_aoi(block[aoi_col])
+
+            transitions.extend(
+                zip(
+                    states[:-1],
+                    states[1:],
+                    strict=False,
+                )
+            )
+
+    if include_self_loops is not True:
+        transitions = [transition for transition in transitions if transition[0] != transition[1]]
+
+    if not transitions:
+        return {
+            "graph_summary": pd.DataFrame(
+                [
+                    {
+                        "n_states": 0,
+                        "n_edges": 0,
+                        "density": np.nan,
+                        "self_loops": 0,
+                        "total_transitions": 0,
+                    }
+                ]
+            ),
+            "state_summary": pd.DataFrame(),
+            "network_status": "empty",
+        }
+
+    transition_frame = pd.DataFrame(
+        transitions,
+        columns=[
+            "from_state",
+            "to_state",
+        ],
+    )
+
+    edge_summary = (
+        transition_frame.value_counts(
+            [
+                "from_state",
+                "to_state",
+            ],
+            sort=False,
+        )
+        .rename("count")
+        .reset_index()
+        .sort_values(
+            [
+                "from_state",
+                "to_state",
+            ],
+            kind="stable",
+        )
+        .reset_index(drop=True)
+    )
+
+    states = sorted(set(edge_summary["from_state"]) | set(edge_summary["to_state"]))
+
+    n_states = len(states)
+    n_edges = len(edge_summary)
+
+    possible_edges = n_states**2 if include_self_loops is True else n_states * (n_states - 1)
+
     rows = []
-    for node in G.nodes:
+
+    for state in states:
+        outgoing = edge_summary["from_state"].eq(state)
+
+        incoming = edge_summary["to_state"].eq(state)
+
         rows.append(
             {
-                "node": node,
-                "in_degree": G.in_degree(node, weight="weight"),
-                "out_degree": G.out_degree(node, weight="weight"),
-                "pagerank": nx.pagerank(G, weight="weight").get(node, np.nan),
+                "state": state,
+                "out_degree": int(outgoing.sum()),
+                "in_degree": int(incoming.sum()),
+                "weighted_out_degree": int(
+                    edge_summary.loc[
+                        outgoing,
+                        "count",
+                    ].sum()
+                ),
+                "weighted_in_degree": int(
+                    edge_summary.loc[
+                        incoming,
+                        "count",
+                    ].sum()
+                ),
             }
         )
-    return pd.DataFrame(rows)
+
+    state_summary = pd.DataFrame(rows)
+
+    graph_summary = pd.DataFrame(
+        [
+            {
+                "n_states": n_states,
+                "n_edges": n_edges,
+                "density": (n_edges / possible_edges if possible_edges else np.nan),
+                "self_loops": int(edge_summary["from_state"].eq(edge_summary["to_state"]).sum()),
+                "total_transitions": int(edge_summary["count"].sum()),
+                "mean_out_degree": float(state_summary["out_degree"].mean()),
+                "max_out_degree": int(state_summary["out_degree"].max()),
+                "mean_in_degree": float(state_summary["in_degree"].mean()),
+                "max_in_degree": int(state_summary["in_degree"].max()),
+            }
+        ]
+    )
+
+    return {
+        "graph_summary": graph_summary,
+        "state_summary": state_summary,
+        "edge_summary": edge_summary,
+        "network_status": "ok",
+    }
 
 
 def summarise_gazepoint_markovchain(data=None, sequence=None, **kwargs) -> dict[str, Any]:
