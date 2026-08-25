@@ -24,38 +24,130 @@ from .io import standardise_gazepoint_names
 
 
 def add_gazepoint_aoi(
-    data,
+    data=None,
     x_col=None,
     y_col=None,
     aoi_geometry=None,
     output_col="aoi_current",
     outside_label="outside",
+    *,
+    aoi_name=None,
+    output=None,
+    prefix="aoi_",
+    overlap=None,
+    include_overlap_count=None,
 ) -> pd.DataFrame:
-    """Assign rectangular AOIs from a geometry table.
-
-    ``aoi_geometry`` should contain name/aoi plus xmin, xmax, ymin, ymax columns.
-    """
+    """Assign rectangular AOIs with legacy and R v2.3.0-compatible semantics."""
     df = ensure_dataframe(data)
+    geom = ensure_dataframe(aoi_geometry, copy=False)
+    if geom.empty:
+        raise ValueError("aoi_geometry/aoi_defs must contain at least one AOI")
     x_col = infer_column(df, "x", x_col, required=True)
     y_col = infer_column(df, "y", y_col, required=True)
-    geom = (
-        ensure_dataframe(aoi_geometry, copy=False) if aoi_geometry is not None else pd.DataFrame()
+
+    aliases = {
+        "name": ("name", "aoi_name", "AOI", "aoi", "label"),
+        "left": ("L", "left", "xmin", "x_min"),
+        "right": ("R", "right", "xmax", "x_max"),
+        "top": ("T", "top", "ymin", "y_min"),
+        "bottom": ("B", "bottom", "ymax", "y_max"),
+    }
+    resolved = {
+        role: next((candidate for candidate in candidates if candidate in geom.columns), None)
+        for role, candidates in aliases.items()
+    }
+    missing = [role for role, column in resolved.items() if column is None]
+    if missing:
+        raise ValueError("Could not resolve AOI definition fields: " + ", ".join(missing))
+
+    defs = pd.DataFrame(
+        {
+            "name": geom[resolved["name"]].astype("string"),
+            "left": pd.to_numeric(geom[resolved["left"]], errors="coerce"),
+            "right": pd.to_numeric(geom[resolved["right"]], errors="coerce"),
+            "top": pd.to_numeric(geom[resolved["top"]], errors="coerce"),
+            "bottom": pd.to_numeric(geom[resolved["bottom"]], errors="coerce"),
+        }
     )
-    name_col = next((c for c in ("aoi", "name", "AOI", "label") if c in geom), None)
-    required = {"xmin", "xmax", "ymin", "ymax"}
-    if name_col is None or not required.issubset(geom.columns):
-        raise ValueError("aoi_geometry must contain name/aoi and xmin,xmax,ymin,ymax columns")
-    x = finite_numeric(df[x_col])
-    y = finite_numeric(df[y_col])
-    labels = pd.Series(outside_label, index=df.index, dtype="object")
-    for _, row in geom.iterrows():
-        mask = x.between(float(row.xmin), float(row.xmax)) & y.between(
-            float(row.ymin), float(row.ymax)
+    if aoi_name is not None:
+        wanted = (
+            {str(aoi_name)} if isinstance(aoi_name, str) else {str(value) for value in aoi_name}
         )
-        labels.loc[mask] = row[name_col]
-    labels.loc[x.isna() | y.isna()] = pd.NA
-    df[output_col] = labels
-    return df
+        defs = defs.loc[defs["name"].astype(str).isin(wanted)].copy()
+        if defs.empty:
+            raise ValueError("aoi_name did not match any AOI definition")
+    if defs["name"].duplicated().any():
+        raise ValueError("AOI names must be unique")
+    if not np.isfinite(defs[["left", "right", "top", "bottom"]].to_numpy(float)).all():
+        raise ValueError("AOI boundaries must be finite numeric values")
+
+    left = np.minimum(defs["left"].to_numpy(float), defs["right"].to_numpy(float))
+    right = np.maximum(defs["left"].to_numpy(float), defs["right"].to_numpy(float))
+    top = np.minimum(defs["top"].to_numpy(float), defs["bottom"].to_numpy(float))
+    bottom = np.maximum(defs["top"].to_numpy(float), defs["bottom"].to_numpy(float))
+    x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(float)
+    y = pd.to_numeric(df[y_col], errors="coerce").to_numpy(float)
+    valid = np.isfinite(x) & np.isfinite(y)
+    membership = np.column_stack(
+        [
+            valid & (x >= left[i]) & (x <= right[i]) & (y >= top[i]) & (y <= bottom[i])
+            for i in range(len(defs))
+        ]
+    )
+    names = defs["name"].astype(str).tolist()
+    overlap_count = membership.sum(axis=1)
+
+    r_mode = any(
+        (
+            aoi_name is not None,
+            output is not None,
+            prefix != "aoi_",
+            overlap is not None,
+            include_overlap_count is not None,
+        )
+    )
+    if r_mode:
+        output = "logical" if output is None else str(output)
+        overlap = "first" if overlap is None else str(overlap)
+        include_overlap_count = (
+            True if include_overlap_count is None else bool(include_overlap_count)
+        )
+    else:
+        output = "label"
+        overlap = "last"
+        include_overlap_count = False
+
+    if output not in {"logical", "label", "both"}:
+        raise ValueError("output must be one of: logical, label, both")
+    if overlap not in {"first", "last", "error"}:
+        raise ValueError("overlap must be one of: first, last, error")
+    if overlap == "error" and np.any(overlap_count > 1):
+        raise ValueError(f"{int(np.sum(overlap_count > 1))} sample(s) fall inside overlapping AOIs")
+
+    out = df.copy()
+    if output in {"logical", "both"}:
+        logical_names = [prefix + value for value in _gp3_polygon_r_make_names(names)]
+        for index, column in enumerate(logical_names):
+            out[column] = membership[:, index]
+    if output in {"label", "both"}:
+        labels = np.full(len(out), outside_label, dtype=object)
+        labels[~valid] = pd.NA
+        if overlap == "last":
+            for index, name in enumerate(names):
+                labels[membership[:, index]] = name
+        else:
+            unassigned = valid.copy()
+            for index, name in enumerate(names):
+                hit = membership[:, index] & unassigned
+                labels[hit] = name
+                unassigned[hit] = False
+        out[output_col] = labels
+    if include_overlap_count:
+        out["aoi_overlap_count"] = overlap_count.astype(int)
+
+    out.attrs.update(df.attrs)
+    out.attrs["gazepoint_aoi_definitions"] = defs.reset_index(drop=True)
+    return out
 
 
 def _gp3_polygon_r_prepare(
@@ -810,19 +902,182 @@ def audit_gazepoint_aoi_screen_coverage(
     }
 
 
-def audit_gazepoint_dynamic_aoi_coverage(data, aoi_col="aoi_current") -> pd.DataFrame:
+def audit_gazepoint_dynamic_aoi_coverage(
+    data,
+    aoi_col="aoi_current",
+    *,
+    label_col=None,
+    definition_time_col=None,
+    time_gap_col=None,
+    group_cols=None,
+    outside_label="outside",
+    max_time_gap=None,
+    x_col=None,
+    y_col=None,
+):
+    """Audit dynamic-AOI coverage while preserving the historical summary mode."""
+    r_mode = (
+        any(
+            value is not None
+            for value in (
+                label_col,
+                definition_time_col,
+                time_gap_col,
+                group_cols,
+                max_time_gap,
+                x_col,
+                y_col,
+            )
+        )
+        or outside_label != "outside"
+    )
     df = ensure_dataframe(data, copy=False)
-    s = df[aoi_col] if aoi_col in df else pd.Series(pd.NA, index=df.index)
-    return pd.DataFrame(
+    if not r_mode:
+        values = df[aoi_col] if aoi_col in df else pd.Series(pd.NA, index=df.index)
+        return pd.DataFrame(
+            [
+                {
+                    "n_samples": len(df),
+                    "n_assigned": int(values.notna().sum()),
+                    "assigned_prop": float(values.notna().mean()),
+                    "n_outside": int(values.astype("string").eq("outside").sum()),
+                }
+            ]
+        )
+
+    label_col = "aoi_current" if label_col is None else label_col
+    definition_time_col = (
+        "aoi_definition_time" if definition_time_col is None else definition_time_col
+    )
+    time_gap_col = "aoi_time_gap" if time_gap_col is None else time_gap_col
+    max_time_gap = np.inf if max_time_gap is None else float(max_time_gap)
+    groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    required = [label_col, definition_time_col, time_gap_col, *groups]
+    required.extend(column for column in (x_col, y_col) if column is not None)
+    missing = [column for column in dict.fromkeys(required) if column not in df.columns]
+    if missing:
+        raise ValueError("Missing columns: " + ", ".join(missing))
+    if max_time_gap < 0 or not (np.isfinite(max_time_gap) or np.isinf(max_time_gap)):
+        raise ValueError("max_time_gap must be one non-negative number or Inf")
+
+    label = df[label_col].astype("string")
+    definition_time = pd.to_numeric(df[definition_time_col], errors="coerce").to_numpy(float)
+    time_gap = pd.to_numeric(df[time_gap_col], errors="coerce").to_numpy(float)
+    has_definition = np.isfinite(definition_time)
+    inside = has_definition & label.notna().to_numpy() & label.ne(outside_label).to_numpy()
+    outside = has_definition & label.notna().to_numpy() & label.eq(outside_label).to_numpy()
+    missing_gaze = np.zeros(len(df), dtype=bool)
+    if x_col is not None and y_col is not None:
+        x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(float)
+        y = pd.to_numeric(df[y_col], errors="coerce").to_numpy(float)
+        missing_gaze = ~np.isfinite(x) | ~np.isfinite(y)
+    excessive_gap = has_definition & np.isfinite(time_gap) & (time_gap > max_time_gap)
+    issue = np.where(
+        missing_gaze,
+        "missing_gaze",
+        np.where(
+            ~has_definition,
+            "no_dynamic_definition",
+            np.where(
+                excessive_gap,
+                "definition_gap_exceeds_threshold",
+                np.where(outside, "outside_all_aoi", "ok"),
+            ),
+        ),
+    )
+
+    def percent(value, total):
+        return 100 * value / total if total else np.nan
+
+    finite_gap = time_gap[np.isfinite(time_gap)]
+    overview = pd.DataFrame(
         [
             {
-                "n_samples": len(df),
-                "n_assigned": int(s.notna().sum()),
-                "assigned_prop": float(s.notna().mean()),
-                "n_outside": int(s.astype("string").eq("outside").sum()),
+                "n_rows": len(df),
+                "n_with_definition": int(has_definition.sum()),
+                "pct_with_definition": percent(has_definition.sum(), len(df)),
+                "n_inside_aoi": int(inside.sum()),
+                "pct_inside_aoi": percent(inside.sum(), len(df)),
+                "n_outside_aoi": int(outside.sum()),
+                "pct_outside_aoi": percent(outside.sum(), len(df)),
+                "n_missing_gaze": int(missing_gaze.sum()),
+                "n_excessive_gap": int(excessive_gap.sum()),
+                "mean_time_gap": float(np.mean(finite_gap)) if len(finite_gap) else np.nan,
+                "max_time_gap_observed": float(np.max(finite_gap)) if len(finite_gap) else np.nan,
+                "audit_status": "ok" if np.all(issue == "ok") else "review",
             }
         ]
     )
+    group_summary = pd.DataFrame()
+    if groups:
+        temp = df.assign(
+            _has_definition=has_definition,
+            _inside=inside,
+            _outside=outside,
+            _missing_gaze=missing_gaze,
+            _excessive_gap=excessive_gap,
+            _time_gap=time_gap,
+        )
+        rows = []
+        for key, block in temp.groupby(groups, sort=True, dropna=False):
+            key = key if isinstance(key, tuple) else (key,)
+            finite = pd.to_numeric(block["_time_gap"], errors="coerce")
+            finite = finite[np.isfinite(finite)]
+            row = {column: value for column, value in zip(groups, key, strict=True)}
+            row.update(
+                {
+                    "n_rows": len(block),
+                    "n_with_definition": int(block["_has_definition"].sum()),
+                    "pct_with_definition": percent(block["_has_definition"].sum(), len(block)),
+                    "n_inside_aoi": int(block["_inside"].sum()),
+                    "pct_inside_aoi": percent(block["_inside"].sum(), len(block)),
+                    "n_outside_aoi": int(block["_outside"].sum()),
+                    "pct_outside_aoi": percent(block["_outside"].sum(), len(block)),
+                    "n_missing_gaze": int(block["_missing_gaze"].sum()),
+                    "n_excessive_gap": int(block["_excessive_gap"].sum()),
+                    "mean_time_gap": float(finite.mean()) if len(finite) else np.nan,
+                    "max_time_gap_observed": float(finite.max()) if len(finite) else np.nan,
+                }
+            )
+            rows.append(row)
+        group_summary = pd.DataFrame(rows)
+
+    levels = sorted({str(value) for value in label.dropna() if str(value) != outside_label})
+    aoi_summary = pd.DataFrame(
+        [
+            {
+                "aoi": value,
+                "n_samples": int(label.eq(value).sum()),
+                "pct_all_samples": percent(label.eq(value).sum(), len(df)),
+                "pct_defined_samples": percent(label.eq(value).sum(), has_definition.sum()),
+            }
+            for value in levels
+        ],
+        columns=["aoi", "n_samples", "pct_all_samples", "pct_defined_samples"],
+    )
+    flagged = df.loc[issue != "ok"].copy()
+    flagged["dynamic_aoi_issue"] = issue[issue != "ok"]
+    return {
+        "overview": overview,
+        "group_summary": group_summary,
+        "aoi_summary": aoi_summary,
+        "flagged_rows": flagged,
+        "settings": {
+            "label_col": label_col,
+            "definition_time_col": definition_time_col,
+            "time_gap_col": time_gap_col,
+            "group_cols": groups,
+            "outside_label": outside_label,
+            "max_time_gap": max_time_gap,
+            "x_col": x_col,
+            "y_col": y_col,
+        },
+        "_gp3_class": "gp3_dynamic_aoi_coverage_audit",
+    }
 
 
 def _gp3_aoi_coding_r_aliases(data):

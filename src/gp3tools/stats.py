@@ -1007,8 +1007,268 @@ def estimate_gazepoint_cluster_offset(result, **kwargs):
     )
 
 
-def summarise_gazepoint_clusters(result) -> pd.DataFrame:
-    return result["clusters"].copy() if isinstance(result, dict) else ensure_dataframe(result)
+def summarise_gazepoint_clusters(
+    result,
+    alpha=None,
+    round_digits=None,
+    include_timecourse=None,
+):
+    """Summarise cluster-permutation output with a legacy DataFrame shortcut."""
+    r_mode = alpha is not None or round_digits is not None or include_timecourse is not None
+    if not r_mode:
+        return result["clusters"].copy() if isinstance(result, dict) else ensure_dataframe(result)
+
+    if not isinstance(result, dict):
+        raise ValueError("result must be a cluster-permutation result object")
+    required = {"timecourse", "clusters", "permutation_distribution", "settings", "model_status"}
+    missing = [name for name in required if name not in result]
+    if missing:
+        raise ValueError("result is missing required element(s): " + ", ".join(sorted(missing)))
+    alpha = 0.05 if alpha is None else float(alpha)
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be a numeric scalar between 0 and 1")
+    if round_digits is not None:
+        if (
+            isinstance(round_digits, (bool, np.bool_))
+            or not isinstance(round_digits, (int, float, np.integer, np.floating))
+            or not np.isfinite(round_digits)
+            or round_digits < 0
+        ):
+            raise ValueError("round_digits must be NULL or a non-negative numeric scalar")
+        round_digits = int(round_digits)
+    include_timecourse = True if include_timecourse is None else include_timecourse
+    if not isinstance(include_timecourse, (bool, np.bool_)):
+        raise ValueError("include_timecourse must be TRUE or FALSE")
+
+    timecourse = ensure_dataframe(result["timecourse"])
+    clusters = ensure_dataframe(result["clusters"])
+    permutation = ensure_dataframe(result["permutation_distribution"])
+
+    required_time = {
+        ".gp3_cluster_time_bin",
+        "n_subjects",
+        "mean_difference",
+        "statistic",
+        "cluster_id",
+        "point_candidate",
+    }
+    missing_time = required_time.difference(timecourse.columns)
+    if missing_time:
+        raise ValueError(
+            "result$timecourse is missing required column(s): " + ", ".join(sorted(missing_time))
+        )
+    required_perm = {"permutation", "max_cluster_statistic"}
+    missing_perm = required_perm.difference(permutation.columns)
+    if missing_perm:
+        raise ValueError(
+            "result$permutation_distribution is missing required column(s): "
+            + ", ".join(sorted(missing_perm))
+        )
+    required_cluster = {
+        "cluster_id",
+        "cluster_direction",
+        "start_time_bin",
+        "end_time_bin",
+        "n_time_bins",
+        "cluster_statistic",
+        "max_abs_statistic",
+        "mean_difference",
+        "p_value",
+    }
+    if len(clusters):
+        missing_cluster = required_cluster.difference(clusters.columns)
+        if missing_cluster:
+            raise ValueError(
+                "result$clusters is missing required column(s): "
+                + ", ".join(sorted(missing_cluster))
+            )
+
+    time_bins = np.sort(
+        pd.to_numeric(timecourse[".gp3_cluster_time_bin"], errors="coerce").dropna().unique()
+    )
+    bin_step = float(np.median(np.diff(time_bins))) if len(time_bins) >= 2 else np.nan
+
+    if len(clusters):
+        clusters = clusters.copy()
+        clusters["cluster_label"] = "Cluster " + clusters["cluster_id"].astype(str)
+        duration = pd.to_numeric(clusters["end_time_bin"], errors="coerce") - pd.to_numeric(
+            clusters["start_time_bin"], errors="coerce"
+        )
+        if np.isfinite(bin_step):
+            duration = duration + bin_step
+        clusters["cluster_duration_ms"] = duration
+        clusters["significant_alpha"] = pd.to_numeric(clusters["p_value"], errors="coerce") < alpha
+        clusters["report_status"] = np.where(
+            clusters["significant_alpha"], "significant", "not_significant"
+        )
+        preferred = [
+            "cluster_id",
+            "cluster_label",
+            "cluster_direction",
+            "start_time_bin",
+            "end_time_bin",
+            "cluster_duration_ms",
+            "n_time_bins",
+            "cluster_statistic",
+            "max_abs_statistic",
+            "mean_difference",
+            "p_value",
+            "significant_alpha",
+            "report_status",
+        ]
+        clusters = clusters[
+            preferred + [column for column in clusters.columns if column not in preferred]
+        ]
+    else:
+        clusters = pd.DataFrame(
+            columns=[
+                "cluster_id",
+                "cluster_label",
+                "cluster_direction",
+                "start_time_bin",
+                "end_time_bin",
+                "cluster_duration_ms",
+                "n_time_bins",
+                "cluster_statistic",
+                "max_abs_statistic",
+                "mean_difference",
+                "p_value",
+                "significant_alpha",
+                "report_status",
+            ]
+        )
+
+    significant = clusters.loc[clusters["significant_alpha"].fillna(False)].copy()
+    settings = result["settings"] if isinstance(result["settings"], dict) else {}
+    n_observed = len(clusters)
+    n_significant = len(significant)
+    report_status = (
+        "no_observed_clusters"
+        if n_observed == 0
+        else "significant_cluster_evidence"
+        if n_significant
+        else "observed_clusters_not_significant"
+    )
+
+    overview = pd.DataFrame(
+        [
+            {
+                "model_status": str(result["model_status"]),
+                "report_status": report_status,
+                "alpha": alpha,
+                "n_subjects": int(
+                    result.get(
+                        "n_subjects",
+                        timecourse["n_subjects"].nunique(dropna=True),
+                    )
+                ),
+                "n_time_bins": int(
+                    result.get(
+                        "n_time_bins",
+                        timecourse[".gp3_cluster_time_bin"].nunique(dropna=True),
+                    )
+                ),
+                "bin_step_ms": bin_step,
+                "n_permutations": settings.get("n_permutations", np.nan),
+                "condition_1": settings.get("condition_1", pd.NA),
+                "condition_2": settings.get("condition_2", pd.NA),
+                "difference": settings.get("difference", pd.NA),
+                "cluster_threshold": settings.get("cluster_threshold", np.nan),
+                "tail": settings.get("tail", pd.NA),
+                "cluster_stat": settings.get("cluster_stat", pd.NA),
+                "min_time_bins": settings.get("min_time_bins", np.nan),
+                "n_observed_clusters": n_observed,
+                "n_significant_clusters": n_significant,
+            }
+        ]
+    )
+
+    tc_stat = pd.to_numeric(timecourse["statistic"], errors="coerce")
+    tc_diff = pd.to_numeric(timecourse["mean_difference"], errors="coerce")
+    tc_n = pd.to_numeric(timecourse["n_subjects"], errors="coerce")
+    timecourse_summary = pd.DataFrame(
+        [
+            {
+                "n_time_bins": len(timecourse),
+                "start_time_bin": pd.to_numeric(
+                    timecourse[".gp3_cluster_time_bin"], errors="coerce"
+                ).min(),
+                "end_time_bin": pd.to_numeric(
+                    timecourse[".gp3_cluster_time_bin"], errors="coerce"
+                ).max(),
+                "min_n_subjects": tc_n.min(),
+                "max_n_subjects": tc_n.max(),
+                "mean_difference_min": tc_diff.min(),
+                "mean_difference_max": tc_diff.max(),
+                "mean_difference_mean": tc_diff.mean(),
+                "max_abs_statistic": tc_stat.abs().max(),
+                "n_candidate_time_bins": int(
+                    timecourse["point_candidate"].fillna(False).astype(bool).sum()
+                ),
+                "n_clustered_time_bins": int(timecourse["cluster_id"].notna().sum()),
+            }
+        ]
+    )
+
+    dist = pd.to_numeric(permutation["max_cluster_statistic"], errors="coerce")
+    permutation_summary = pd.DataFrame(
+        [
+            {
+                "n_permutations": len(permutation),
+                "min_max_cluster_statistic": dist.min(),
+                "median_max_cluster_statistic": dist.median(),
+                "mean_max_cluster_statistic": dist.mean(),
+                "p95_max_cluster_statistic": dist.quantile(0.95),
+                "max_max_cluster_statistic": dist.max(),
+            }
+        ]
+    )
+    settings_table = pd.DataFrame(
+        [
+            {
+                "parameter": key,
+                "value": (
+                    ", ".join(map(str, value)) if isinstance(value, (list, tuple)) else str(value)
+                ),
+            }
+            for key, value in settings.items()
+        ],
+        columns=["parameter", "value"],
+    )
+    warning = pd.DataFrame(
+        [
+            {
+                "warning": result.get(
+                    "warning",
+                    "Cluster-based permutation tests are for time-course inference; "
+                    "do not use them to select a confirmatory window and then retest that same window.",
+                )
+            }
+        ]
+    )
+
+    def round_frame(frame):
+        if round_digits is None:
+            return frame
+        frame = frame.copy()
+        for column in frame.select_dtypes(include=np.number).columns:
+            frame[column] = frame[column].round(round_digits)
+        return frame
+
+    out = {
+        "overview": round_frame(overview),
+        "clusters": round_frame(clusters),
+        "significant_clusters": round_frame(significant),
+        "timecourse_summary": round_frame(timecourse_summary),
+        "permutation_summary": round_frame(permutation_summary),
+        "settings": settings_table,
+        "warning": warning,
+        "model_status": str(result["model_status"]),
+        "_gp3_class": "gp3_cluster_summary",
+    }
+    if include_timecourse:
+        out["timecourse"] = round_frame(timecourse)
+    return out
 
 
 def summarize_gazepoint_time_clusters(result, alpha=None) -> pd.DataFrame:
