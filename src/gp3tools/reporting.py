@@ -391,11 +391,155 @@ def report_gazepoint_qc_overview(data, max_objects=None):
     }
 
 
-def report_gazepoint_face_qc(data) -> str:
-    from .face import audit_gazepoint_face_quality
+def report_gazepoint_face_qc(
+    face_data=None,
+    quality_audit=None,
+    sync_audit=None,
+    window_summary=None,
+    reactivity_summary=None,
+    multimodal_model=None,
+    checklist=None,
+    output="markdown",
+    include_cautions=True,
+):
+    """Report external facial-behaviour QC and reporting readiness."""
+    from .face import create_gazepoint_face_reporting_checklist
 
-    q = audit_gazepoint_face_quality(data)
-    return f"Face-quality audit evaluated {int(q['n'].iloc[0])} row(s)."
+    if output not in {"markdown", "list"}:
+        raise ValueError("output must be 'markdown' or 'list'")
+
+    if checklist is None:
+        checklist = create_gazepoint_face_reporting_checklist(
+            face_data=face_data,
+            quality_audit=quality_audit,
+            sync_audit=sync_audit,
+            window_summary=window_summary,
+            reactivity_summary=reactivity_summary,
+            multimodal_model=multimodal_model,
+            include_interpretation_cautions=include_cautions,
+        )
+    if not isinstance(checklist, pd.DataFrame):
+        raise TypeError("checklist must be a data frame")
+
+    def extract_table(value, key):
+        if isinstance(value, dict) and isinstance(value.get(key), pd.DataFrame):
+            return value[key].copy()
+        return pd.DataFrame()
+
+    def select_columns(value, candidates):
+        if not isinstance(value, pd.DataFrame):
+            return pd.DataFrame()
+        columns = [column for column in candidates if column in value.columns]
+        return value[columns].copy() if columns else value.copy()
+
+    model_summary = pd.DataFrame()
+    if isinstance(multimodal_model, dict) and isinstance(multimodal_model.get("settings"), dict):
+        settings = multimodal_model["settings"]
+        model_summary = pd.DataFrame(
+            [
+                {
+                    "model_class": multimodal_model.get("_gp3_class", "dict"),
+                    "outcome": settings.get("outcome"),
+                    "predictors": ", ".join(map(str, settings.get("predictors", []) or [])),
+                    "covariates": ", ".join(map(str, settings.get("covariates", []) or [])),
+                    "random_effects": settings.get("random_effects"),
+                    "n_rows_input": settings.get("n_rows_input"),
+                    "n_rows_model": settings.get("n_rows_model"),
+                }
+            ]
+        )
+
+    cautions = (
+        [
+            "External facial-behaviour outputs should be reported as algorithmic or tool-derived measurements, not as direct evidence of emotional states.",
+            "Report face-data quality, confidence, validity, synchronisation, and window coverage before interpreting model estimates.",
+            "Avoid claims of true emotion detection, hidden affect, psychological diagnosis, micro-expression evidence, or causal mechanism unless the study design and validation evidence support them.",
+        ]
+        if include_cautions
+        else []
+    )
+
+    sections = {
+        "checklist": checklist.copy(),
+        "quality_overview": extract_table(quality_audit, "overview"),
+        "quality_issues": extract_table(quality_audit, "issue_summary"),
+        "sync_overview": extract_table(sync_audit, "overview"),
+        "sync_issues": extract_table(sync_audit, "issue_summary"),
+        "window_summary_overview": select_columns(
+            window_summary,
+            [
+                "participant_id",
+                "trial_id",
+                "face_window_label",
+                "n_rows",
+                "n_used",
+                "valid_percent",
+                "face_confidence_mean",
+            ],
+        ),
+        "reactivity_overview": select_columns(
+            reactivity_summary,
+            [
+                "participant_id",
+                "trial_id",
+                "measure",
+                "statistic",
+                "baseline_window",
+                "response_window",
+                "baseline_value",
+                "response_value",
+                "reactivity",
+                "absolute_reactivity",
+            ],
+        ),
+        "model_summary": model_summary,
+        "cautions": cautions,
+        "_gp3_class": "gp3_face_qc_report_list",
+    }
+
+    if output == "list":
+        return sections
+
+    def table_lines(table):
+        if not isinstance(table, pd.DataFrame) or len(table) < 1:
+            return ["_Not supplied._"]
+        if len(table.columns) < 1:
+            return ["_No columns._"]
+        text = table.copy()
+        for column in text.columns:
+            text[column] = (
+                text[column].astype("string").fillna("").str.replace("|", "/", regex=False)
+            )
+        header = "| " + " | ".join(map(str, text.columns)) + " |"
+        divider = "| " + " | ".join(["---"] * len(text.columns)) + " |"
+        body = [
+            "| " + " | ".join(map(str, row)) + " |"
+            for row in text.itertuples(index=False, name=None)
+        ]
+        return [header, divider, *body]
+
+    lines = [
+        "# External facial-behaviour QC report",
+        "",
+        "This report summarises technical reporting readiness for external facial-behaviour data used with Gazepoint workflows. It does not infer facial expressions or emotional states.",
+        "",
+    ]
+    for title, key in [
+        ("Reporting checklist", "checklist"),
+        ("Face-data quality overview", "quality_overview"),
+        ("Face-data quality issues", "quality_issues"),
+        ("Synchronisation overview", "sync_overview"),
+        ("Synchronisation issues", "sync_issues"),
+        ("Window-summary overview", "window_summary_overview"),
+        ("Reactivity overview", "reactivity_overview"),
+        ("Model summary", "model_summary"),
+    ]:
+        lines.extend([f"## {title}", "", *table_lines(sections[key]), ""])
+    if cautions:
+        lines.extend(["## Interpretation cautions", ""])
+        lines.extend(f"- {item}" for item in cautions)
+
+    return "\n".join(lines).rstrip()
 
 
 def report_gazepoint_multiverse(

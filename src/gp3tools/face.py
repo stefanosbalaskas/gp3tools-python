@@ -252,32 +252,299 @@ def standardize_gazepoint_face_columns(
     return out
 
 
-def audit_gazepoint_face_quality(data, confidence_col=None, threshold: float = 0.8) -> pd.DataFrame:
-    df = standardize_gazepoint_face_columns(data)
-    if confidence_col is None:
-        confidence_col = next((c for c in df.columns if "confidence" in c), None)
-    if confidence_col and confidence_col in df:
-        v = pd.to_numeric(df[confidence_col], errors="coerce")
+def audit_gazepoint_face_quality(
+    data,
+    confidence_col=None,
+    threshold=None,
+    *,
+    group_cols=("participant_id", "face_file"),
+    confidence_threshold=0.80,
+    min_valid_percent=70,
+    warning_valid_percent=85,
+    max_time_gap_sec=None,
+    max_duplicate_frame_percent=1,
+    standardize=True,
+):
+    """Audit external facial-behaviour data quality using R v2.3.0 semantics."""
+    # Historical Python compatibility: supplying the old confidence/threshold
+    # controls retains the compact one-row DataFrame result.
+    if confidence_col is not None or threshold is not None:
+        df = standardize_gazepoint_face_columns(data)
+        if confidence_col is None:
+            confidence_col = next((c for c in df.columns if "confidence" in c.lower()), None)
+        threshold_value = 0.8 if threshold is None else float(threshold)
+        if confidence_col and confidence_col in df:
+            values = pd.to_numeric(df[confidence_col], errors="coerce")
+            return pd.DataFrame(
+                {
+                    "n": [len(df)],
+                    "n_valid": [int(values.notna().sum())],
+                    "mean_confidence": [float(values.mean())],
+                    "prop_below_threshold": [float((values < threshold_value).mean())],
+                }
+            )
         return pd.DataFrame(
             {
                 "n": [len(df)],
-                "n_valid": [int(v.notna().sum())],
-                "mean_confidence": [float(v.mean())],
-                "prop_below_threshold": [float((v < threshold).mean())],
+                "n_valid": [len(df)],
+                "mean_confidence": [np.nan],
+                "prop_below_threshold": [np.nan],
             }
         )
-    return pd.DataFrame(
+
+    if isinstance(data, (str, Path)):
+        frame = standardize_gazepoint_face_columns(
+            data,
+            confidence_threshold=confidence_threshold,
+        )
+    else:
+        frame = ensure_dataframe(data)
+        required = {
+            "face_frame",
+            "face_time_sec",
+            "face_confidence",
+            "face_success",
+            "face_valid",
+        }
+        if standardize or not required.issubset(frame.columns):
+            frame = standardize_gazepoint_face_columns(
+                frame,
+                confidence_threshold=confidence_threshold,
+            )
+
+    if len(frame) < 1:
+        raise ValueError("data must contain at least one row")
+
+    if group_cols is None:
+        groups = []
+    elif isinstance(group_cols, str):
+        groups = [group_cols] if group_cols in frame.columns else []
+    else:
+        groups = [column for column in group_cols if column in frame.columns]
+
+    def percent(value, denominator):
+        return np.nan if denominator <= 0 else 100.0 * value / denominator
+
+    def safe_stat(values, statistic):
+        numeric = pd.to_numeric(values, errors="coerce")
+        if numeric.notna().sum() == 0:
+            return np.nan
+        return float(getattr(numeric, statistic)())
+
+    def summarise_subset(part, group_values=None):
+        n_rows = len(part)
+        valid = part["face_valid"].astype("boolean")
+        confidence = pd.to_numeric(part["face_confidence"], errors="coerce")
+        success = part["face_success"].astype("boolean")
+        face_frame = pd.to_numeric(part["face_frame"], errors="coerce")
+        time_values = pd.to_numeric(part["face_time_sec"], errors="coerce")
+
+        n_valid = int(valid.eq(True).sum())
+        n_invalid = int(valid.eq(False).sum())
+        n_unknown = int(valid.isna().sum())
+        valid_percent = percent(n_valid, n_rows)
+        invalid_percent = percent(n_invalid, n_rows)
+        unknown_percent = percent(n_unknown, n_rows)
+
+        n_missing_confidence = int(confidence.isna().sum())
+        confidence_missing_percent = percent(n_missing_confidence, n_rows)
+        known_success = success.notna()
+        n_success = int(success.eq(True).sum())
+        success_percent = (
+            percent(n_success, int(known_success.sum())) if known_success.any() else np.nan
+        )
+
+        nonmissing_frame = face_frame.dropna()
+        if len(nonmissing_frame):
+            n_duplicate_frames = int(nonmissing_frame.duplicated().sum())
+            duplicate_frame_percent = percent(n_duplicate_frames, len(nonmissing_frame))
+        else:
+            n_duplicate_frames = np.nan
+            duplicate_frame_percent = np.nan
+
+        finite_time = time_values[np.isfinite(time_values.to_numpy(float))].sort_values()
+        n_missing_time = int(n_rows - len(finite_time))
+        if len(finite_time) > 1:
+            steps = np.diff(finite_time.to_numpy(float))
+        else:
+            steps = np.array([], dtype=float)
+        n_nonpositive_time_steps = int(np.sum(steps <= 0))
+        positive = steps[steps > 0]
+        max_gap = float(np.max(positive)) if len(positive) else np.nan
+        median_step = float(np.median(positive)) if len(positive) else np.nan
+        estimated_hz = 1.0 / median_step if np.isfinite(median_step) and median_step > 0 else np.nan
+
+        if valid.isna().all():
+            status = "unknown"
+        elif np.isfinite(valid_percent) and valid_percent < min_valid_percent:
+            status = "fail"
+        elif np.isfinite(valid_percent) and valid_percent < warning_valid_percent:
+            status = "warn"
+        elif (
+            np.isfinite(duplicate_frame_percent)
+            and duplicate_frame_percent > max_duplicate_frame_percent
+        ):
+            status = "warn"
+        elif (
+            max_time_gap_sec is not None
+            and np.isfinite(max_gap)
+            and max_gap > float(max_time_gap_sec)
+        ):
+            status = "warn"
+        else:
+            status = "pass"
+
+        if status == "unknown":
+            message = (
+                "Face-data validity could not be evaluated because no confidence "
+                "or success information was available."
+            )
+        elif status == "fail":
+            message = (
+                "Face-data validity is below the minimum threshold "
+                f"({valid_percent:.1f}% valid; minimum {min_valid_percent}%)."
+            )
+        elif status == "warn":
+            message = (
+                "Face-data quality should be reviewed before analysis "
+                f"({valid_percent:.1f}% valid; warning threshold "
+                f"{warning_valid_percent}%)."
+            )
+        else:
+            message = "Face-data quality passed the configured validity checks."
+
+        row = {
+            "face_quality_group": "overall",
+            "n_rows": n_rows,
+            "n_valid": n_valid,
+            "valid_percent": valid_percent,
+            "n_invalid": n_invalid,
+            "invalid_percent": invalid_percent,
+            "n_unknown_validity": n_unknown,
+            "unknown_validity_percent": unknown_percent,
+            "n_missing_confidence": n_missing_confidence,
+            "confidence_missing_percent": confidence_missing_percent,
+            "mean_confidence": safe_stat(confidence, "mean"),
+            "median_confidence": safe_stat(confidence, "median"),
+            "min_confidence": safe_stat(confidence, "min"),
+            "max_confidence": safe_stat(confidence, "max"),
+            "n_success": n_success,
+            "success_percent": success_percent,
+            "n_duplicate_frames": n_duplicate_frames,
+            "duplicate_frame_percent": duplicate_frame_percent,
+            "n_missing_time": n_missing_time,
+            "n_nonpositive_time_steps": n_nonpositive_time_steps,
+            "max_time_gap_sec": max_gap,
+            "median_time_step_sec": median_step,
+            "estimated_sampling_rate_hz": estimated_hz,
+            "face_quality_status": status,
+            "message": message,
+        }
+        if group_values:
+            labels = []
+            for column, value in group_values.items():
+                value = "missing" if pd.isna(value) else str(value)
+                row[column] = value
+                labels.append(f"{column}={value}")
+            row["face_quality_group"] = " | ".join(labels)
+        return row
+
+    group_rows = []
+    if groups:
+        grouper = groups[0] if len(groups) == 1 else groups
+        for keys, part in frame.groupby(grouper, dropna=False, sort=False):
+            if len(groups) == 1:
+                keys = (keys,)
+            group_rows.append(summarise_subset(part, dict(zip(groups, keys, strict=True))))
+    else:
+        group_rows.append(summarise_subset(frame))
+    group_summary = pd.DataFrame(group_rows)
+
+    overview_row = summarise_subset(frame)
+    overview_row.pop("face_quality_group", None)
+    overview = pd.DataFrame([{"n_groups": len(group_summary), **overview_row}])
+
+    def count_where(series):
+        return int(pd.Series(series).fillna(False).sum())
+
+    issue_names = [
+        "valid_percent_below_minimum",
+        "valid_percent_below_warning",
+        "unknown_validity",
+        "duplicate_frames",
+        "large_time_gaps",
+        "missing_confidence",
+    ]
+    affected = [
+        count_where(
+            pd.to_numeric(group_summary["valid_percent"], errors="coerce") < min_valid_percent
+        ),
+        count_where(
+            pd.to_numeric(group_summary["valid_percent"], errors="coerce") < warning_valid_percent
+        ),
+        count_where(group_summary["face_quality_status"].eq("unknown")),
+        count_where(
+            pd.to_numeric(group_summary["duplicate_frame_percent"], errors="coerce")
+            > max_duplicate_frame_percent
+        ),
+        (
+            count_where(
+                pd.to_numeric(group_summary["max_time_gap_sec"], errors="coerce")
+                > float(max_time_gap_sec)
+            )
+            if max_time_gap_sec is not None
+            else np.nan
+        ),
+        count_where(pd.to_numeric(group_summary["n_missing_confidence"], errors="coerce") > 0),
+    ]
+    thresholds = [
+        min_valid_percent,
+        warning_valid_percent,
+        np.nan,
+        max_duplicate_frame_percent,
+        np.nan if max_time_gap_sec is None else float(max_time_gap_sec),
+        np.nan,
+    ]
+    issue_summary = pd.DataFrame(
         {
-            "n": [len(df)],
-            "n_valid": [len(df)],
-            "mean_confidence": [np.nan],
-            "prop_below_threshold": [np.nan],
+            "issue": issue_names,
+            "n_groups_affected": affected,
+            "n_groups": len(group_summary),
+            "threshold": thresholds,
         }
     )
+    issue_summary["status"] = [
+        "not_checked" if pd.isna(value) else "review" if value > 0 else "ok" for value in affected
+    ]
+
+    out = {
+        "overview": overview,
+        "group_summary": group_summary,
+        "issue_summary": issue_summary,
+        "data": frame.reset_index(drop=True),
+        "settings": {
+            "group_cols": groups or None,
+            "confidence_threshold": confidence_threshold,
+            "min_valid_percent": min_valid_percent,
+            "warning_valid_percent": warning_valid_percent,
+            "max_time_gap_sec": max_time_gap_sec,
+            "max_duplicate_frame_percent": max_duplicate_frame_percent,
+            "standardize": standardize,
+        },
+        "_gp3_class": "gp3_face_quality_audit",
+    }
+    return out
 
 
 def summarize_gazepoint_face_quality(data, **kwargs):
-    return audit_gazepoint_face_quality(data, **kwargs)
+    """Return the overview from a face-quality audit."""
+    if isinstance(data, dict) and data.get("_gp3_class") == "gp3_face_quality_audit":
+        out = data["overview"].copy()
+    else:
+        audited = audit_gazepoint_face_quality(data, **kwargs)
+        out = audited["overview"].copy() if isinstance(audited, dict) else audited.copy()
+    out.attrs["_gp3_class"] = "gp3_face_quality_summary"
+    return out
 
 
 def summarise_gazepoint_face_quality(data, **kwargs):
@@ -539,19 +806,288 @@ def prepare_gazepoint_multimodal_data(gaze, face=None, **kwargs):
     )
 
 
-def create_gazepoint_face_reporting_checklist(data=None) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "item": [
-                "face software/version",
-                "confidence threshold",
-                "synchronisation method",
-                "missing-face handling",
-                "aggregation window",
-            ],
-            "reported": [False] * 5,
+def create_gazepoint_face_reporting_checklist(
+    face_data=None,
+    quality_audit=None,
+    sync_audit=None,
+    window_summary=None,
+    reactivity_summary=None,
+    multimodal_model=None,
+    include_interpretation_cautions=True,
+) -> pd.DataFrame:
+    """Create the R v2.3.0 reviewer-facing face reporting checklist."""
+
+    def row(section, item, status, evidence, recommendation):
+        return {
+            "section": section,
+            "item": item,
+            "status": status,
+            "evidence": evidence,
+            "recommendation": recommendation,
         }
-    )
+
+    def data_evidence(value):
+        if value is None:
+            return "No object supplied."
+        if isinstance(value, pd.DataFrame):
+            return f"{len(value)} row(s), {len(value.columns)} column(s)."
+        return f"Object supplied with class: {type(value).__name__}"
+
+    def standard_status(value):
+        if not isinstance(value, pd.DataFrame):
+            return "not_available"
+        required = {"face_time_sec", "face_confidence", "face_valid"}
+        present = required.intersection(value.columns)
+        if len(present) == len(required):
+            return "pass"
+        return "warn" if present else "not_available"
+
+    def standard_evidence(value):
+        if not isinstance(value, pd.DataFrame):
+            return "No face-data table supplied."
+        required = [
+            "face_frame",
+            "face_time_sec",
+            "face_confidence",
+            "face_success",
+            "face_valid",
+        ]
+        present = [column for column in required if column in value.columns]
+        missing = [column for column in required if column not in value.columns]
+        return (
+            "Present: "
+            + (", ".join(present) if present else "none")
+            + ". Missing: "
+            + (", ".join(missing) if missing else "none")
+            + "."
+        )
+
+    def status_map(value):
+        if value is None or pd.isna(value) or str(value) == "":
+            return "unknown"
+        lowered = str(value).lower()
+        if lowered in {"pass", "ok"}:
+            return "pass"
+        if lowered in {"warn", "warning", "review"}:
+            return "warn"
+        if lowered in {"fail", "failed"}:
+            return "fail"
+        if lowered in {"unknown", "not_available"}:
+            return lowered
+        return "review"
+
+    def audit_status(value, status_column):
+        if not isinstance(value, dict) or not isinstance(value.get("overview"), pd.DataFrame):
+            return "not_available", "No audit overview supplied."
+        overview = value["overview"]
+        if len(overview) < 1 or status_column not in overview.columns:
+            return "unknown", "Audit overview is missing the status column."
+        raw = overview.iloc[0][status_column]
+        evidence_cols = [
+            column
+            for column in [
+                "n_rows",
+                "valid_percent",
+                "matched_percent",
+                "face_quality_status",
+                "face_sync_audit_status",
+                "max_abs_diff_sec",
+                "max_time_gap_sec",
+            ]
+            if column in overview.columns
+        ]
+        evidence = (
+            "; ".join(f"{column}={overview.iloc[0][column]}" for column in evidence_cols)
+            if evidence_cols
+            else f"Status={raw}"
+        )
+        return status_map(raw), evidence
+
+    def object_evidence(value, expected_class):
+        if value is None:
+            return "No object supplied."
+        cls = value.get("_gp3_class") if isinstance(value, dict) else None
+        text = cls or type(value).__name__
+        return f"Class: {text}" + (
+            " (expected class present)."
+            if cls == expected_class
+            else " (expected class not found)."
+        )
+
+    def issue_status(value):
+        if not isinstance(value, dict) or not isinstance(value.get("issue_summary"), pd.DataFrame):
+            return "not_available"
+        issues = value["issue_summary"]
+        if "n_groups_affected" not in issues.columns:
+            return "unknown"
+        affected = pd.to_numeric(issues["n_groups_affected"], errors="coerce")
+        return "review" if (affected > 0).any() else "pass"
+
+    def issue_evidence(value):
+        if not isinstance(value, dict) or not isinstance(value.get("issue_summary"), pd.DataFrame):
+            return "No issue summary supplied."
+        issues = value["issue_summary"]
+        if not {"issue", "n_groups_affected"}.issubset(issues.columns):
+            return f"{len(issues)} issue-summary row(s) supplied."
+        affected = issues.loc[pd.to_numeric(issues["n_groups_affected"], errors="coerce") > 0]
+        if len(affected) < 1:
+            return "No affected groups reported in issue summary."
+        return "; ".join(
+            f"{record.issue}={record.n_groups_affected}"
+            for record in affected.itertuples(index=False)
+        )
+
+    def window_status(value):
+        if not isinstance(value, pd.DataFrame):
+            return "not_available"
+        if len(value) < 1:
+            return "fail"
+        if (
+            "n_used" in value.columns
+            and (pd.to_numeric(value["n_used"], errors="coerce") < 1).any()
+        ):
+            return "review"
+        return "pass"
+
+    def window_evidence(value):
+        if not isinstance(value, pd.DataFrame):
+            return "No window-summary table supplied."
+        text = f"{len(value)} window-summary row(s)."
+        if "n_used" in value.columns and len(value):
+            numeric = pd.to_numeric(value["n_used"], errors="coerce")
+            if numeric.notna().any():
+                text += f" n_used range: {numeric.min():g}-{numeric.max():g}."
+        return text
+
+    def reactivity_evidence(value):
+        if not isinstance(value, pd.DataFrame):
+            return "No reactivity-summary table supplied."
+        measures = (
+            value["measure"].dropna().astype(str).unique().tolist() if "measure" in value else []
+        )
+        suffix = f"; measure(s): {', '.join(measures)}" if measures else ""
+        return f"{len(value)} reactivity row(s){suffix}."
+
+    def model_evidence(value):
+        if value is None:
+            return "No model object supplied."
+        if isinstance(value, dict) and isinstance(value.get("settings"), dict):
+            settings = value["settings"]
+            return (
+                f"Outcome: {settings.get('outcome')}; model rows: "
+                f"{settings.get('n_rows_model')}; class: "
+                f"{value.get('_gp3_class', type(value).__name__)}."
+            )
+        return f"Model-like object supplied with class: {type(value).__name__}"
+
+    quality_status, quality_evidence = audit_status(quality_audit, "face_quality_status")
+    sync_status, sync_evidence = audit_status(sync_audit, "face_sync_audit_status")
+
+    rows = [
+        row(
+            "Input and provenance",
+            "External face-analysis data are available",
+            "pass" if face_data is not None else "not_available",
+            data_evidence(face_data),
+            "Report the external face-analysis tool, version, input files, and exported columns."
+            if face_data is not None
+            else "Provide imported or standardised external face-analysis data when facial-behaviour analyses are reported.",
+        ),
+        row(
+            "Input and provenance",
+            "Standardised face columns are available",
+            standard_status(face_data),
+            standard_evidence(face_data),
+            "Report standardised timing, frame, confidence, success, and validity fields where available.",
+        ),
+        row(
+            "Quality control",
+            "Face-data quality audit is available",
+            "pass" if quality_audit is not None else "not_available",
+            object_evidence(quality_audit, "gp3_face_quality_audit"),
+            "Use audit_gazepoint_face_quality() before reporting facial-behaviour summaries.",
+        ),
+        row(
+            "Quality control",
+            "Face-data quality status is acceptable",
+            quality_status,
+            quality_evidence,
+            "Report valid-row percentage, confidence coverage, duplicate-frame checks, and timing-gap checks.",
+        ),
+        row(
+            "Quality control",
+            "Quality issues are documented",
+            issue_status(quality_audit),
+            issue_evidence(quality_audit),
+            "Document groups requiring review and explain any exclusions or sensitivity analyses.",
+        ),
+        row(
+            "Synchronisation",
+            "Face-data synchronisation audit is available",
+            "pass" if sync_audit is not None else "not_available",
+            object_evidence(sync_audit, "gp3_face_sync_audit"),
+            "Use audit_gazepoint_face_sync() when face data are aligned to Gazepoint rows.",
+        ),
+        row(
+            "Synchronisation",
+            "Synchronisation status is acceptable",
+            sync_status,
+            sync_evidence,
+            "Report matching method, tolerance, matched percentage, unmatched rows, and timing differences.",
+        ),
+        row(
+            "Window summaries",
+            "Face-window summary is available",
+            "pass" if window_summary is not None else "not_available",
+            data_evidence(window_summary),
+            "Report window definitions, grouping variables, validity filtering, and summarised facial-behaviour measures.",
+        ),
+        row(
+            "Window summaries",
+            "Window-summary coverage is documented",
+            window_status(window_summary),
+            window_evidence(window_summary),
+            "Report n_rows, n_used, valid_percent, confidence summaries, and measure summaries for each window.",
+        ),
+        row(
+            "Reactivity summaries",
+            "Baseline-to-response reactivity is available when used",
+            "pass" if reactivity_summary is not None else "not_available",
+            reactivity_evidence(reactivity_summary),
+            "Define baseline and response windows and report reactivity as response minus baseline.",
+        ),
+        row(
+            "Modelling",
+            "Multimodal or face-window model object is available when models are reported",
+            "pass" if multimodal_model is not None else "not_available",
+            model_evidence(multimodal_model),
+            "Report formula, predictors, covariates, random effects, family, missing-data handling, and model sample size.",
+        ),
+    ]
+
+    if include_interpretation_cautions:
+        rows.extend(
+            [
+                row(
+                    "Interpretation",
+                    "Facial-behaviour variables are not interpreted as direct emotion measures",
+                    "review",
+                    "Manual manuscript/reporting review required.",
+                    "Use cautious language such as facial-behaviour measure, action-unit intensity, confidence, synchronisation coverage, or window-level feature.",
+                ),
+                row(
+                    "Interpretation",
+                    "Unsupported claims are avoided",
+                    "review",
+                    "Manual manuscript/reporting review required.",
+                    "Avoid claims of true emotion detection, hidden affect, micro-expression evidence, diagnosis, or causal mechanism without design support.",
+                ),
+            ]
+        )
+
+    out = pd.DataFrame(rows)
+    out.attrs["_gp3_class"] = "gp3_face_reporting_checklist"
+    return out
 
 
 # BEGIN R V2.3.0 CALL-SURFACE ALIASES
