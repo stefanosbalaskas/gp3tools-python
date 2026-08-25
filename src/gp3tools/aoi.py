@@ -1155,15 +1155,363 @@ def compute_gazepoint_scanpath_geometry(
     return pd.DataFrame(rows)
 
 
-def compute_gazepoint_scanpath_similarity(path_a, path_b, method="sequence") -> float:
-    if method == "sequence":
-        return 1 - compute_gazepoint_sequence_distance(path_a, path_b, normalize=True)
-    a = np.asarray(path_a, float)
-    b = np.asarray(path_b, float)
-    n = min(len(a), len(b))
-    if n == 0:
-        return np.nan
-    return float(np.exp(-np.mean(np.linalg.norm(a[:n] - b[:n], axis=1))))
+def _gp3_scanpath_r_group_id(key):
+    if not isinstance(key, tuple):
+        key = (key,)
+    return "|".join("<NA>" if pd.isna(v) else str(v) for v in key)
+
+
+def _gp3_scanpath_r_sequences(
+    data,
+    *,
+    aoi_col,
+    group_cols,
+    time_col,
+    include_missing,
+    missing_label,
+    collapse_repeats,
+    max_sequences,
+):
+    frame = ensure_dataframe(data, copy=False)
+    if not isinstance(aoi_col, str) or not aoi_col:
+        raise ValueError("aoi_col must be a non-empty string")
+
+    groups = [group_cols] if isinstance(group_cols, str) else list(group_cols or [])
+    if not groups or not all(isinstance(c, str) and c for c in groups):
+        raise ValueError("group_cols must be a non-empty character vector")
+
+    if time_col is not None and (not isinstance(time_col, str) or not time_col):
+        raise ValueError("time_col must be None or a non-empty string")
+
+    needed = [aoi_col, *groups]
+    if time_col is not None:
+        needed.append(time_col)
+
+    missing = [c for c in needed if c not in frame.columns]
+    if missing:
+        raise ValueError("Missing columns: " + ", ".join(missing))
+
+    try:
+        max_sequences = int(max_sequences)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_sequences must be a number of at least 2") from exc
+
+    if max_sequences < 2:
+        raise ValueError("max_sequences must be a number of at least 2")
+
+    ids, seqs = [], []
+
+    for key, part in frame.groupby(groups, dropna=False, sort=False):
+        if time_col is not None:
+            part = part.sort_values(time_col, kind="stable", na_position="last")
+
+        values = []
+        for value in part[aoi_col]:
+            missing_value = pd.isna(value) or (isinstance(value, str) and value == "")
+            if missing_value:
+                if include_missing:
+                    values.append(str(missing_label))
+                continue
+            values.append(str(value))
+
+        if collapse_repeats:
+            values = list(collapse_consecutive(values))
+
+        ids.append(_gp3_scanpath_r_group_id(key))
+        seqs.append(values)
+
+    if len(seqs) > max_sequences:
+        raise ValueError(
+            "Too many grouped sequences. Increase max_sequences if this is intentional."
+        )
+
+    return ids, seqs
+
+
+def _gp3_scanpath_r_validate_distance_matrix(matrix, labels=None):
+    if isinstance(matrix, pd.DataFrame):
+        if matrix.shape[0] != matrix.shape[1]:
+            raise ValueError("Distance matrix must be square")
+        values = matrix.to_numpy(dtype=float)
+        if labels is None:
+            labels = [str(x) for x in matrix.index]
+    else:
+        values = np.asarray(matrix, dtype=float)
+        if values.ndim != 2 or values.shape[0] != values.shape[1]:
+            raise ValueError("Distance matrix must be square")
+        if labels is None:
+            labels = [f"sequence_{i}" for i in range(1, values.shape[0] + 1)]
+
+    labels = [str(x) for x in labels]
+
+    if len(labels) != values.shape[0] or len(set(labels)) != len(labels):
+        raise ValueError("Distance labels must be unique and match matrix dimensions")
+
+    if not np.isfinite(values).all():
+        raise ValueError("Distance matrix must contain finite values")
+
+    if (values < 0).any():
+        raise ValueError("Distance matrix must be non-negative")
+
+    if not np.allclose(values, values.T, atol=1e-12, rtol=1e-12):
+        raise ValueError("Distance matrix must be symmetric")
+
+    if not np.allclose(np.diag(values), 0.0, atol=1e-12, rtol=1e-12):
+        raise ValueError("Distance matrix diagonal must be zero")
+
+    return pd.DataFrame(values, index=labels, columns=labels)
+
+
+def _gp3_scanpath_r_pairs_to_matrix(pairs, distance_col):
+    frame = ensure_dataframe(pairs, copy=False)
+    needed = ["sequence_a", "sequence_b", distance_col]
+    missing = [c for c in needed if c not in frame.columns]
+    if missing:
+        raise ValueError("Missing columns: " + ", ".join(missing))
+
+    labels = []
+    for col in ("sequence_a", "sequence_b"):
+        for value in frame[col]:
+            value = str(value)
+            if value not in labels:
+                labels.append(value)
+
+    matrix = pd.DataFrame(
+        np.nan,
+        index=labels,
+        columns=labels,
+        dtype=float,
+    )
+
+    for label in labels:
+        matrix.loc[label, label] = 0.0
+
+    for _, row in frame.iterrows():
+        a = str(row["sequence_a"])
+        b = str(row["sequence_b"])
+        value = float(row[distance_col])
+        matrix.loc[a, b] = value
+        matrix.loc[b, a] = value
+
+    if matrix.isna().any().any():
+        raise ValueError("Pairwise distance table does not contain every sequence pair")
+
+    return _gp3_scanpath_r_validate_distance_matrix(matrix)
+
+
+def _gp3_scanpath_r_cluster_matrix(distance, *, k, method, linkage):
+    from scipy.cluster.hierarchy import cut_tree
+    from scipy.cluster.hierarchy import linkage as scipy_linkage
+    from scipy.spatial.distance import squareform
+
+    n = len(distance)
+    if n < 3:
+        raise ValueError("At least three scanpaths are required for clustering")
+
+    try:
+        k = int(k)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("k must be one finite integer") from exc
+
+    if k < 2 or k >= n:
+        raise ValueError("k must be at least 2 and smaller than the number of scanpaths")
+
+    if method == "hierarchical":
+        linkage_map = {
+            "average": "average",
+            "complete": "complete",
+            "single": "single",
+            "ward.D2": "ward",
+            "ward.D": "ward",
+            "mcquitty": "weighted",
+            "median": "median",
+            "centroid": "centroid",
+        }
+
+        if linkage not in linkage_map:
+            raise ValueError("Unsupported hierarchical linkage")
+
+        model = scipy_linkage(
+            squareform(distance.to_numpy(float), checks=False),
+            method=linkage_map[linkage],
+        )
+        labels = cut_tree(model, n_clusters=[k]).reshape(-1).astype(int) + 1
+        return labels, model, None
+
+    if method != "pam":
+        raise ValueError("method must be 'hierarchical' or 'pam'")
+
+    values = distance.to_numpy(float)
+    medoids = [int(np.argmin(values.sum(axis=1)))]
+
+    while len(medoids) < k:
+        nearest = np.min(values[:, medoids], axis=1)
+        nearest[medoids] = -np.inf
+        medoids.append(int(np.argmax(nearest)))
+
+    for _ in range(100):
+        assigned = np.argmin(values[:, medoids], axis=1)
+        updated = medoids.copy()
+
+        for cluster_index in range(k):
+            members = np.flatnonzero(assigned == cluster_index)
+            if not len(members):
+                continue
+
+            within = values[np.ix_(members, members)]
+            updated[cluster_index] = int(members[np.argmin(within.sum(axis=1))])
+
+        if updated == medoids:
+            break
+        medoids = updated
+
+    labels = np.argmin(values[:, medoids], axis=1).astype(int) + 1
+    return labels, {"method": "pam", "medoid_indices": medoids}, medoids
+
+
+def _gp3_scanpath_r_representatives(fit):
+    distance = fit["distance"]
+    assignments = fit["assignments"].set_index("sequence_id")["cluster"].astype(int)
+
+    rows = []
+
+    for cluster_id in sorted(assignments.unique()):
+        members = [
+            sequence_id
+            for sequence_id in distance.index
+            if assignments.loc[sequence_id] == cluster_id
+        ]
+
+        if len(members) == 1:
+            means = pd.Series([0.0], index=members)
+        else:
+            means = distance.loc[members, members].sum(axis=1) / (len(members) - 1)
+
+        sequence_id = sorted(
+            members,
+            key=lambda value: (float(means.loc[value]), str(value)),
+        )[0]
+
+        rows.append(
+            {
+                "cluster": int(cluster_id),
+                "sequence_id": sequence_id,
+                "mean_within_cluster_distance": float(means.loc[sequence_id]),
+                "cluster_size": len(members),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _gp3_scanpath_r_map_clusters(reference, resampled):
+    reference = np.asarray(reference, dtype=int)
+    resampled = np.asarray(resampled, dtype=int)
+    mapping = {}
+
+    for cluster_id in sorted(np.unique(resampled)):
+        values, counts = np.unique(
+            reference[resampled == cluster_id],
+            return_counts=True,
+        )
+        order = np.lexsort((values, -counts))
+        mapping[int(cluster_id)] = int(values[order[0]])
+
+    return mapping
+
+
+def compute_gazepoint_scanpath_similarity(
+    path_a=None,
+    path_b=None,
+    method="sequence",
+    *,
+    data=None,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    include_missing=False,
+    missing_label="missing",
+    collapse_repeats=False,
+    max_sequences=200,
+):
+    """Compute scalar Python similarity or an R-compatible pairwise table."""
+    if data is not None and path_a is not None:
+        raise TypeError("supply either path_a or data, not both")
+
+    r_data = data
+    if r_data is None and isinstance(path_a, pd.DataFrame) and path_b is None:
+        r_data = path_a
+
+    if r_data is None:
+        if path_b is None:
+            raise TypeError("path_b is required for the legacy Python interface")
+
+        if method == "sequence":
+            return 1 - compute_gazepoint_sequence_distance(
+                path_a,
+                path_b,
+                normalize=True,
+            )
+
+        a = np.asarray(path_a, float)
+        b = np.asarray(path_b, float)
+        n = min(len(a), len(b))
+
+        if n == 0:
+            return np.nan
+
+        return float(
+            np.exp(
+                -np.mean(
+                    np.linalg.norm(
+                        a[:n] - b[:n],
+                        axis=1,
+                    )
+                )
+            )
+        )
+
+    ids, seqs = _gp3_scanpath_r_sequences(
+        r_data,
+        aoi_col=aoi_col,
+        group_cols=group_cols,
+        time_col=time_col,
+        include_missing=include_missing,
+        missing_label=missing_label,
+        collapse_repeats=collapse_repeats,
+        max_sequences=max_sequences,
+    )
+
+    rows = []
+
+    for i in range(len(seqs)):
+        for j in range(i, len(seqs)):
+            edit = int(
+                compute_gazepoint_sequence_distance(
+                    seqs[i],
+                    seqs[j],
+                    normalize=False,
+                )
+            )
+
+            denominator = max(len(seqs[i]), len(seqs[j]))
+            normalized = 0.0 if denominator == 0 else edit / denominator
+
+            rows.append(
+                {
+                    "sequence_a": ids[i],
+                    "sequence_b": ids[j],
+                    "edit_distance": edit,
+                    "normalized_distance": float(normalized),
+                    "similarity": float(1 - normalized),
+                    "sequence_a_length": len(seqs[i]),
+                    "sequence_b_length": len(seqs[j]),
+                    "n_sequences": len(seqs),
+                    "similarity_status": "ok",
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 def compute_gazepoint_transition_network_metrics(matrix) -> pd.DataFrame:
@@ -1295,29 +1643,175 @@ def audit_gazepoint_aoi_window_denominators(
 
 
 def cluster_gazepoint_scanpaths(
-    data, aoi_col=None, group_cols=None, time_col=None, n_clusters=3
-) -> pd.DataFrame:
-    seq = prepare_gazepoint_aoi_sequences(
-        data, aoi_col=aoi_col, group_cols=group_cols, time_col=time_col
-    )
-    n = len(seq)
-    if n == 0:
-        return seq.assign(cluster=pd.Series(dtype=int))
-    dist = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist[i, j] = dist[j, i] = compute_gazepoint_sequence_distance(
-                seq.iloc[i].sequence, seq.iloc[j].sequence
-            )
-    if n == 1:
-        labels = np.array([0])
+    data=None,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    n_clusters=3,
+    *,
+    x=None,
+    k=None,
+    method=None,
+    linkage="average",
+    distance_col="normalized_distance",
+    include_missing=False,
+    missing_label="missing",
+    collapse_repeats=False,
+    max_sequences=200,
+):
+    """Cluster scanpaths with legacy Python or R-compatible structured output."""
+    r_mode = x is not None or k is not None or method is not None
+
+    if not r_mode:
+        seq = prepare_gazepoint_aoi_sequences(
+            data,
+            aoi_col=aoi_col,
+            group_cols=group_cols,
+            time_col=time_col,
+        )
+
+        n = len(seq)
+        if n == 0:
+            return seq.assign(cluster=pd.Series(dtype=int))
+
+        distance_matrix = np.zeros((n, n))
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                distance_matrix[i, j] = distance_matrix[j, i] = compute_gazepoint_sequence_distance(
+                    seq.iloc[i].sequence,
+                    seq.iloc[j].sequence,
+                )
+
+        if n == 1:
+            labels = np.array([0])
+        else:
+            labels = AgglomerativeClustering(
+                n_clusters=min(n_clusters, n),
+                metric="precomputed",
+                linkage="average",
+            ).fit_predict(distance_matrix)
+
+        seq["cluster"] = labels
+        seq.attrs["distance_matrix"] = distance_matrix
+        return seq
+
+    source = x if x is not None else data
+    if source is None:
+        raise TypeError("x is required for the R-compatible interface")
+
+    k = 3 if k is None else k
+    method = "hierarchical" if method is None else str(method)
+    pairwise = None
+
+    if isinstance(source, np.ndarray):
+        distance = _gp3_scanpath_r_validate_distance_matrix(source)
+        distance_source = "distance_matrix"
+
+    elif (
+        isinstance(source, pd.DataFrame)
+        and source.shape[0] == source.shape[1]
+        and [str(value) for value in source.index] == [str(value) for value in source.columns]
+    ):
+        distance = _gp3_scanpath_r_validate_distance_matrix(
+            source,
+            labels=[str(value) for value in source.index],
+        )
+        distance_source = "distance_matrix"
+
+    elif isinstance(source, pd.DataFrame) and {
+        "sequence_a",
+        "sequence_b",
+        distance_col,
+    }.issubset(source.columns):
+        pairwise = source.copy()
+        distance = _gp3_scanpath_r_pairs_to_matrix(source, distance_col)
+        distance_source = "pairwise_distance_table"
+
+    elif isinstance(source, pd.DataFrame):
+        if aoi_col is None or group_cols is None:
+            raise ValueError("Supply aoi_col and group_cols when x is long-format AOI data")
+
+        pairwise = compute_gazepoint_scanpath_similarity(
+            data=source,
+            aoi_col=aoi_col,
+            group_cols=group_cols,
+            time_col=time_col,
+            include_missing=include_missing,
+            missing_label=missing_label,
+            collapse_repeats=collapse_repeats,
+            max_sequences=max_sequences,
+        )
+
+        distance = _gp3_scanpath_r_pairs_to_matrix(
+            pairwise,
+            distance_col,
+        )
+        distance_source = "long_aoi_data"
+
     else:
-        labels = AgglomerativeClustering(
-            n_clusters=min(n_clusters, n), metric="precomputed", linkage="average"
-        ).fit_predict(dist)
-    seq["cluster"] = labels
-    seq.attrs["distance_matrix"] = dist
-    return seq
+        distance = _gp3_scanpath_r_validate_distance_matrix(source)
+        distance_source = "distance_matrix"
+
+    labels, model_object, medoid_indices = _gp3_scanpath_r_cluster_matrix(
+        distance,
+        k=k,
+        method=method,
+        linkage=linkage,
+    )
+
+    sequence_ids = list(distance.index)
+    assignments = pd.DataFrame(
+        {
+            "sequence_id": sequence_ids,
+            "cluster": labels.astype(int),
+        }
+    )
+
+    medoids = (
+        [sequence_ids[index] for index in medoid_indices] if medoid_indices is not None else None
+    )
+
+    silhouette = None
+    mean_silhouette_width = np.nan
+
+    unique_clusters = np.unique(labels)
+
+    if 2 <= len(unique_clusters) < len(labels):
+        from sklearn.metrics import silhouette_samples
+
+        widths = silhouette_samples(
+            distance.to_numpy(float),
+            labels,
+            metric="precomputed",
+        )
+
+        silhouette = pd.DataFrame(
+            {
+                "sequence_id": sequence_ids,
+                "cluster": labels.astype(int),
+                "neighbor_cluster": np.nan,
+                "silhouette_width": widths.astype(float),
+            }
+        )
+
+        mean_silhouette_width = float(np.mean(widths))
+
+    return {
+        "assignments": assignments,
+        "distance": distance,
+        "model": model_object,
+        "medoids": medoids,
+        "silhouette": silhouette,
+        "mean_silhouette_width": mean_silhouette_width,
+        "pairwise_distances": pairwise,
+        "k": int(k),
+        "method": method,
+        "linkage": linkage if method == "hierarchical" else None,
+        "distance_source": distance_source,
+        "clustering_status": "ok",
+        "_gp3_class": "gp3_scanpath_clusters",
+    }
 
 
 def select_gazepoint_scanpath_clusters(data, max_clusters=6, **kwargs) -> pd.DataFrame:
@@ -1358,45 +1852,623 @@ def extract_gazepoint_representative_scanpaths(clustered) -> pd.DataFrame:
 
 
 def bootstrap_gazepoint_scanpath_clusters(
-    data, n_boot=100, random_state=123, **kwargs
-) -> pd.DataFrame:
-    rng = np.random.default_rng(random_state)
-    cluster_gazepoint_scanpaths(data, **kwargs)
-    rows = []
-    for b in range(n_boot):
-        idx = rng.integers(0, len(data), len(data))
-        sample = ensure_dataframe(data, copy=False).iloc[idx].reset_index(drop=True)
-        try:
-            cl = cluster_gazepoint_scanpaths(sample, **kwargs)
-            rows.append(
+    data=None,
+    n_boot=100,
+    random_state=123,
+    *,
+    x=None,
+    k=None,
+    sample_fraction=None,
+    method=None,
+    linkages=None,
+    seed=None,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    distance_col="normalized_distance",
+    include_missing=False,
+    missing_label="missing",
+    collapse_repeats=False,
+    max_sequences=200,
+    **kwargs,
+):
+    """Bootstrap scanpath clusters with legacy Python or R-compatible output."""
+    r_mode = any(value is not None for value in (x, k, sample_fraction, method, linkages, seed))
+
+    if not r_mode:
+        rng = np.random.default_rng(random_state)
+        cluster_gazepoint_scanpaths(data, **kwargs)
+
+        rows = []
+
+        for bootstrap_index in range(n_boot):
+            indices = rng.integers(
+                0,
+                len(data),
+                len(data),
+            )
+
+            sample = ensure_dataframe(data, copy=False).iloc[indices].reset_index(drop=True)
+
+            try:
+                clustered = cluster_gazepoint_scanpaths(
+                    sample,
+                    **kwargs,
+                )
+
+                rows.append(
+                    {
+                        "bootstrap": bootstrap_index,
+                        "n_clusters": int(clustered.cluster.nunique()),
+                        "largest_cluster_prop": float(
+                            clustered.cluster.value_counts(normalize=True).max()
+                        ),
+                    }
+                )
+
+            except Exception:
+                rows.append(
+                    {
+                        "bootstrap": bootstrap_index,
+                        "n_clusters": np.nan,
+                        "largest_cluster_prop": np.nan,
+                    }
+                )
+
+        return pd.DataFrame(rows)
+
+    if kwargs:
+        raise TypeError("legacy clustering kwargs are not accepted in R-compatible mode")
+
+    source = x if x is not None else data
+
+    if source is None:
+        raise TypeError("x is required for R-compatible bootstrap mode")
+
+    k = 3 if k is None else int(k)
+    sample_fraction = 0.8 if sample_fraction is None else float(sample_fraction)
+    method = "hierarchical" if method is None else str(method)
+
+    if linkages is None:
+        linkages = ["average"]
+    elif isinstance(linkages, str):
+        linkages = [linkages]
+    else:
+        linkages = list(linkages)
+
+    if not np.isfinite(sample_fraction) or not (0 < sample_fraction <= 1):
+        raise ValueError("sample_fraction must be greater than 0 and at most 1")
+
+    n_boot = int(n_boot)
+    if n_boot < 1:
+        raise ValueError("n_boot must be one positive integer")
+
+    if method == "pam":
+        specifications = pd.DataFrame(
+            [
                 {
-                    "bootstrap": b,
-                    "n_clusters": int(cl.cluster.nunique()),
-                    "largest_cluster_prop": float(cl.cluster.value_counts(normalize=True).max()),
+                    "specification": "pam",
+                    "method": "pam",
+                    "linkage": "average",
+                }
+            ]
+        )
+    else:
+        specifications = pd.DataFrame(
+            [
+                {
+                    "specification": f"hierarchical_{value}",
+                    "method": "hierarchical",
+                    "linkage": str(value),
+                }
+                for value in linkages
+            ]
+        )
+
+    preparation = cluster_gazepoint_scanpaths(
+        x=source,
+        k=2,
+        method="hierarchical",
+        linkage="average",
+        aoi_col=aoi_col,
+        group_cols=group_cols,
+        time_col=time_col,
+        distance_col=distance_col,
+        include_missing=include_missing,
+        missing_label=missing_label,
+        collapse_repeats=collapse_repeats,
+        max_sequences=max_sequences,
+    )
+
+    distance = preparation["distance"]
+    sequence_ids = list(distance.index)
+    n_sequences = len(sequence_ids)
+
+    if k < 2 or k >= n_sequences:
+        raise ValueError("k must be at least 2 and smaller than the number of scanpaths")
+
+    sample_size = min(
+        max(
+            k + 1,
+            int(np.ceil(n_sequences * sample_fraction)),
+        ),
+        n_sequences,
+    )
+
+    from sklearn.metrics import adjusted_rand_score
+
+    rng = np.random.default_rng(seed)
+
+    reference_fits = {}
+    co_clustering = {}
+    pair_coverage = {}
+    same_counts = {}
+    seen_counts = {}
+    inclusion_counts = {}
+    iteration_rows = []
+    representative_rows = []
+
+    index_lookup = {sequence_id: index for index, sequence_id in enumerate(sequence_ids)}
+
+    for specification in specifications.itertuples(index=False):
+        reference_fit = cluster_gazepoint_scanpaths(
+            x=distance,
+            k=k,
+            method=specification.method,
+            linkage=specification.linkage,
+        )
+
+        reference_fits[specification.specification] = reference_fit
+
+        reference_map = (
+            reference_fit["assignments"].set_index("sequence_id")["cluster"].astype(int).to_dict()
+        )
+
+        same_matrix = np.zeros(
+            (n_sequences, n_sequences),
+            dtype=int,
+        )
+
+        seen_matrix = np.zeros_like(same_matrix)
+
+        included = {sequence_id: 0 for sequence_id in sequence_ids}
+
+        for iteration in range(1, n_boot + 1):
+            sampled_ids = list(
+                rng.choice(
+                    sequence_ids,
+                    size=sample_size,
+                    replace=False,
+                )
+            )
+
+            for sequence_id in sampled_ids:
+                included[sequence_id] += 1
+
+            fit = cluster_gazepoint_scanpaths(
+                x=distance.loc[sampled_ids, sampled_ids],
+                k=k,
+                method=specification.method,
+                linkage=specification.linkage,
+            )
+
+            sampled_map = (
+                fit["assignments"].set_index("sequence_id")["cluster"].astype(int).to_dict()
+            )
+
+            sampled_cluster = np.array(
+                [sampled_map[sequence_id] for sequence_id in sampled_ids],
+                dtype=int,
+            )
+
+            sampled_reference = np.array(
+                [reference_map[sequence_id] for sequence_id in sampled_ids],
+                dtype=int,
+            )
+
+            sampled_indices = np.array(
+                [index_lookup[sequence_id] for sequence_id in sampled_ids],
+                dtype=int,
+            )
+
+            seen_matrix[np.ix_(sampled_indices, sampled_indices)] += 1
+
+            same_matrix[np.ix_(sampled_indices, sampled_indices)] += (
+                sampled_cluster[:, None] == sampled_cluster[None, :]
+            ).astype(int)
+
+            iteration_rows.append(
+                {
+                    "specification": specification.specification,
+                    "method": specification.method,
+                    "linkage": specification.linkage,
+                    "iteration": iteration,
+                    "n_sampled": sample_size,
+                    "adjusted_rand_index": float(
+                        adjusted_rand_score(
+                            sampled_reference,
+                            sampled_cluster,
+                        )
+                    ),
+                    "mean_silhouette_width": fit["mean_silhouette_width"],
                 }
             )
-        except Exception:
-            rows.append({"bootstrap": b, "n_clusters": np.nan, "largest_cluster_prop": np.nan})
-    return pd.DataFrame(rows)
 
+            mapping = _gp3_scanpath_r_map_clusters(
+                sampled_reference,
+                sampled_cluster,
+            )
 
-def summarise_gazepoint_scanpath_cluster_stability(data) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    return pd.DataFrame(
-        [
-            {
-                "n_boot": len(df),
-                "mean_n_clusters": float(pd.to_numeric(df.n_clusters, errors="coerce").mean())
-                if "n_clusters" in df
-                else np.nan,
-                "mean_largest_cluster_prop": float(
-                    pd.to_numeric(df.largest_cluster_prop, errors="coerce").mean()
+            representatives = _gp3_scanpath_r_representatives(fit)
+
+            for row in representatives.itertuples(index=False):
+                representative_rows.append(
+                    {
+                        "specification": specification.specification,
+                        "iteration": iteration,
+                        "sequence_id": row.sequence_id,
+                        "resampled_cluster": int(row.cluster),
+                        "reference_cluster": mapping[int(row.cluster)],
+                    }
                 )
-                if "largest_cluster_prop" in df
-                else np.nan,
-            }
-        ]
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            co_matrix = same_matrix / seen_matrix
+
+        co_matrix = co_matrix.astype(float)
+        co_matrix[seen_matrix == 0] = np.nan
+        np.fill_diagonal(co_matrix, 1.0)
+
+        coverage_matrix = seen_matrix / n_boot
+
+        co_clustering[specification.specification] = pd.DataFrame(
+            co_matrix,
+            index=sequence_ids,
+            columns=sequence_ids,
+        )
+
+        pair_coverage[specification.specification] = pd.DataFrame(
+            coverage_matrix,
+            index=sequence_ids,
+            columns=sequence_ids,
+        )
+
+        same_counts[specification.specification] = pd.DataFrame(
+            same_matrix,
+            index=sequence_ids,
+            columns=sequence_ids,
+        )
+
+        seen_counts[specification.specification] = pd.DataFrame(
+            seen_matrix,
+            index=sequence_ids,
+            columns=sequence_ids,
+        )
+
+        inclusion_counts[specification.specification] = included
+
+    iteration_summary = pd.DataFrame(iteration_rows)
+
+    representative_events = pd.DataFrame(
+        representative_rows,
+        columns=[
+            "specification",
+            "iteration",
+            "sequence_id",
+            "resampled_cluster",
+            "reference_cluster",
+        ],
     )
+
+    if representative_events.empty:
+        representative_stability = pd.DataFrame(
+            columns=[
+                "specification",
+                "reference_cluster",
+                "sequence_id",
+                "n_representative",
+                "n_included",
+                "representative_rate",
+            ]
+        )
+    else:
+        representative_stability = (
+            representative_events.groupby(
+                [
+                    "specification",
+                    "reference_cluster",
+                    "sequence_id",
+                ],
+                dropna=False,
+                sort=False,
+            )
+            .size()
+            .rename("n_representative")
+            .reset_index()
+        )
+
+        representative_stability["n_included"] = [
+            inclusion_counts[row.specification].get(
+                str(row.sequence_id),
+                0,
+            )
+            for row in representative_stability.itertuples(index=False)
+        ]
+
+        representative_stability["representative_rate"] = np.where(
+            representative_stability["n_included"] > 0,
+            representative_stability["n_representative"] / representative_stability["n_included"],
+            np.nan,
+        )
+
+    return {
+        "reference_fits": reference_fits,
+        "co_clustering": co_clustering,
+        "pair_coverage": pair_coverage,
+        "same_counts": same_counts,
+        "seen_counts": seen_counts,
+        "inclusion_counts": inclusion_counts,
+        "iteration_summary": iteration_summary,
+        "representative_events": representative_events,
+        "representative_stability": representative_stability,
+        "distance": distance,
+        "specifications": specifications,
+        "settings": {
+            "k": k,
+            "n_boot": n_boot,
+            "sample_fraction": sample_fraction,
+            "sample_size": sample_size,
+            "method": method,
+            "linkages": specifications["linkage"].tolist(),
+            "seed": seed,
+            "distance_source": preparation["distance_source"],
+        },
+        "bootstrap_status": "ok",
+        "_gp3_class": "gp3_scanpath_cluster_bootstrap",
+    }
+
+
+def summarise_gazepoint_scanpath_cluster_stability(
+    data=None,
+    *,
+    x=None,
+    min_pair_coverage=0.5,
+    stable_threshold=0.75,
+):
+    """Summarise legacy bootstrap tables or R-compatible bootstrap objects."""
+    source = x if x is not None else data
+
+    if isinstance(source, pd.DataFrame):
+        df = ensure_dataframe(source, copy=False)
+
+        return pd.DataFrame(
+            [
+                {
+                    "n_boot": len(df),
+                    "mean_n_clusters": (
+                        float(
+                            pd.to_numeric(
+                                df.n_clusters,
+                                errors="coerce",
+                            ).mean()
+                        )
+                        if "n_clusters" in df
+                        else np.nan
+                    ),
+                    "mean_largest_cluster_prop": (
+                        float(
+                            pd.to_numeric(
+                                df.largest_cluster_prop,
+                                errors="coerce",
+                            ).mean()
+                        )
+                        if "largest_cluster_prop" in df
+                        else np.nan
+                    ),
+                }
+            ]
+        )
+
+    if not isinstance(source, dict):
+        raise ValueError("x must be returned by the R-compatible bootstrap function")
+
+    required = {
+        "reference_fits",
+        "co_clustering",
+        "pair_coverage",
+        "iteration_summary",
+        "representative_stability",
+        "specifications",
+        "settings",
+    }
+
+    missing = sorted(required - set(source))
+
+    if missing:
+        raise ValueError("Bootstrap result is missing: " + ", ".join(missing))
+
+    for name, value in {
+        "min_pair_coverage": min_pair_coverage,
+        "stable_threshold": stable_threshold,
+    }.items():
+        value = float(value)
+
+        if not np.isfinite(value) or not (0 <= value <= 1):
+            raise ValueError(f"{name} must be between 0 and 1")
+
+    overview_rows = []
+    sequence_rows = []
+    pair_rows = []
+
+    for specification in source["specifications"].itertuples(index=False):
+        fit = source["reference_fits"][specification.specification]
+        co_matrix = source["co_clustering"][specification.specification]
+        coverage_matrix = source["pair_coverage"][specification.specification]
+
+        reference = fit["assignments"].set_index("sequence_id")["cluster"].astype(int).to_dict()
+
+        sequence_ids = list(reference)
+        local_pair_rows = []
+
+        for i in range(len(sequence_ids)):
+            for j in range(i + 1, len(sequence_ids)):
+                sequence_a = sequence_ids[i]
+                sequence_b = sequence_ids[j]
+
+                probability = float(co_matrix.loc[sequence_a, sequence_b])
+
+                coverage = float(coverage_matrix.loc[sequence_a, sequence_b])
+
+                row = {
+                    "specification": specification.specification,
+                    "sequence_a": sequence_a,
+                    "sequence_b": sequence_b,
+                    "co_clustering_probability": probability,
+                    "pair_coverage": coverage,
+                    "same_reference_cluster": (reference[sequence_a] == reference[sequence_b]),
+                    "included_in_summary": bool(
+                        np.isfinite(probability) and coverage >= min_pair_coverage
+                    ),
+                }
+
+                local_pair_rows.append(row)
+                pair_rows.append(row)
+
+        for sequence_id in sequence_ids:
+            other_ids = [value for value in sequence_ids if value != sequence_id]
+
+            same_ids = [value for value in other_ids if reference[value] == reference[sequence_id]]
+
+            different_ids = [
+                value for value in other_ids if reference[value] != reference[sequence_id]
+            ]
+
+            def eligible(
+                other_ids,
+                co_matrix=co_matrix,
+                coverage_matrix=coverage_matrix,
+                sequence_id=sequence_id,
+            ):
+                values = []
+
+                for other_id in other_ids:
+                    value = float(co_matrix.loc[sequence_id, other_id])
+
+                    coverage = float(coverage_matrix.loc[sequence_id, other_id])
+
+                    if np.isfinite(value) and coverage >= min_pair_coverage:
+                        values.append(value)
+
+                return values
+
+            within_values = eligible(same_ids)
+            between_values = eligible(different_ids)
+
+            within_mean = float(np.mean(within_values)) if within_values else np.nan
+
+            between_mean = float(np.mean(between_values)) if between_values else np.nan
+
+            coverages = [
+                float(coverage_matrix.loc[sequence_id, other_id])
+                for other_id in other_ids
+                if np.isfinite(float(coverage_matrix.loc[sequence_id, other_id]))
+            ]
+
+            sequence_rows.append(
+                {
+                    "specification": specification.specification,
+                    "sequence_id": sequence_id,
+                    "reference_cluster": int(reference[sequence_id]),
+                    "within_cluster_stability": within_mean,
+                    "between_cluster_coclustering": between_mean,
+                    "stability_separation": (
+                        within_mean - between_mean
+                        if np.isfinite(within_mean) and np.isfinite(between_mean)
+                        else np.nan
+                    ),
+                    "n_within_pairs": len(within_values),
+                    "n_between_pairs": len(between_values),
+                    "mean_pair_coverage": (float(np.mean(coverages)) if coverages else np.nan),
+                    "stable": bool(np.isfinite(within_mean) and within_mean >= stable_threshold),
+                }
+            )
+
+        sequence_table = pd.DataFrame(
+            [row for row in sequence_rows if row["specification"] == specification.specification]
+        )
+
+        pair_table = pd.DataFrame(local_pair_rows)
+
+        valid_pairs = pair_table.loc[pair_table["included_in_summary"]]
+
+        within_pairs = valid_pairs.loc[
+            valid_pairs["same_reference_cluster"],
+            "co_clustering_probability",
+        ].to_numpy(float)
+
+        between_pairs = valid_pairs.loc[
+            ~valid_pairs["same_reference_cluster"],
+            "co_clustering_probability",
+        ].to_numpy(float)
+
+        iteration_summary = source["iteration_summary"]
+        iteration_table = iteration_summary.loc[
+            iteration_summary["specification"].eq(specification.specification)
+        ]
+
+        ari = pd.to_numeric(
+            iteration_table["adjusted_rand_index"],
+            errors="coerce",
+        ).dropna()
+
+        stability_values = pd.to_numeric(
+            sequence_table["within_cluster_stability"],
+            errors="coerce",
+        )
+
+        finite_stability = stability_values.loc[np.isfinite(stability_values)]
+
+        acceptable = sequence_table["stable"] | ~np.isfinite(stability_values)
+
+        overview_rows.append(
+            {
+                "specification": specification.specification,
+                "method": specification.method,
+                "linkage": specification.linkage,
+                "k": source["settings"]["k"],
+                "n_boot": source["settings"]["n_boot"],
+                "sample_size": source["settings"]["sample_size"],
+                "mean_adjusted_rand_index": (float(ari.mean()) if len(ari) else np.nan),
+                "sd_adjusted_rand_index": (float(ari.std(ddof=1)) if len(ari) >= 2 else np.nan),
+                "min_adjusted_rand_index": (float(ari.min()) if len(ari) else np.nan),
+                "mean_within_cluster_coclustering": (
+                    float(np.mean(within_pairs)) if len(within_pairs) else np.nan
+                ),
+                "mean_between_cluster_coclustering": (
+                    float(np.mean(between_pairs)) if len(between_pairs) else np.nan
+                ),
+                "mean_sequence_stability": (
+                    float(finite_stability.mean()) if len(finite_stability) else np.nan
+                ),
+                "min_sequence_stability": (
+                    float(finite_stability.min()) if len(finite_stability) else np.nan
+                ),
+                "pct_sequences_stable": (100 * float(sequence_table["stable"].mean())),
+                "stability_status": ("stable" if bool(acceptable.all()) else "review"),
+            }
+        )
+
+    return {
+        "overview": pd.DataFrame(overview_rows),
+        "sequence_summary": pd.DataFrame(sequence_rows),
+        "pairwise_summary": pd.DataFrame(pair_rows),
+        "representative_stability": source["representative_stability"],
+        "settings": {
+            "min_pair_coverage": float(min_pair_coverage),
+            "stable_threshold": float(stable_threshold),
+        },
+        "_gp3_class": "gp3_scanpath_cluster_stability_summary",
+    }
 
 
 # BEGIN R V2.3.0 CALL-SURFACE ALIASES
