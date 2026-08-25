@@ -219,22 +219,503 @@ def summarise_gazepoint_fixation_trials(
 
 
 def audit_gazepoint_fixation_reliability(
-    data, subject_col=None, duration_col="duration_ms"
+    data,
+    subject_col=None,
+    duration_col=None,
+    *,
+    trial_col=None,
+    metric="fixation_count",
+    aoi_col=None,
+    target_aoi=None,
+    time_col=None,
+    group_cols=None,
+    min_trials=4,
+    split_method="odd_even",
+    seed=None,
+    correlation_method="pearson",
 ) -> pd.DataFrame:
+    """Audit split-half fixation reliability.
+
+    Supplying ``trial_col`` activates the R gp3tools v2.3.0 split-half
+    reliability procedure. If ``trial_col`` is omitted, the historical
+    Python per-subject duration summary is retained.
+    """
     df = ensure_dataframe(data)
-    subject_col = subject_col or infer_column(df, "subject")
-    if not subject_col:
-        return pd.DataFrame(
+
+    # ------------------------------------------------------------
+    # Historical Python behaviour
+    # ------------------------------------------------------------
+    if trial_col is None:
+        legacy_duration_col = duration_col or "duration_ms"
+        legacy_subject_col = subject_col or infer_column(df, "subject")
+
+        if not legacy_subject_col:
+            duration = pd.to_numeric(
+                df.get(legacy_duration_col),
+                errors="coerce",
+            )
+
+            return pd.DataFrame(
+                {
+                    "n": [len(df)],
+                    "mean_duration_ms": [duration.mean()],
+                }
+            )
+
+        return (
+            df.groupby(
+                legacy_subject_col,
+                dropna=False,
+            )[legacy_duration_col]
+            .agg(
+                n="size",
+                mean_duration_ms="mean",
+                sd_duration_ms="std",
+            )
+            .reset_index()
+        )
+
+    # ------------------------------------------------------------
+    # R v2.3.0 behaviour
+    # ------------------------------------------------------------
+    def check_scalar_string(
+        value,
+        argument,
+        *,
+        allow_none=False,
+    ):
+        if value is None and allow_none:
+            return
+
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{argument} must be a non-empty string")
+
+    check_scalar_string(
+        subject_col,
+        "subject_col",
+    )
+    check_scalar_string(
+        trial_col,
+        "trial_col",
+    )
+    check_scalar_string(
+        duration_col,
+        "duration_col",
+        allow_none=True,
+    )
+    check_scalar_string(
+        aoi_col,
+        "aoi_col",
+        allow_none=True,
+    )
+    check_scalar_string(
+        target_aoi,
+        "target_aoi",
+        allow_none=True,
+    )
+    check_scalar_string(
+        time_col,
+        "time_col",
+        allow_none=True,
+    )
+
+    valid_metrics = {
+        "fixation_count",
+        "mean_fixation_duration",
+        "total_fixation_duration",
+        "aoi_dwell_prop",
+        "transition_count",
+        "entropy_score",
+    }
+
+    if metric not in valid_metrics:
+        raise ValueError("metric must be one of: " + ", ".join(sorted(valid_metrics)))
+
+    if split_method not in {
+        "odd_even",
+        "random",
+    }:
+        raise ValueError("split_method must be 'odd_even' or 'random'")
+
+    if correlation_method not in {
+        "pearson",
+        "spearman",
+    }:
+        raise ValueError("correlation_method must be 'pearson' or 'spearman'")
+
+    if (
+        isinstance(min_trials, bool)
+        or not isinstance(
+            min_trials,
+            (int, float, np.integer, np.floating),
+        )
+        or not np.isfinite(min_trials)
+        or min_trials < 2
+    ):
+        raise ValueError("min_trials must be a finite numeric scalar of at least 2")
+
+    min_trials = int(min_trials)
+
+    groups = normalize_group_cols(
+        df,
+        group_cols,
+    )
+
+    required_cols = [
+        subject_col,
+        trial_col,
+        *groups,
+    ]
+
+    if metric in {
+        "mean_fixation_duration",
+        "total_fixation_duration",
+    }:
+        if duration_col is None:
+            raise ValueError("duration_col is required for duration reliability metrics")
+
+        required_cols.append(duration_col)
+
+    if metric in {
+        "aoi_dwell_prop",
+        "transition_count",
+        "entropy_score",
+    }:
+        if aoi_col is None:
+            raise ValueError("aoi_col is required for AOI reliability metrics")
+
+        required_cols.append(aoi_col)
+
+        if time_col is not None:
+            required_cols.append(time_col)
+
+    if metric == "aoi_dwell_prop" and target_aoi is None:
+        raise ValueError("target_aoi is required when metric='aoi_dwell_prop'")
+
+    if metric == "aoi_dwell_prop" and duration_col is not None:
+        required_cols.append(duration_col)
+
+    missing = [col for col in dict.fromkeys(required_cols) if col not in df.columns]
+
+    if missing:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+    def ordered(part):
+        if time_col is None:
+            return part
+
+        return part.sort_values(
+            time_col,
+            kind="stable",
+            na_position="last",
+        )
+
+    def prepared_aoi(part):
+        values = part[aoi_col].astype("string")
+
+        valid = values.notna() & values.str.strip().ne("")
+
+        return values.loc[valid].astype(str).tolist()
+
+    def collapsed(values):
+        if len(values) <= 1:
+            return values
+
+        out = [values[0]]
+
+        for value in values[1:]:
+            if value != out[-1]:
+                out.append(value)
+
+        return out
+
+    def entropy_score(values):
+        if not values:
+            return np.nan
+
+        counts = pd.Series(values).value_counts().to_numpy(float)
+
+        counts = counts[np.isfinite(counts) & (counts > 0)]
+
+        if not len(counts):
+            return np.nan
+
+        probabilities = counts / counts.sum()
+
+        entropy = float(-np.sum(probabilities * np.log2(probabilities)))
+
+        n_categories = len(counts)
+
+        if n_categories <= 1:
+            return 0.0
+
+        maximum = np.log2(n_categories)
+
+        if not np.isfinite(maximum) or maximum <= 0:
+            return np.nan
+
+        return float(entropy / maximum)
+
+    def trial_metric(part):
+        if metric == "fixation_count":
+            return float(len(part))
+
+        if metric in {
+            "mean_fixation_duration",
+            "total_fixation_duration",
+        }:
+            values = pd.to_numeric(
+                part[duration_col],
+                errors="coerce",
+            ).to_numpy(float)
+
+            values = values[np.isfinite(values)]
+
+            if not len(values):
+                return np.nan
+
+            if metric == "mean_fixation_duration":
+                return float(values.mean())
+
+            return float(values.sum())
+
+        if metric == "aoi_dwell_prop":
+            aoi = part[aoi_col].astype("string")
+
+            valid_aoi = aoi.notna() & aoi.str.strip().ne("")
+
+            if not bool(valid_aoi.any()):
+                return np.nan
+
+            if duration_col is not None:
+                duration = pd.to_numeric(
+                    part[duration_col],
+                    errors="coerce",
+                ).to_numpy(float)
+
+                valid = valid_aoi.to_numpy() & np.isfinite(duration) & (duration >= 0)
+
+                if not valid.any() or duration[valid].sum() == 0:
+                    return np.nan
+
+                target = aoi.astype("string").eq(str(target_aoi)).fillna(False).to_numpy()
+
+                return float(duration[valid & target].sum() / duration[valid].sum())
+
+            target = aoi.loc[valid_aoi].astype(str).eq(str(target_aoi))
+
+            return float(target.mean())
+
+        part = ordered(part)
+        aoi = prepared_aoi(part)
+
+        if metric == "transition_count":
+            aoi = collapsed(aoi)
+            return float(max(len(aoi) - 1, 0))
+
+        return entropy_score(aoi)
+
+    trial_group_cols = [
+        subject_col,
+        trial_col,
+        *groups,
+    ]
+
+    trial_rows = []
+
+    for _, part in df.groupby(
+        trial_group_cols,
+        dropna=False,
+        sort=False,
+    ):
+        row = {col: part.iloc[0][col] for col in groups}
+
+        row.update(
             {
-                "n": [len(df)],
-                "mean_duration_ms": [pd.to_numeric(df.get(duration_col), errors="coerce").mean()],
+                ".gp3_subject": str(part.iloc[0][subject_col]),
+                ".gp3_trial": str(part.iloc[0][trial_col]),
+                ".gp3_metric_value": trial_metric(part),
             }
         )
-    return (
-        df.groupby(subject_col, dropna=False)[duration_col]
-        .agg(n="size", mean_duration_ms="mean", sd_duration_ms="std")
-        .reset_index()
+
+        trial_rows.append(row)
+
+    if not trial_rows:
+        return pd.DataFrame(
+            {
+                "metric": [metric],
+                "split_method": [split_method],
+                "correlation_method": [correlation_method],
+                "split_half_r": [np.nan],
+                "spearman_brown": [np.nan],
+                "n_subjects_total": [0],
+                "n_subjects_used": [0],
+                "n_trials": [0],
+                "min_trials": [min_trials],
+                "reliability_status": ["no_trials"],
+                "reliability_warning": ["No trial-level metrics could be computed."],
+            }
+        )
+
+    trial_summary = pd.DataFrame(trial_rows)
+
+    rng = np.random.default_rng(seed)
+
+    split_rows = []
+
+    split_group_cols = [
+        *groups,
+        ".gp3_subject",
+    ]
+
+    for _, part in trial_summary.groupby(
+        split_group_cols,
+        dropna=False,
+        sort=False,
+    ):
+        part = part.copy()
+
+        if split_method == "random":
+            order = rng.permutation(len(part))
+
+            part = part.iloc[order].copy()
+        else:
+            part = (
+                part.assign(_gp3_trial_sort=part[".gp3_trial"].astype("string"))
+                .sort_values(
+                    "_gp3_trial_sort",
+                    kind="stable",
+                    na_position="last",
+                )
+                .drop(columns="_gp3_trial_sort")
+            )
+
+        part[".gp3_half"] = ["odd" if index % 2 == 0 else "even" for index in range(len(part))]
+
+        split_rows.append(part)
+
+    trial_summary = pd.concat(
+        split_rows,
+        ignore_index=True,
     )
+
+    if groups:
+        reliability_iterator = trial_summary.groupby(
+            groups,
+            dropna=False,
+            sort=False,
+        )
+    else:
+        reliability_iterator = [
+            (
+                None,
+                trial_summary,
+            )
+        ]
+
+    reliability_rows = []
+
+    for _, part in reliability_iterator:
+        group_values = {col: part.iloc[0][col] for col in groups}
+
+        subject_rows = []
+
+        for subject, subpart in part.groupby(
+            ".gp3_subject",
+            dropna=False,
+            sort=False,
+        ):
+            values = pd.to_numeric(
+                subpart[".gp3_metric_value"],
+                errors="coerce",
+            )
+
+            odd_values = values.loc[subpart[".gp3_half"].eq("odd")]
+
+            even_values = values.loc[subpart[".gp3_half"].eq("even")]
+
+            odd_values = odd_values[np.isfinite(odd_values)]
+
+            even_values = even_values[np.isfinite(even_values)]
+
+            odd = float(odd_values.mean()) if len(odd_values) else np.nan
+
+            even = float(even_values.mean()) if len(even_values) else np.nan
+
+            subject_rows.append(
+                {
+                    ".gp3_subject": subject,
+                    "odd": odd,
+                    "even": even,
+                    "n_trials": int(len(subpart)),
+                }
+            )
+
+        subject_summary = pd.DataFrame(subject_rows)
+
+        eligible = subject_summary.loc[
+            (subject_summary["n_trials"] >= min_trials)
+            & np.isfinite(subject_summary["odd"])
+            & np.isfinite(subject_summary["even"])
+        ].copy()
+
+        n_subjects_total = int(len(subject_summary))
+
+        n_subjects_used = int(len(eligible))
+
+        n_trials_used = int(eligible["n_trials"].sum())
+
+        if n_subjects_used < 3:
+            split_half_r = np.nan
+            spearman_brown = np.nan
+            status = "too_few_subjects"
+            warning = "Fewer than three subjects had enough complete split-half data."
+
+        else:
+            odd_sd = float(eligible["odd"].std(ddof=1))
+
+            even_sd = float(eligible["even"].std(ddof=1))
+
+            if odd_sd == 0 or even_sd == 0:
+                split_half_r = np.nan
+                spearman_brown = np.nan
+                status = "no_variance"
+                warning = "At least one split had zero between-subject variance."
+
+            else:
+                split_half_r = float(
+                    eligible["odd"].corr(
+                        eligible["even"],
+                        method=correlation_method,
+                    )
+                )
+
+                if np.isfinite(split_half_r) and split_half_r != -1:
+                    spearman_brown = float((2 * split_half_r) / (1 + split_half_r))
+                else:
+                    spearman_brown = np.nan
+
+                status = "ok"
+                warning = ""
+
+        reliability_rows.append(
+            {
+                **group_values,
+                "metric": metric,
+                "split_method": split_method,
+                "correlation_method": correlation_method,
+                "split_half_r": split_half_r,
+                "spearman_brown": spearman_brown,
+                "n_subjects_total": n_subjects_total,
+                "n_subjects_used": n_subjects_used,
+                "n_trials": n_trials_used,
+                "min_trials": min_trials,
+                "reliability_status": status,
+                "reliability_warning": warning,
+            }
+        )
+
+    return pd.DataFrame(reliability_rows)
 
 
 def compare_gazepoint_event_detectors(data, **kwargs) -> pd.DataFrame:
