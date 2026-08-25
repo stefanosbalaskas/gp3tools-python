@@ -278,20 +278,246 @@ def smooth_gazepoint_pupil(
     return df
 
 
-def smooth_gazepoint_coordinate(
-    data, column=None, output_col=None, window: int = 5, method="moving_average"
-) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    if column is None:
-        column = infer_column(df, "x", required=True)
-    output_col = output_col or f"{column}_smoothed"
-    x = finite_numeric(df[column])
-    df[output_col] = (
-        x.rolling(window, center=True, min_periods=1).mean()
-        if method == "moving_average"
-        else x.rolling(window, center=True, min_periods=1).median()
+def _gp3_pupil_r_roll(
+    values,
+    *,
+    window,
+    method,
+    min_valid,
+):
+    values = np.asarray(
+        values,
+        dtype=float,
     )
-    return df
+
+    output = np.full(
+        len(values),
+        np.nan,
+    )
+
+    left_width = (window - 1) // 2
+
+    right_width = window - left_width - 1
+
+    for index in range(len(values)):
+        lower = max(
+            0,
+            index - left_width,
+        )
+
+        upper = min(
+            len(values),
+            index + right_width + 1,
+        )
+
+        local = values[lower:upper]
+
+        finite = np.isfinite(local)
+
+        if finite.sum() < min_valid:
+            continue
+
+        if method == "median":
+            output[index] = float(np.median(local[finite]))
+        else:
+            output[index] = float(np.mean(local[finite]))
+
+    return output
+
+
+def smooth_gazepoint_coordinate(
+    data=None,
+    column=None,
+    output_col=None,
+    window: int = 5,
+    method="moving_average",
+    *,
+    all_gaze=None,
+    x_col=None,
+    y_col=None,
+    id_col="USER_ID",
+    group_cols=None,
+    suffix="_smooth",
+    min_valid=None,
+    preserve_missing=True,
+) -> pd.DataFrame:
+    """Smooth gaze coordinates using Python or R v2.3.0 semantics."""
+    r_mode = (
+        all_gaze is not None
+        or x_col is not None
+        or y_col is not None
+        or group_cols is not None
+        or id_col != "USER_ID"
+        or suffix != "_smooth"
+        or min_valid is not None
+        or preserve_missing is not True
+        or method
+        in {
+            "mean",
+            "median",
+        }
+    )
+
+    if not r_mode:
+        df = ensure_dataframe(data)
+
+        if column is None:
+            column = infer_column(
+                df,
+                "x",
+                required=True,
+            )
+
+        output_col = output_col or f"{column}_smoothed"
+
+        values = finite_numeric(df[column])
+
+        if method == "moving_average":
+            smoothed = values.rolling(
+                window,
+                center=True,
+                min_periods=1,
+            ).mean()
+        else:
+            smoothed = values.rolling(
+                window,
+                center=True,
+                min_periods=1,
+            ).median()
+
+        df[output_col] = smoothed
+
+        return df
+
+    if all_gaze is not None and data is not None:
+        raise TypeError("supply either data or all_gaze, not both")
+
+    frame = ensure_dataframe(
+        all_gaze if all_gaze is not None else data,
+        copy=False,
+    )
+
+    x_col = x_col or "FPOGX"
+
+    y_col = y_col or "FPOGY"
+
+    r_method = "median" if (all_gaze is not None and method == "moving_average") else method
+
+    if r_method not in {
+        "median",
+        "mean",
+    }:
+        raise ValueError("method must be 'median' or 'mean'")
+
+    if (
+        isinstance(window, bool)
+        or not isinstance(
+            window,
+            (int, float, np.integer, np.floating),
+        )
+        or not np.isfinite(window)
+        or window < 1
+        or float(window) != int(window)
+    ):
+        raise ValueError("window must be one positive integer")
+
+    window = int(window)
+
+    min_valid = 1 if min_valid is None else min_valid
+
+    if (
+        isinstance(min_valid, bool)
+        or not isinstance(
+            min_valid,
+            (int, float, np.integer, np.floating),
+        )
+        or not np.isfinite(min_valid)
+        or min_valid < 1
+        or float(min_valid) != int(min_valid)
+    ):
+        raise ValueError("min_valid must be one positive integer")
+
+    min_valid = int(min_valid)
+
+    groups = _gp3_pupil_r_group_cols(
+        id_col,
+        group_cols,
+    )
+
+    required = list(
+        dict.fromkeys(
+            groups
+            + [
+                x_col,
+                y_col,
+            ]
+        )
+    )
+
+    missing = [column_name for column_name in required if column_name not in frame.columns]
+
+    if missing:
+        raise ValueError("all_gaze is missing required column(s): " + ", ".join(missing))
+
+    output = frame.copy()
+
+    x_out = f"{x_col}{suffix}"
+
+    y_out = f"{y_col}{suffix}"
+
+    output[x_out] = np.nan
+    output[y_out] = np.nan
+
+    x_position = output.columns.get_loc(x_out)
+
+    y_position = output.columns.get_loc(y_out)
+
+    for indices in _gp3_pupil_r_group_positions(
+        frame,
+        groups,
+    ):
+        x = _gp3_pupil_r_numeric(frame.iloc[indices][x_col])
+
+        y = _gp3_pupil_r_numeric(frame.iloc[indices][y_col])
+
+        smoothed_x = _gp3_pupil_r_roll(
+            x,
+            window=window,
+            method=r_method,
+            min_valid=min_valid,
+        )
+
+        smoothed_y = _gp3_pupil_r_roll(
+            y,
+            window=window,
+            method=r_method,
+            min_valid=min_valid,
+        )
+
+        if preserve_missing is True:
+            smoothed_x[~np.isfinite(x)] = np.nan
+
+            smoothed_y[~np.isfinite(y)] = np.nan
+
+        output.iloc[
+            indices,
+            x_position,
+        ] = smoothed_x
+
+        output.iloc[
+            indices,
+            y_position,
+        ] = smoothed_y
+
+    output.attrs["gazepoint_coordinate_smoothing"] = {
+        "method": r_method,
+        "window": window,
+        "x_col": x_col,
+        "y_col": y_col,
+        "group_cols": groups,
+    }
+
+    return output
 
 
 def baseline_correct_gazepoint_pupil(
@@ -1130,50 +1356,639 @@ def summarize_gazepoint_pupil_response_features(data, **kwargs):
 summarise_gazepoint_pupil_response_features = summarize_gazepoint_pupil_response_features
 
 
-def downsample_gazepoint_pupil(
-    data, time_col=None, pupil_col=None, target_hz: float = 30.0, group_cols=None
-) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    time_col = infer_column(df, "time", time_col, required=True)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
-    bin_width = 1 / target_hz
-    work = df.copy()
-    ts = time_to_seconds(work[time_col])
-    work["_bin"] = (ts / bin_width).round().astype("Int64")
-    agg_cols = groups + ["_bin"]
-    out = (
-        work.groupby(agg_cols, dropna=False)
-        .agg(**{time_col: (time_col, "mean"), pupil_col: (pupil_col, "mean")})
-        .reset_index()
-        .drop(columns="_bin")
+def _gp3_pupil_r_group_cols(id_col, group_cols):
+    groups = []
+
+    if id_col is not None:
+        groups.append(str(id_col))
+
+    if group_cols is not None:
+        if isinstance(group_cols, str):
+            group_cols = [group_cols]
+
+        for column in group_cols:
+            column = str(column)
+
+            if column not in groups:
+                groups.append(column)
+
+    return groups
+
+
+def _gp3_pupil_r_group_positions(data, columns):
+    if len(data) == 0:
+        return []
+
+    if not columns:
+        return [np.arange(len(data), dtype=int)]
+
+    groups = data.groupby(
+        columns,
+        dropna=False,
+        sort=False,
     )
-    return out
+
+    return [np.asarray(indices, dtype=int) for indices in groups.indices.values()]
+
+
+def _gp3_pupil_r_detect_columns(data, pupil_cols):
+    if pupil_cols is not None:
+        if isinstance(pupil_cols, str):
+            columns = [pupil_cols]
+        else:
+            columns = [str(column) for column in pupil_cols]
+
+        columns = list(dict.fromkeys(columns))
+
+        missing = [column for column in columns if column not in data.columns]
+
+        if missing:
+            raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+        return columns
+
+    candidates = [
+        "mean_pupil",
+        "pupil_regressed",
+        "pupil_smoothed",
+        "pupil_interpolated",
+        "pupil_clean",
+        "pupil",
+        "LPupil",
+        "RPupil",
+        "LPD",
+        "RPD",
+        "LPMM",
+        "RPMM",
+    ]
+
+    detected = [column for column in candidates if column in data.columns]
+
+    if not detected:
+        raise ValueError(
+            "No pupil column was supplied or detected. Provide pupil_col or pupil_cols explicitly."
+        )
+
+    return [detected[0]]
+
+
+def _gp3_pupil_r_numeric(values):
+    return pd.to_numeric(
+        values,
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+
+def downsample_gazepoint_pupil(
+    data=None,
+    time_col=None,
+    pupil_col=None,
+    target_hz: float = 30.0,
+    group_cols=None,
+    *,
+    master_df=None,
+    factor=None,
+    pupil_cols=None,
+    id_col="USER_ID",
+    ts_col="TIME",
+    method=None,
+    keep_bin=False,
+) -> pd.DataFrame:
+    """Downsample pupil data using Python or R v2.3.0 semantics."""
+    r_mode = (
+        master_df is not None
+        or factor is not None
+        or pupil_cols is not None
+        or method is not None
+        or keep_bin
+        or id_col != "USER_ID"
+        or ts_col != "TIME"
+    )
+
+    if not r_mode:
+        df = ensure_dataframe(
+            data,
+            copy=False,
+        )
+
+        time_col = infer_column(
+            df,
+            "time",
+            time_col,
+            required=True,
+        )
+
+        pupil_col = infer_column(
+            df,
+            "pupil",
+            pupil_col,
+            required=True,
+        )
+
+        groups = normalize_group_cols(
+            df,
+            group_cols,
+        )
+
+        bin_width = 1 / target_hz
+
+        work = df.copy()
+
+        ts = time_to_seconds(work[time_col])
+
+        work["_bin"] = (ts / bin_width).round().astype("Int64")
+
+        agg_cols = groups + ["_bin"]
+
+        return (
+            work.groupby(
+                agg_cols,
+                dropna=False,
+            )
+            .agg(
+                **{
+                    time_col: (
+                        time_col,
+                        "mean",
+                    ),
+                    pupil_col: (
+                        pupil_col,
+                        "mean",
+                    ),
+                }
+            )
+            .reset_index()
+            .drop(columns="_bin")
+        )
+
+    if master_df is not None and data is not None:
+        raise TypeError("supply either data or master_df, not both")
+
+    frame = ensure_dataframe(
+        master_df if master_df is not None else data,
+        copy=False,
+    )
+
+    factor = 2 if factor is None else factor
+    method = "mean" if method is None else str(method)
+
+    if (
+        isinstance(factor, bool)
+        or not isinstance(
+            factor,
+            (int, float, np.integer, np.floating),
+        )
+        or not np.isfinite(factor)
+        or factor < 1
+        or float(factor) != int(factor)
+    ):
+        raise ValueError("factor must be one positive integer")
+
+    factor = int(factor)
+
+    if method not in {
+        "mean",
+        "first",
+    }:
+        raise ValueError("method must be 'mean' or 'first'")
+
+    detected_pupil_cols = _gp3_pupil_r_detect_columns(
+        frame,
+        pupil_cols,
+    )
+
+    groups = _gp3_pupil_r_group_cols(
+        id_col,
+        group_cols,
+    )
+
+    required = list(
+        dict.fromkeys(groups + detected_pupil_cols + ([] if ts_col is None else [ts_col]))
+    )
+
+    missing = [column for column in required if column not in frame.columns]
+
+    if missing:
+        raise ValueError("master_df is missing required column(s): " + ", ".join(missing))
+
+    output_rows = []
+
+    for indices in _gp3_pupil_r_group_positions(
+        frame,
+        groups,
+    ):
+        if ts_col is not None:
+            ordered = (
+                frame.iloc[indices]
+                .sort_values(
+                    ts_col,
+                    kind="stable",
+                    na_position="last",
+                )
+                .index
+            )
+
+            position_map = {index: position for position, index in enumerate(frame.index)}
+
+            indices = np.asarray(
+                [position_map[index] for index in ordered],
+                dtype=int,
+            )
+
+        for start in range(
+            0,
+            len(indices),
+            factor,
+        ):
+            bin_indices = indices[start : start + factor]
+
+            row = frame.iloc[int(bin_indices[0])].copy().to_dict()
+
+            if method == "mean":
+                for column in detected_pupil_cols:
+                    values = _gp3_pupil_r_numeric(frame.iloc[bin_indices][column])
+
+                    finite = np.isfinite(values)
+
+                    row[column] = float(np.mean(values[finite])) if finite.any() else np.nan
+
+                if ts_col is not None:
+                    values = _gp3_pupil_r_numeric(frame.iloc[bin_indices][ts_col])
+
+                    finite = np.isfinite(values)
+
+                    row[ts_col] = float(np.mean(values[finite])) if finite.any() else np.nan
+
+            row["n_samples_aggregated"] = len(bin_indices)
+
+            row["downsample_factor"] = factor
+
+            row["downsample_bin"] = (start // factor) + 1
+
+            output_rows.append(row)
+
+    if output_rows:
+        output = pd.DataFrame(output_rows).reset_index(drop=True)
+    else:
+        output = frame.iloc[0:0].copy()
+
+    if not keep_bin and "downsample_bin" in output.columns:
+        output = output.drop(columns=["downsample_bin"])
+
+    output.attrs["gazepoint_downsampling"] = {
+        "factor": factor,
+        "method": method,
+        "pupil_cols": detected_pupil_cols,
+        "group_cols": groups,
+    }
+
+    return output
+
+
+def _gp3_pupil_r_row_mean_two(left, right):
+    left = np.asarray(
+        left,
+        dtype=float,
+    )
+
+    right = np.asarray(
+        right,
+        dtype=float,
+    )
+
+    left_ok = np.isfinite(left)
+    right_ok = np.isfinite(right)
+
+    available = left_ok.astype(int) + right_ok.astype(int)
+
+    left_zero = np.where(
+        left_ok,
+        left,
+        0.0,
+    )
+
+    right_zero = np.where(
+        right_ok,
+        right,
+        0.0,
+    )
+
+    result = (left_zero + right_zero) / np.maximum(
+        available,
+        1,
+    )
+
+    result[available == 0] = np.nan
+
+    return result
+
+
+def _gp3_pupil_r_fit_line(x, y):
+    x = np.asarray(
+        x,
+        dtype=float,
+    )
+
+    y = np.asarray(
+        y,
+        dtype=float,
+    )
+
+    design = np.column_stack(
+        [
+            np.ones(len(x)),
+            x,
+        ]
+    )
+
+    coefficients, _, _, _ = np.linalg.lstsq(
+        design,
+        y,
+        rcond=None,
+    )
+
+    if len(coefficients) != 2 or not np.isfinite(coefficients).all():
+        return np.array(
+            [
+                float(np.mean(y)),
+                0.0,
+            ]
+        )
+
+    return coefficients
 
 
 def regress_gazepoint_pupils(
-    data, left_col=None, right_col=None, direction="right_from_left"
-) -> dict[str, Any]:
-    df = ensure_dataframe(data, copy=False)
-    left_col = infer_column(df, "left_pupil", left_col, required=True)
-    right_col = infer_column(df, "right_pupil", right_col, required=True)
-    left_values = finite_numeric(df[left_col])
-    right_values = finite_numeric(df[right_col])
-    ok = left_values.notna() & right_values.notna()
-    x, y = (
-        (left_values[ok], right_values[ok])
-        if direction == "right_from_left"
-        else (right_values[ok], left_values[ok])
-    )
-    lr = stats.linregress(x, y) if ok.sum() >= 3 else None
-    return {
-        "direction": direction,
-        "n": int(ok.sum()),
-        "slope": lr.slope if lr else np.nan,
-        "intercept": lr.intercept if lr else np.nan,
-        "r2": lr.rvalue**2 if lr else np.nan,
-        "model": lr,
+    data=None,
+    left_col=None,
+    right_col=None,
+    direction="right_from_left",
+    *,
+    master_df=None,
+    lp_col=None,
+    rp_col=None,
+    id_col="USER_ID",
+    group_cols=None,
+    output_col="pupil_regressed",
+    residual_col="pupil_regression_residual",
+    min_complete=None,
+):
+    """Regress binocular pupil signals using Python or R v2.3.0 semantics."""
+    r_directions = {
+        "bidirectional",
+        "right_on_left",
+        "left_on_right",
     }
+
+    r_mode = (
+        master_df is not None
+        or lp_col is not None
+        or rp_col is not None
+        or group_cols is not None
+        or id_col != "USER_ID"
+        or output_col != "pupil_regressed"
+        or residual_col != "pupil_regression_residual"
+        or min_complete is not None
+        or direction in r_directions
+    )
+
+    if not r_mode:
+        df = ensure_dataframe(
+            data,
+            copy=False,
+        )
+
+        left_col = infer_column(
+            df,
+            "left_pupil",
+            left_col,
+            required=True,
+        )
+
+        right_col = infer_column(
+            df,
+            "right_pupil",
+            right_col,
+            required=True,
+        )
+
+        left_values = finite_numeric(df[left_col])
+
+        right_values = finite_numeric(df[right_col])
+
+        ok = left_values.notna() & right_values.notna()
+
+        if direction == "right_from_left":
+            x = left_values[ok]
+            y = right_values[ok]
+        else:
+            x = right_values[ok]
+            y = left_values[ok]
+
+        model = stats.linregress(x, y) if ok.sum() >= 3 else None
+
+        return {
+            "direction": direction,
+            "n": int(ok.sum()),
+            "slope": model.slope if model else np.nan,
+            "intercept": model.intercept if model else np.nan,
+            "r2": model.rvalue**2 if model else np.nan,
+            "model": model,
+        }
+
+    if master_df is not None and data is not None:
+        raise TypeError("supply either data or master_df, not both")
+
+    frame = ensure_dataframe(
+        master_df if master_df is not None else data,
+        copy=False,
+    )
+
+    lp_col = lp_col or left_col or "LPupil"
+
+    rp_col = rp_col or right_col or "RPupil"
+
+    if direction not in r_directions:
+        direction = "bidirectional"
+
+    min_complete = 10 if min_complete is None else min_complete
+
+    if (
+        isinstance(min_complete, bool)
+        or not isinstance(
+            min_complete,
+            (int, float, np.integer, np.floating),
+        )
+        or not np.isfinite(min_complete)
+        or min_complete < 2
+        or float(min_complete) != int(min_complete)
+    ):
+        raise ValueError("min_complete must be an integer of at least 2")
+
+    min_complete = int(min_complete)
+
+    groups = _gp3_pupil_r_group_cols(
+        id_col,
+        group_cols,
+    )
+
+    required = list(
+        dict.fromkeys(
+            groups
+            + [
+                lp_col,
+                rp_col,
+            ]
+        )
+    )
+
+    missing = [column for column in required if column not in frame.columns]
+
+    if missing:
+        raise ValueError("master_df is missing required column(s): " + ", ".join(missing))
+
+    output = frame.copy()
+
+    output[output_col] = np.nan
+    output[residual_col] = np.nan
+    output["pupil_regression_n"] = pd.Series(
+        [pd.NA] * len(output),
+        dtype="Int64",
+    )
+
+    output["pupil_regression_method"] = pd.Series(
+        [pd.NA] * len(output),
+        dtype="object",
+    )
+
+    output_col_position = output.columns.get_loc(output_col)
+
+    residual_position = output.columns.get_loc(residual_col)
+
+    n_position = output.columns.get_loc("pupil_regression_n")
+
+    method_position = output.columns.get_loc("pupil_regression_method")
+
+    for indices in _gp3_pupil_r_group_positions(
+        frame,
+        groups,
+    ):
+        left = _gp3_pupil_r_numeric(frame.iloc[indices][lp_col])
+
+        right = _gp3_pupil_r_numeric(frame.iloc[indices][rp_col])
+
+        complete = np.isfinite(left) & np.isfinite(right)
+
+        n_complete = int(complete.sum())
+
+        fallback = _gp3_pupil_r_row_mean_two(
+            left,
+            right,
+        )
+
+        fused = fallback.copy()
+
+        residual = np.full(
+            len(indices),
+            np.nan,
+        )
+
+        method_used = "binocular_mean_fallback"
+
+        can_fit = (
+            n_complete >= min_complete
+            and np.std(
+                left[complete],
+                ddof=1,
+            )
+            > 0
+            and np.std(
+                right[complete],
+                ddof=1,
+            )
+            > 0
+        )
+
+        if can_fit:
+            right_fit = _gp3_pupil_r_fit_line(
+                left[complete],
+                right[complete],
+            )
+
+            left_fit = _gp3_pupil_r_fit_line(
+                right[complete],
+                left[complete],
+            )
+
+            predicted_right = np.full(
+                len(indices),
+                np.nan,
+            )
+
+            predicted_left = np.full(
+                len(indices),
+                np.nan,
+            )
+
+            finite_left = np.isfinite(left)
+
+            finite_right = np.isfinite(right)
+
+            predicted_right[finite_left] = right_fit[0] + right_fit[1] * left[finite_left]
+
+            predicted_left[finite_right] = left_fit[0] + left_fit[1] * right[finite_right]
+
+            both = finite_left & finite_right
+
+            residual[both] = right[both] - predicted_right[both]
+
+            if direction == "bidirectional":
+                fused = _gp3_pupil_r_row_mean_two(
+                    predicted_left,
+                    predicted_right,
+                )
+
+            elif direction == "right_on_left":
+                fused = predicted_right
+
+            else:
+                fused = predicted_left
+
+            missing_fused = ~np.isfinite(fused)
+
+            fused[missing_fused] = fallback[missing_fused]
+
+            method_used = direction
+
+        output.iloc[
+            indices,
+            output_col_position,
+        ] = fused
+
+        output.iloc[
+            indices,
+            residual_position,
+        ] = residual
+
+        output.iloc[
+            indices,
+            n_position,
+        ] = n_complete
+
+        output.iloc[
+            indices,
+            method_position,
+        ] = method_used
+
+    output.attrs["gazepoint_pupil_regression"] = {
+        "lp_col": lp_col,
+        "rp_col": rp_col,
+        "direction": direction,
+        "output_col": output_col,
+        "group_cols": groups,
+    }
+
+    return output
 
 
 def fit_gazepoint_binocular_calibration(data, left_col=None, right_col=None) -> dict[str, Any]:
