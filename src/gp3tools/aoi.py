@@ -700,11 +700,654 @@ def audit_gazepoint_dynamic_aoi_coverage(data, aoi_col="aoi_current") -> pd.Data
     )
 
 
-def audit_gazepoint_aoi_coding_matrix(data, aoi_col=None, group_cols=None) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    aoi_col = infer_column(df, "aoi", aoi_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
-    return df.groupby(groups + [aoi_col], dropna=False).size().rename("n").reset_index()
+def _gp3_aoi_coding_r_aliases(data):
+    frame = data.copy()
+    if "MEDIA_ID" in frame.columns and "media_id" not in frame.columns:
+        frame["media_id"] = frame["MEDIA_ID"]
+    if "AOI" in frame.columns and "aoi" not in frame.columns:
+        frame["aoi"] = frame["AOI"]
+    return frame
+
+
+def _gp3_aoi_coding_r_resolve(col, columns, arg, candidates=(), required=False):
+    if col is not None:
+        if not isinstance(col, str) or not col:
+            raise ValueError(f"{arg} must be a non-missing character scalar")
+        if col == "MEDIA_ID" and "media_id" in columns:
+            return "media_id"
+        if col == "AOI" and "aoi" in columns:
+            return "aoi"
+        if col not in columns:
+            raise ValueError(f"{arg} must be present in data")
+        return col
+    found = [candidate for candidate in candidates if candidate in columns]
+    if found:
+        first = found[0]
+        if first == "MEDIA_ID" and "media_id" in columns:
+            return "media_id"
+        if first == "AOI" and "aoi" in columns:
+            return "aoi"
+        return first
+    if required:
+        raise ValueError(f"{arg} could not be detected and must be supplied")
+    return None
+
+
+def _gp3_aoi_coding_r_numeric(series):
+    return pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+
+
+def _gp3_aoi_coding_r_range(value, arg):
+    try:
+        values = np.asarray(value, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{arg} must be a numeric length-2 vector with lower < upper") from exc
+    if (
+        values.ndim != 1
+        or len(values) != 2
+        or not np.isfinite(values).all()
+        or values[0] >= values[1]
+    ):
+        raise ValueError(f"{arg} must be a numeric length-2 vector with lower < upper")
+    return values
+
+
+def _gp3_aoi_coding_r_prop(value, arg):
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not np.isfinite(value)
+        or value < 0
+        or value > 1
+    ):
+        raise ValueError(f"{arg} must be a numeric scalar between 0 and 1")
+    return float(value)
+
+
+def _gp3_aoi_coding_r_label(value, arg):
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{arg} must be a non-missing character scalar")
+    return value
+
+
+def _gp3_aoi_coding_r_character_vector(value, arg):
+    if isinstance(value, str):
+        values = [value]
+    else:
+        try:
+            values = list(value)
+        except TypeError as exc:
+            raise ValueError(f"{arg} must be a non-empty character vector") from exc
+    if not values or any(not isinstance(item, str) or not item for item in values):
+        raise ValueError(f"{arg} must be a non-empty character vector")
+    return values
+
+
+def _gp3_aoi_coding_r_geometry(
+    data,
+    *,
+    aoi_col,
+    stimulus_col,
+    x_min_col,
+    y_min_col,
+    x_max_col,
+    y_max_col,
+    x_col,
+    y_col,
+    width_col,
+    height_col,
+    screen_x_range,
+    screen_y_range,
+):
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        raise ValueError("aoi_geometry must contain at least one row")
+    frame = _gp3_aoi_coding_r_aliases(data)
+    columns = frame.columns
+    aoi_col = _gp3_aoi_coding_r_resolve(
+        aoi_col,
+        columns,
+        "geometry_aoi_col",
+        ("aoi", "aoi_name", "aoi_id", "AOI", "AOI_NAME", "AOI_ID"),
+        True,
+    )
+    stimulus_col = _gp3_aoi_coding_r_resolve(stimulus_col, columns, "geometry_stimulus_col")
+    x_min_col = _gp3_aoi_coding_r_resolve(
+        x_min_col,
+        columns,
+        "x_min_col",
+        ("x_min", "xmin", "left", "Left", "AOI_X_MIN", "AOI_LEFT"),
+    )
+    y_min_col = _gp3_aoi_coding_r_resolve(
+        y_min_col,
+        columns,
+        "y_min_col",
+        ("y_min", "ymin", "top", "Top", "AOI_Y_MIN", "AOI_TOP"),
+    )
+    x_max_col = _gp3_aoi_coding_r_resolve(
+        x_max_col,
+        columns,
+        "x_max_col",
+        ("x_max", "xmax", "right", "Right", "AOI_X_MAX", "AOI_RIGHT"),
+    )
+    y_max_col = _gp3_aoi_coding_r_resolve(
+        y_max_col,
+        columns,
+        "y_max_col",
+        ("y_max", "ymax", "bottom", "Bottom", "AOI_Y_MAX", "AOI_BOTTOM"),
+    )
+    x_col = _gp3_aoi_coding_r_resolve(x_col, columns, "x_col", ("x", "X", "aoi_x", "AOI_X"))
+    y_col = _gp3_aoi_coding_r_resolve(y_col, columns, "y_col", ("y", "Y", "aoi_y", "AOI_Y"))
+    width_col = _gp3_aoi_coding_r_resolve(
+        width_col, columns, "width_col", ("width", "Width", "aoi_width", "AOI_WIDTH")
+    )
+    height_col = _gp3_aoi_coding_r_resolve(
+        height_col,
+        columns,
+        "height_col",
+        ("height", "Height", "aoi_height", "AOI_HEIGHT"),
+    )
+    has_bounds = all(value is not None for value in (x_min_col, y_min_col, x_max_col, y_max_col))
+    has_origin_size = all(value is not None for value in (x_col, y_col, width_col, height_col))
+    if not has_bounds and not has_origin_size:
+        raise ValueError(
+            "AOI geometry requires either x/y min-max columns or x/y plus width/height columns"
+        )
+    screen_x = _gp3_aoi_coding_r_range(screen_x_range, "screen_x_range")
+    screen_y = _gp3_aoi_coding_r_range(screen_y_range, "screen_y_range")
+    if has_bounds:
+        xmin = _gp3_aoi_coding_r_numeric(frame[x_min_col])
+        ymin = _gp3_aoi_coding_r_numeric(frame[y_min_col])
+        xmax = _gp3_aoi_coding_r_numeric(frame[x_max_col])
+        ymax = _gp3_aoi_coding_r_numeric(frame[y_max_col])
+    else:
+        xmin = _gp3_aoi_coding_r_numeric(frame[x_col])
+        ymin = _gp3_aoi_coding_r_numeric(frame[y_col])
+        width = _gp3_aoi_coding_r_numeric(frame[width_col])
+        height = _gp3_aoi_coding_r_numeric(frame[height_col])
+        xmax = xmin + width
+        ymax = ymin + height
+    width = xmax - xmin
+    height = ymax - ymin
+    area = width * height
+    screen_area = (screen_x[1] - screen_x[0]) * (screen_y[1] - screen_y[0])
+    area_prop = area / screen_area
+    invalid_coordinate = ~(
+        np.isfinite(xmin) & np.isfinite(ymin) & np.isfinite(xmax) & np.isfinite(ymax)
+    )
+    invalid_dimension = ~invalid_coordinate & ((width <= 0) | (height <= 0))
+    too_large = ~invalid_coordinate & ~invalid_dimension & (area_prop > 1)
+    status = np.full(len(frame), "ok", dtype=object)
+    status[too_large] = "too_large"
+    status[invalid_dimension] = "invalid_dimension"
+    status[invalid_coordinate] = "invalid_coordinate"
+    id_cols = [aoi_col] + ([stimulus_col] if stimulus_col is not None else [])
+    summary = frame[id_cols].copy().reset_index(drop=True)
+    summary["x_min"] = xmin
+    summary["y_min"] = ymin
+    summary["x_max"] = xmax
+    summary["y_max"] = ymax
+    summary["width"] = width
+    summary["height"] = height
+    summary["area"] = area
+    summary["area_prop"] = area_prop
+    summary["center_x"] = xmin + width / 2
+    summary["center_y"] = ymin + height / 2
+    summary["outside_screen"] = (
+        ~invalid_coordinate
+        & ~invalid_dimension
+        & (
+            (xmin < screen_x[0])
+            | (xmax > screen_x[1])
+            | (ymin < screen_y[0])
+            | (ymax > screen_y[1])
+        )
+    )
+    summary["aoi_geometry_status"] = status
+    return summary, aoi_col, stimulus_col
+
+
+def _gp3_aoi_coding_r_standardise_observed(values, outside_label, outside_values):
+    raw = values.astype("string")
+    lower = raw.str.strip().str.lower()
+    result = raw.astype(object)
+    outside_lookup = {value.lower() for value in outside_values}
+    result.loc[lower.isin(outside_lookup)] = outside_label
+    result.loc[lower.eq("") | raw.isna()] = pd.NA
+    return result
+
+
+def _gp3_aoi_coding_r_assign(
+    gaze,
+    geometry,
+    *,
+    gaze_x_col,
+    gaze_y_col,
+    gaze_stimulus_col,
+    geometry_aoi_col,
+    geometry_stimulus_col,
+    tie_method,
+    outside_label,
+    ambiguous_label,
+    missing_label,
+):
+    x = _gp3_aoi_coding_r_numeric(gaze[gaze_x_col])
+    y = _gp3_aoi_coding_r_numeric(gaze[gaze_y_col])
+    derived = np.full(len(gaze), outside_label, dtype=object)
+    n_matching = np.zeros(len(gaze), dtype=int)
+    assignment = np.full(len(gaze), "no_aoi", dtype=object)
+    missing = ~(np.isfinite(x) & np.isfinite(y))
+    derived[missing] = missing_label
+    assignment[missing] = "missing_coordinate"
+    for i in range(len(gaze)):
+        if missing[i]:
+            continue
+        candidate = geometry
+        if gaze_stimulus_col is not None and geometry_stimulus_col is not None:
+            gaze_value = gaze.iloc[i][gaze_stimulus_col]
+            candidate = candidate.loc[
+                candidate[geometry_stimulus_col].astype("string").eq(str(gaze_value)).fillna(False)
+            ]
+        if candidate.empty:
+            continue
+        inside = (
+            (x[i] >= candidate["x_min"].to_numpy(float))
+            & (x[i] <= candidate["x_max"].to_numpy(float))
+            & (y[i] >= candidate["y_min"].to_numpy(float))
+            & (y[i] <= candidate["y_max"].to_numpy(float))
+        )
+        hits = np.flatnonzero(inside)
+        n_matching[i] = len(hits)
+        if len(hits) == 0:
+            continue
+        if len(hits) == 1:
+            derived[i] = str(candidate.iloc[hits[0]][geometry_aoi_col])
+            assignment[i] = "single_aoi"
+        elif tie_method == "first":
+            derived[i] = str(candidate.iloc[hits[0]][geometry_aoi_col])
+            assignment[i] = "multiple_aoi_resolved"
+        else:
+            derived[i] = ambiguous_label
+            assignment[i] = "ambiguous_aoi"
+    return pd.DataFrame(
+        {
+            "derived_aoi": derived,
+            "n_matching_aois": n_matching,
+            "derived_assignment_status": assignment,
+        }
+    )
+
+
+def _gp3_aoi_coding_r_summary(sample_coding, key):
+    rows = []
+    grouped = sample_coding.loc[sample_coding[key].notna()].groupby(key, sort=True, dropna=True)
+    for value, block in grouped:
+        comparable = int(block["comparable_sample"].fillna(False).sum())
+        mismatches = int(block["aoi_coding_status"].eq("mismatch").sum())
+        rows.append(
+            {
+                key: str(value),
+                "n_samples": len(block),
+                "n_comparable_samples": comparable,
+                "n_matches": int(block["coding_match"].eq(True).sum()),
+                "n_mismatches": mismatches,
+            }
+        )
+    out = pd.DataFrame(
+        rows,
+        columns=[
+            key,
+            "n_samples",
+            "n_comparable_samples",
+            "n_matches",
+            "n_mismatches",
+        ],
+    )
+    total = int(out["n_samples"].sum()) if len(out) else 0
+    out["sample_prop"] = out["n_samples"] / total if total else np.nan
+    out["mismatch_prop"] = np.where(
+        out["n_comparable_samples"] > 0,
+        out["n_mismatches"] / out["n_comparable_samples"],
+        np.nan,
+    )
+    return out
+
+
+def _gp3_aoi_coding_r_text(value):
+    if value is None:
+        return pd.NA
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return pd.NA
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
+
+def audit_gazepoint_aoi_coding_matrix(
+    data=None,
+    aoi_col=None,
+    group_cols=None,
+    *,
+    gaze_data=None,
+    aoi_geometry=None,
+    observed_aoi_col=None,
+    gaze_x_col=None,
+    gaze_y_col=None,
+    gaze_stimulus_col=None,
+    sample_id_cols=None,
+    geometry_aoi_col=None,
+    geometry_stimulus_col=None,
+    x_min_col=None,
+    y_min_col=None,
+    x_max_col=None,
+    y_max_col=None,
+    x_col=None,
+    y_col=None,
+    width_col=None,
+    height_col=None,
+    screen_x_range=(0, 1),
+    screen_y_range=(0, 1),
+    tie_method="ambiguous",
+    outside_label="outside",
+    ambiguous_label="ambiguous",
+    missing_label="missing_coordinate",
+    observed_outside_values=(
+        "outside",
+        "none",
+        "no_aoi",
+        "non_aoi",
+        "background",
+        "off_aoi",
+    ),
+    max_mismatch_prop=0.05,
+    max_ambiguous_prop=0.05,
+    max_missing_coordinate_prop=0.2,
+    ignore_invalid_geometry=True,
+):
+    """Audit observed versus geometry-derived AOI coding.
+
+    The historical Python frequency-table interface is preserved. Supplying
+    ``aoi_geometry``/``gaze_data`` or two DataFrames positionally activates
+    the R gp3tools v2.3.0 audit interface.
+    """
+    positional_r_mode = (
+        isinstance(data, pd.DataFrame)
+        and isinstance(aoi_col, pd.DataFrame)
+        and gaze_data is None
+        and aoi_geometry is None
+    )
+    r_mode = positional_r_mode or gaze_data is not None or aoi_geometry is not None
+    if not r_mode:
+        df = ensure_dataframe(data, copy=False)
+        resolved_aoi = infer_column(df, "aoi", aoi_col, required=True)
+        groups = normalize_group_cols(df, group_cols)
+        return df.groupby(groups + [resolved_aoi], dropna=False).size().rename("n").reset_index()
+    if positional_r_mode:
+        gaze_data, aoi_geometry = data, aoi_col
+    else:
+        if gaze_data is not None and data is not None:
+            raise TypeError("supply either data or gaze_data, not both")
+        if gaze_data is None:
+            gaze_data = data
+    if not isinstance(gaze_data, pd.DataFrame) or gaze_data.empty:
+        raise ValueError("gaze_data must contain at least one row")
+    if not isinstance(aoi_geometry, pd.DataFrame) or aoi_geometry.empty:
+        raise ValueError("aoi_geometry must contain at least one row")
+    if tie_method not in {"ambiguous", "first"}:
+        raise ValueError("tie_method must be 'ambiguous' or 'first'")
+    outside_label = _gp3_aoi_coding_r_label(outside_label, "outside_label")
+    ambiguous_label = _gp3_aoi_coding_r_label(ambiguous_label, "ambiguous_label")
+    missing_label = _gp3_aoi_coding_r_label(missing_label, "missing_label")
+    outside_values = _gp3_aoi_coding_r_character_vector(
+        observed_outside_values, "observed_outside_values"
+    )
+    max_mismatch_prop = _gp3_aoi_coding_r_prop(max_mismatch_prop, "max_mismatch_prop")
+    max_ambiguous_prop = _gp3_aoi_coding_r_prop(max_ambiguous_prop, "max_ambiguous_prop")
+    max_missing_coordinate_prop = _gp3_aoi_coding_r_prop(
+        max_missing_coordinate_prop, "max_missing_coordinate_prop"
+    )
+    if not isinstance(ignore_invalid_geometry, (bool, np.bool_)):
+        raise ValueError("ignore_invalid_geometry must be TRUE or FALSE")
+    gaze = _gp3_aoi_coding_r_aliases(gaze_data).reset_index(drop=True)
+    observed_aoi_col = _gp3_aoi_coding_r_resolve(
+        observed_aoi_col,
+        gaze.columns,
+        "observed_aoi_col",
+        (
+            "observed_aoi",
+            "observed_aoi_label",
+            "coded_aoi",
+            "aoi",
+            "AOI",
+            "aoi_current",
+            "aoi_label",
+            "AOI_LABEL",
+        ),
+        True,
+    )
+    gaze_x_col = _gp3_aoi_coding_r_resolve(
+        gaze_x_col,
+        gaze.columns,
+        "gaze_x_col",
+        ("x", "X", "gaze_x", "gaze_x_norm", "FPOGX", "BPOGX"),
+        True,
+    )
+    gaze_y_col = _gp3_aoi_coding_r_resolve(
+        gaze_y_col,
+        gaze.columns,
+        "gaze_y_col",
+        ("y", "Y", "gaze_y", "gaze_y_norm", "FPOGY", "BPOGY"),
+        True,
+    )
+    gaze_stimulus_col = _gp3_aoi_coding_r_resolve(
+        gaze_stimulus_col,
+        gaze.columns,
+        "gaze_stimulus_col",
+        ("media_id", "MEDIA_ID", "stimulus", "stimulus_id"),
+    )
+    if sample_id_cols is None:
+        sample_id_cols = []
+    elif isinstance(sample_id_cols, str):
+        sample_id_cols = [sample_id_cols]
+    else:
+        sample_id_cols = [str(value) for value in sample_id_cols]
+    sample_id_cols = [
+        "media_id" if value == "MEDIA_ID" else "aoi" if value == "AOI" else value
+        for value in sample_id_cols
+    ]
+    sample_id_cols = [value for value in sample_id_cols if value in gaze.columns]
+    geometry_summary, resolved_geometry_aoi_col, resolved_geometry_stimulus_col = (
+        _gp3_aoi_coding_r_geometry(
+            aoi_geometry,
+            aoi_col=geometry_aoi_col,
+            stimulus_col=geometry_stimulus_col,
+            x_min_col=x_min_col,
+            y_min_col=y_min_col,
+            x_max_col=x_max_col,
+            y_max_col=y_max_col,
+            x_col=x_col,
+            y_col=y_col,
+            width_col=width_col,
+            height_col=height_col,
+            screen_x_range=screen_x_range,
+            screen_y_range=screen_y_range,
+        )
+    )
+    if (
+        resolved_geometry_stimulus_col is not None
+        and gaze_stimulus_col is None
+        and geometry_summary[resolved_geometry_stimulus_col].nunique(dropna=False) > 1
+    ):
+        raise ValueError(
+            "gaze_stimulus_col is required when aoi_geometry contains multiple stimuli"
+        )
+    geometry_for_coding = geometry_summary
+    if bool(ignore_invalid_geometry):
+        geometry_for_coding = geometry_summary.loc[
+            ~geometry_summary["aoi_geometry_status"].isin(
+                ["invalid_coordinate", "invalid_dimension"]
+            )
+        ].copy()
+    base = pd.DataFrame({".gp3_sample_index": np.arange(1, len(gaze) + 1)})
+    for column in sample_id_cols:
+        base[column] = gaze[column].to_numpy()
+    if gaze_stimulus_col is not None and gaze_stimulus_col not in base.columns:
+        base[gaze_stimulus_col] = gaze[gaze_stimulus_col].to_numpy()
+    observed_raw = gaze[observed_aoi_col].astype("string")
+    observed = _gp3_aoi_coding_r_standardise_observed(observed_raw, outside_label, outside_values)
+    derived = _gp3_aoi_coding_r_assign(
+        gaze,
+        geometry_for_coding,
+        gaze_x_col=gaze_x_col,
+        gaze_y_col=gaze_y_col,
+        gaze_stimulus_col=gaze_stimulus_col,
+        geometry_aoi_col=resolved_geometry_aoi_col,
+        geometry_stimulus_col=resolved_geometry_stimulus_col,
+        tie_method=tie_method,
+        outside_label=outside_label,
+        ambiguous_label=ambiguous_label,
+        missing_label=missing_label,
+    )
+    comparable = observed.notna() & ~derived["derived_aoi"].isin([ambiguous_label, missing_label])
+    coding_match = pd.Series(pd.NA, index=gaze.index, dtype="boolean")
+    coding_match.loc[comparable] = (
+        observed.loc[comparable].astype(str).to_numpy()
+        == derived.loc[comparable, "derived_aoi"].astype(str).to_numpy()
+    )
+    status = pd.Series("ok", index=gaze.index, dtype="object")
+    status.loc[observed.isna()] = "observed_missing"
+    status.loc[derived["derived_assignment_status"].eq("missing_coordinate")] = "missing_coordinate"
+    status.loc[derived["derived_aoi"].eq(ambiguous_label)] = "ambiguous_derived"
+    status.loc[comparable & coding_match.eq(False)] = "mismatch"
+    sample_coding = pd.concat(
+        [
+            base.reset_index(drop=True),
+            pd.DataFrame(
+                {
+                    "observed_aoi_raw": observed_raw.reset_index(drop=True),
+                    "observed_aoi": observed.reset_index(drop=True),
+                    "derived_aoi": derived["derived_aoi"].reset_index(drop=True),
+                    "n_matching_aois": derived["n_matching_aois"].reset_index(drop=True),
+                    "derived_assignment_status": derived["derived_assignment_status"].reset_index(
+                        drop=True
+                    ),
+                    "comparable_sample": comparable.reset_index(drop=True),
+                    "coding_match": coding_match.reset_index(drop=True),
+                    "aoi_coding_status": status.reset_index(drop=True),
+                }
+            ),
+        ],
+        axis=1,
+    )
+    coding_matrix = (
+        sample_coding.groupby(["observed_aoi", "derived_aoi"], dropna=False, sort=True)
+        .size()
+        .rename("n_samples")
+        .reset_index()
+    )
+    total_matrix = int(coding_matrix["n_samples"].sum())
+    coding_matrix["sample_prop"] = (
+        coding_matrix["n_samples"] / total_matrix if total_matrix else np.nan
+    )
+    observed_summary = _gp3_aoi_coding_r_summary(sample_coding, "observed_aoi")
+    derived_summary = _gp3_aoi_coding_r_summary(sample_coding, "derived_aoi")
+    flagged_samples = sample_coding.loc[~sample_coding["aoi_coding_status"].eq("ok")].copy()
+    n_comparable = int(sample_coding["comparable_sample"].fillna(False).sum())
+    n_mismatched = int(sample_coding["aoi_coding_status"].eq("mismatch").sum())
+    n_ambiguous = int(sample_coding["derived_assignment_status"].eq("ambiguous_aoi").sum())
+    n_missing = int(sample_coding["derived_assignment_status"].eq("missing_coordinate").sum())
+    mismatch_prop = n_mismatched / n_comparable if n_comparable else np.nan
+    ambiguous_prop = n_ambiguous / len(sample_coding)
+    missing_prop = n_missing / len(sample_coding)
+    overview_status = (
+        "review"
+        if (
+            (np.isfinite(mismatch_prop) and mismatch_prop > max_mismatch_prop)
+            or ambiguous_prop > max_ambiguous_prop
+            or missing_prop > max_missing_coordinate_prop
+        )
+        else "ok"
+    )
+    overview = pd.DataFrame(
+        [
+            {
+                "n_gaze_rows": len(gaze),
+                "n_geometry_rows": len(aoi_geometry),
+                "n_aois": len(geometry_summary),
+                "n_aois_used": len(geometry_for_coding),
+                "n_coded_samples": len(sample_coding),
+                "n_comparable_samples": n_comparable,
+                "n_mismatched_samples": n_mismatched,
+                "mismatch_prop": mismatch_prop,
+                "n_ambiguous_samples": n_ambiguous,
+                "ambiguous_prop": ambiguous_prop,
+                "n_missing_coordinate_samples": n_missing,
+                "missing_coordinate_prop": missing_prop,
+                "n_flagged_samples": len(flagged_samples),
+                "aoi_coding_matrix_status": overview_status,
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "observed_aoi_col",
+                "gaze_x_col",
+                "gaze_y_col",
+                "gaze_stimulus_col",
+                "sample_id_cols",
+                "geometry_aoi_col",
+                "geometry_stimulus_col",
+                "screen_x_range",
+                "screen_y_range",
+                "tie_method",
+                "outside_label",
+                "ambiguous_label",
+                "missing_label",
+                "observed_outside_values",
+                "max_mismatch_prop",
+                "max_ambiguous_prop",
+                "max_missing_coordinate_prop",
+                "ignore_invalid_geometry",
+            ],
+            "value": [
+                observed_aoi_col,
+                gaze_x_col,
+                gaze_y_col,
+                _gp3_aoi_coding_r_text(gaze_stimulus_col),
+                _gp3_aoi_coding_r_text(sample_id_cols),
+                resolved_geometry_aoi_col,
+                _gp3_aoi_coding_r_text(resolved_geometry_stimulus_col),
+                ", ".join(
+                    f"{value:g}"
+                    for value in _gp3_aoi_coding_r_range(screen_x_range, "screen_x_range")
+                ),
+                ", ".join(
+                    f"{value:g}"
+                    for value in _gp3_aoi_coding_r_range(screen_y_range, "screen_y_range")
+                ),
+                tie_method,
+                outside_label,
+                ambiguous_label,
+                missing_label,
+                ", ".join(outside_values),
+                f"{max_mismatch_prop:g}",
+                f"{max_ambiguous_prop:g}",
+                f"{max_missing_coordinate_prop:g}",
+                "TRUE" if bool(ignore_invalid_geometry) else "FALSE",
+            ],
+        }
+    )
+    return {
+        "overview": overview,
+        "geometry_summary": geometry_summary,
+        "sample_coding": sample_coding,
+        "coding_matrix": coding_matrix,
+        "observed_summary": observed_summary,
+        "derived_summary": derived_summary,
+        "flagged_samples": flagged_samples,
+        "settings": settings,
+        "_gp3_class": "gp3_aoi_coding_matrix_audit",
+    }
 
 
 def audit_gazepoint_aoi_margin_sensitivity(
