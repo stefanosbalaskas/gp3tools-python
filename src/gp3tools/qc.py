@@ -1762,31 +1762,741 @@ def audit_gazepoint_condition_quality_imbalance(data, condition_col=None, **kwar
 
 
 def audit_gazepoint_post_exclusion_balance(
-    data, excluded_col: str = "excluded", group_cols=("condition",)
-) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    cols = [c for c in group_cols if c in df]
-    if excluded_col in df:
-        retained = df.loc[~as_bool(df[excluded_col])]
+    data,
+    excluded_col: str = "excluded",
+    group_cols=("condition",),
+    *,
+    subject_col=_GP3_QC_R_UNSET,
+    condition_col=_GP3_QC_R_UNSET,
+    unit_cols=_GP3_QC_R_UNSET,
+    retained_col=_GP3_QC_R_UNSET,
+    include_col=_GP3_QC_R_UNSET,
+    exclude_col=_GP3_QC_R_UNSET,
+    status_col=_GP3_QC_R_UNSET,
+    expected_conditions=_GP3_QC_R_UNSET,
+    included_values=_GP3_QC_R_UNSET,
+    excluded_values=_GP3_QC_R_UNSET,
+    min_retained_units_per_condition=_GP3_QC_R_UNSET,
+    min_retained_units_per_subject_condition=_GP3_QC_R_UNSET,
+    max_condition_count_ratio=_GP3_QC_R_UNSET,
+    max_subject_condition_ratio=_GP3_QC_R_UNSET,
+    require_all_conditions_per_subject=_GP3_QC_R_UNSET,
+):
+    r_mode = any(
+        v is not _GP3_QC_R_UNSET
+        for v in (
+            subject_col,
+            condition_col,
+            unit_cols,
+            retained_col,
+            include_col,
+            exclude_col,
+            status_col,
+            expected_conditions,
+            included_values,
+            excluded_values,
+            min_retained_units_per_condition,
+            min_retained_units_per_subject_condition,
+            max_condition_count_ratio,
+            max_subject_condition_ratio,
+            require_all_conditions_per_subject,
+        )
+    )
+    if not r_mode:
+        df = ensure_dataframe(data, copy=False)
+        cols = [c for c in group_cols if c in df]
+        retained = df.loc[~as_bool(df[excluded_col])] if excluded_col in df else df
+        return (
+            retained.groupby(cols, dropna=False).size().rename("n_retained").reset_index()
+            if cols
+            else result_table(n_retained=len(retained))
+        )
+    df = _gp3_exclusion_r_aliases(ensure_dataframe(data))
+    if df.empty:
+        raise ValueError("data must contain at least one row")
+    subject_col = _gp3_exclusion_r_col(
+        df, "subject" if subject_col is _GP3_QC_R_UNSET else subject_col, "subject_col"
+    )
+    condition_col = _gp3_exclusion_r_col(
+        df, "condition" if condition_col is _GP3_QC_R_UNSET else condition_col, "condition_col"
+    )
+    raw_units = (
+        ("media_id", "trial_global")
+        if unit_cols is _GP3_QC_R_UNSET
+        else (
+            () if unit_cols is None else ([unit_cols] if isinstance(unit_cols, str) else unit_cols)
+        )
+    )
+    unit_cols = [
+        {"MEDIA_ID": "media_id", "USER_FILE": "subject"}.get(c, c)
+        for c in raw_units
+        if {"MEDIA_ID": "media_id", "USER_FILE": "subject"}.get(c, c) in df
+    ]
+    retained_col = _gp3_exclusion_r_col(
+        df, None if retained_col is _GP3_QC_R_UNSET else retained_col, "retained_col", optional=True
+    )
+    include_col = _gp3_exclusion_r_col(
+        df, None if include_col is _GP3_QC_R_UNSET else include_col, "include_col", optional=True
+    )
+    exclude_col_r = _gp3_exclusion_r_col(
+        df, None if exclude_col is _GP3_QC_R_UNSET else exclude_col, "exclude_col", optional=True
+    )
+    status_col = _gp3_exclusion_r_col(
+        df, None if status_col is _GP3_QC_R_UNSET else status_col, "status_col", optional=True
+    )
+    included_values = (
+        ["included", "include", "kept", "keep", "retained", "ok", "ready", "complete", "completed"]
+        if included_values is _GP3_QC_R_UNSET
+        else list(included_values)
+    )
+    excluded_values = (
+        [
+            "excluded",
+            "exclude",
+            "drop",
+            "dropped",
+            "removed",
+            "fail",
+            "failed",
+            "not_ready",
+            "review",
+            "invalid",
+        ]
+        if excluded_values is _GP3_QC_R_UNSET
+        else list(excluded_values)
+    )
+    min_cond = (
+        1
+        if min_retained_units_per_condition is _GP3_QC_R_UNSET
+        else int(min_retained_units_per_condition)
+    )
+    min_cell = (
+        1
+        if min_retained_units_per_subject_condition is _GP3_QC_R_UNSET
+        else int(min_retained_units_per_subject_condition)
+    )
+    max_cond = (
+        2.0 if max_condition_count_ratio is _GP3_QC_R_UNSET else float(max_condition_count_ratio)
+    )
+    max_subj = (
+        2.0
+        if max_subject_condition_ratio is _GP3_QC_R_UNSET
+        else float(max_subject_condition_ratio)
+    )
+    require_all = (
+        True
+        if require_all_conditions_per_subject is _GP3_QC_R_UNSET
+        else bool(require_all_conditions_per_subject)
+    )
+    if min_cond <= 0 or min_cell <= 0 or max_cond <= 0 or max_subj <= 0:
+        raise ValueError("post-exclusion thresholds must be positive")
+    df = df.loc[
+        df[subject_col].notna()
+        & df[condition_col].notna()
+        & df[subject_col].astype(str).ne("")
+        & df[condition_col].astype(str).ne("")
+    ].copy()
+    if df.empty:
+        raise ValueError("subject_col and condition_col must define at least one usable row")
+    if all(x is None for x in (retained_col, include_col, exclude_col_r, status_col)):
+        flags = pd.Series(True, index=df.index, dtype="boolean")
     else:
-        retained = df
-    return (
-        retained.groupby(cols, dropna=False).size().rename("n_retained").reset_index()
-        if cols
-        else result_table(n_retained=len(retained))
+        flags = pd.Series(pd.NA, index=df.index, dtype="boolean")
+    if retained_col is not None:
+        flags = _gp3_exclusion_r_bool(df[retained_col], "retained_col")
+        flags.index = df.index
+    if include_col is not None:
+        flags = _gp3_exclusion_r_bool(df[include_col], "include_col")
+        flags.index = df.index
+    if exclude_col_r is not None:
+        ex = _gp3_exclusion_r_bool(df[exclude_col_r], "exclude_col")
+        ex.index = df.index
+        flags.loc[ex.notna()] = (~ex.loc[ex.notna()]).to_numpy()
+    if status_col is not None:
+        text = df[status_col].astype("string").str.lower()
+        st = pd.Series(pd.NA, index=df.index, dtype="boolean")
+        st.loc[text.isin({str(x).lower() for x in included_values})] = True
+        st.loc[text.isin({str(x).lower() for x in excluded_values})] = False
+        flags.loc[st.notna()] = st.loc[st.notna()].to_numpy()
+    units = _gp3_exclusion_r_units(
+        df, flags, subject_col, condition_col, unit_cols, status_name="post_exclusion_unit_status"
+    )
+    observed = sorted(df[condition_col].astype(str).unique())
+    conditions = (
+        observed
+        if expected_conditions is _GP3_QC_R_UNSET or expected_conditions is None
+        else list(expected_conditions)
+    )
+    subjects = sorted(units[subject_col].astype(str).unique())
+    rows = []
+    for subj in subjects:
+        for cond in conditions:
+            g = units.loc[
+                units[subject_col].astype(str).eq(str(subj))
+                & units[condition_col].astype(str).eq(str(cond))
+            ]
+            total = len(g)
+            nr = int(g["retained"].sum()) if total else 0
+            status = (
+                "missing_retained_condition"
+                if nr == 0
+                else ("too_few_retained_units" if nr < min_cell else "ok")
+            )
+            rows.append(
+                {
+                    subject_col: subj,
+                    condition_col: cond,
+                    "n_total_units": total,
+                    "n_retained_units": nr,
+                    "retained_prop": nr / total if total else np.nan,
+                    "post_exclusion_cell_status": status,
+                }
+            )
+    cells = pd.DataFrame(rows)
+    cond_rows = []
+    for cond, g in cells.groupby(condition_col, sort=True):
+        total = int(g["n_total_units"].sum())
+        nr = int(g["n_retained_units"].sum())
+        cond_rows.append(
+            {
+                condition_col: cond,
+                "n_subject_cells": len(g),
+                "n_subjects_with_retained": int((g["n_retained_units"] > 0).sum()),
+                "n_subjects_missing_retained": int((g["n_retained_units"] == 0).sum()),
+                "total_units": total,
+                "total_retained_units": nr,
+                "retained_prop": nr / total if total else np.nan,
+                "min_retained_units_per_subject": int(g["n_retained_units"].min()),
+                "max_retained_units_per_subject": int(g["n_retained_units"].max()),
+                "mean_retained_units_per_subject": float(g["n_retained_units"].mean()),
+                "post_exclusion_condition_status": "too_few_retained_units"
+                if nr < min_cond
+                else "ok",
+            }
+        )
+    condition_summary = pd.DataFrame(cond_rows)
+    subj_rows = []
+    for subj, g in cells.groupby(subject_col, sort=True):
+        counts = g["n_retained_units"].to_numpy(int)
+        nonzero = counts[counts > 0]
+        missing = int((counts == 0).sum())
+        low = int((g["post_exclusion_cell_status"] == "too_few_retained_units").sum())
+        ratio = np.nan if len(nonzero) <= 1 else float(nonzero.max() / nonzero.min())
+        status = (
+            "missing_retained_condition"
+            if require_all and missing > 0
+            else (
+                "too_few_retained_units"
+                if low > 0
+                else (
+                    "retained_condition_imbalance"
+                    if np.isfinite(ratio) and ratio > max_subj
+                    else "ok"
+                )
+            )
+        )
+        subj_rows.append(
+            {
+                subject_col: subj,
+                "n_conditions_expected": len(conditions),
+                "n_conditions_with_retained": int((counts > 0).sum()),
+                "total_retained_units": int(counts.sum()),
+                "min_retained_units_per_condition": int(nonzero.min()) if len(nonzero) else np.nan,
+                "max_retained_units_per_condition": int(nonzero.max()) if len(nonzero) else np.nan,
+                "retained_condition_ratio": ratio,
+                "n_missing_retained_conditions": missing,
+                "n_low_retained_conditions": low,
+                "post_exclusion_subject_status": status,
+            }
+        )
+    subject_summary = pd.DataFrame(subj_rows)
+    flagged_cells = cells.loc[cells["post_exclusion_cell_status"].ne("ok")].copy()
+    flagged_subjects = subject_summary.loc[
+        subject_summary["post_exclusion_subject_status"].ne("ok")
+    ].copy()
+    count_ratio = _gp3_exclusion_r_ratio(
+        condition_summary["total_retained_units"], zero_returns_one=False
+    )
+    ratio_status = (
+        "condition_count_imbalance"
+        if np.isinf(count_ratio) or (np.isfinite(count_ratio) and count_ratio > max_cond)
+        else "ok"
+    )
+    problem = int(
+        units["post_exclusion_unit_status"].isin(["conflicting_flags", "unclear_status"]).sum()
+    )
+    retained_n = int(units["retained"].sum())
+    flagged_cond = int(condition_summary["post_exclusion_condition_status"].ne("ok").sum())
+    review = (
+        problem > 0
+        or len(flagged_cells) > 0
+        or len(flagged_subjects) > 0
+        or flagged_cond > 0
+        or ratio_status != "ok"
+    )
+    overview = pd.DataFrame(
+        [
+            {
+                "n_rows": len(df),
+                "n_units": len(units),
+                "n_retained_units": retained_n,
+                "n_excluded_units": len(units) - retained_n,
+                "retained_prop": retained_n / len(units),
+                "n_subjects": len(subjects),
+                "n_conditions": len(conditions),
+                "n_problem_units": problem,
+                "n_flagged_cells": len(flagged_cells),
+                "n_flagged_subjects": len(flagged_subjects),
+                "n_flagged_conditions": flagged_cond,
+                "condition_count_ratio": count_ratio,
+                "condition_ratio_status": ratio_status,
+                "post_exclusion_balance_status": "review" if review else "ok",
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "subject_col",
+                "condition_col",
+                "unit_cols",
+                "retained_col",
+                "include_col",
+                "exclude_col",
+                "status_col",
+                "expected_conditions",
+                "included_values",
+                "excluded_values",
+                "min_retained_units_per_condition",
+                "min_retained_units_per_subject_condition",
+                "max_condition_count_ratio",
+                "max_subject_condition_ratio",
+                "require_all_conditions_per_subject",
+            ],
+            "value": [
+                subject_col,
+                condition_col,
+                ", ".join(unit_cols),
+                retained_col,
+                include_col,
+                exclude_col_r,
+                status_col,
+                None if expected_conditions is _GP3_QC_R_UNSET else ", ".join(conditions),
+                ", ".join(included_values),
+                ", ".join(excluded_values),
+                str(min_cond),
+                str(min_cell),
+                str(max_cond),
+                str(max_subj),
+                str(require_all),
+            ],
+        }
+    )
+    return {
+        "overview": overview,
+        "unit_flow": units,
+        "cell_summary": cells,
+        "condition_summary": condition_summary,
+        "subject_summary": subject_summary,
+        "flagged_cells": flagged_cells,
+        "flagged_subjects": flagged_subjects,
+        "settings": settings,
+    }
+
+
+def _gp3_exclusion_r_bool(values, arg):
+    ser = pd.Series(values)
+    out = pd.Series(pd.NA, index=ser.index, dtype="boolean")
+    if pd.api.types.is_bool_dtype(ser.dtype):
+        return ser.astype("boolean")
+    if pd.api.types.is_numeric_dtype(ser.dtype):
+        num = pd.to_numeric(ser, errors="coerce")
+        bad = num.notna() & ~num.isin([0, 1])
+        if bad.any():
+            raise ValueError(f"{arg} numeric values must be 0, 1, or missing")
+        out.loc[num.eq(1)] = True
+        out.loc[num.eq(0)] = False
+        return out
+    text = ser.astype("string").str.strip().str.lower()
+    true_values = {
+        "true",
+        "t",
+        "yes",
+        "y",
+        "1",
+        "included",
+        "include",
+        "keep",
+        "kept",
+        "retained",
+        "ok",
+        "ready",
+    }
+    false_values = {
+        "false",
+        "f",
+        "no",
+        "n",
+        "0",
+        "excluded",
+        "exclude",
+        "drop",
+        "dropped",
+        "removed",
+        "fail",
+        "failed",
+        "not_ready",
+        "review",
+    }
+    out.loc[text.isin(true_values)] = True
+    out.loc[text.isin(false_values)] = False
+    bad = text.notna() & text.ne("") & out.isna()
+    if bad.any():
+        raise ValueError(
+            f"{arg} character values must be interpretable as inclusion/exclusion flags"
+        )
+    return out
+
+
+def _gp3_exclusion_r_aliases(df):
+    out = df.copy()
+    if "MEDIA_ID" in out and "media_id" not in out:
+        out["media_id"] = out["MEDIA_ID"]
+    if "USER_FILE" in out and "subject" not in out:
+        out["subject"] = out["USER_FILE"]
+    return out
+
+
+def _gp3_exclusion_r_col(df, col, arg, optional=False):
+    if col is None and optional:
+        return None
+    if not isinstance(col, str) or not col:
+        raise ValueError(f"{arg} must be a non-empty string")
+    alias = {"MEDIA_ID": "media_id", "USER_FILE": "subject"}.get(col, col)
+    if alias not in df:
+        raise KeyError(f"{arg} must be present in data")
+    return alias
+
+
+def _gp3_exclusion_r_units(
+    df,
+    flags,
+    subject_col,
+    condition_col,
+    unit_cols,
+    reason=None,
+    status_name="exclusion_flow_status",
+):
+    work = df.copy()
+    work["__flag"] = flags.to_numpy()
+    if reason is not None:
+        work["__reason"] = reason.to_numpy()
+    ids = []
+    for col in [subject_col, condition_col, *unit_cols]:
+        if col is not None and col in work and col not in ids:
+            ids.append(col)
+    if not ids:
+        work["__unit_id"] = np.arange(len(work))
+        ids = ["__unit_id"]
+    rows = []
+    for _, part in work.groupby(ids, dropna=False, sort=True):
+        vals = part["__flag"].astype("boolean")
+        any_true = bool(vals.fillna(False).any())
+        any_false = bool((~vals.fillna(True)).any())
+        all_unknown = bool(vals.isna().all())
+        if all_unknown:
+            status = "unclear_status"
+        elif any_true and any_false:
+            status = "conflicting_flags"
+        elif any_false:
+            status = "excluded"
+        elif any_true:
+            status = "retained"
+        else:
+            status = "unclear_status"
+        row = {c: part.iloc[0][c] for c in ids if c != "__unit_id"}
+        row.update(
+            {"n_source_rows": len(part), "retained": status == "retained", status_name: status}
+        )
+        if reason is not None:
+            reasons = sorted({str(x) for x in part["__reason"].dropna() if str(x)})
+            if not reasons:
+                reasons = [
+                    {
+                        "retained": "retained",
+                        "conflicting_flags": "conflicting_flags",
+                        "unclear_status": "unclear_status",
+                    }.get(status, "excluded_unspecified")
+                ]
+            row["exclusion_reason"] = "; ".join(reasons)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _gp3_exclusion_r_ratio(values, zero_returns_one=False):
+    vals = pd.to_numeric(pd.Series(values), errors="coerce").dropna().to_numpy(float)
+    if len(vals) <= 1:
+        return np.nan
+    if np.all(vals == 0):
+        return 1.0 if zero_returns_one else np.nan
+    positive = vals[vals > 0]
+    if len(positive) == 0:
+        return 1.0 if zero_returns_one else np.nan
+    if np.any(vals == 0):
+        return np.inf
+    return float(np.max(positive) / np.min(positive))
+
+
+def audit_gazepoint_exclusion_flow(
+    data,
+    stages: list[str] | None = None,
+    *,
+    subject_col=_GP3_QC_R_UNSET,
+    condition_col=_GP3_QC_R_UNSET,
+    unit_cols=_GP3_QC_R_UNSET,
+    include_col=_GP3_QC_R_UNSET,
+    exclude_col=_GP3_QC_R_UNSET,
+    status_col=_GP3_QC_R_UNSET,
+    reason_col=_GP3_QC_R_UNSET,
+    included_values=_GP3_QC_R_UNSET,
+    excluded_values=_GP3_QC_R_UNSET,
+    min_retained_prop=_GP3_QC_R_UNSET,
+    max_condition_exclusion_ratio=_GP3_QC_R_UNSET,
+):
+    r_mode = any(
+        v is not _GP3_QC_R_UNSET
+        for v in (
+            subject_col,
+            condition_col,
+            unit_cols,
+            include_col,
+            exclude_col,
+            status_col,
+            reason_col,
+            included_values,
+            excluded_values,
+            min_retained_prop,
+            max_condition_exclusion_ratio,
+        )
+    )
+    if not r_mode:
+        df = ensure_dataframe(data, copy=False)
+        if stages is None:
+            stages = [
+                c for c in df.columns if c.lower().startswith(("exclude", "flag_", "excluded"))
+            ]
+        rows = [{"stage": "input", "n": len(df)}]
+        current = pd.Series(True, index=df.index)
+        for stage in stages:
+            current &= ~as_bool(df[stage])
+            rows.append({"stage": stage, "n": int(current.sum())})
+        return pd.DataFrame(rows)
+    df = _gp3_exclusion_r_aliases(ensure_dataframe(data))
+    if df.empty:
+        raise ValueError("data must contain at least one row")
+    subject_col = _gp3_exclusion_r_col(
+        df, "subject" if subject_col is _GP3_QC_R_UNSET else subject_col, "subject_col"
+    )
+    condition_col = _gp3_exclusion_r_col(
+        df,
+        None if condition_col is _GP3_QC_R_UNSET else condition_col,
+        "condition_col",
+        optional=True,
+    )
+    raw_units = (
+        ("media_id", "trial_global")
+        if unit_cols is _GP3_QC_R_UNSET
+        else (
+            () if unit_cols is None else ([unit_cols] if isinstance(unit_cols, str) else unit_cols)
+        )
+    )
+    unit_cols = [
+        {"MEDIA_ID": "media_id", "USER_FILE": "subject"}.get(c, c)
+        for c in raw_units
+        if {"MEDIA_ID": "media_id", "USER_FILE": "subject"}.get(c, c) in df
+    ]
+    include_col = _gp3_exclusion_r_col(
+        df, None if include_col is _GP3_QC_R_UNSET else include_col, "include_col", optional=True
+    )
+    exclude_col = _gp3_exclusion_r_col(
+        df, None if exclude_col is _GP3_QC_R_UNSET else exclude_col, "exclude_col", optional=True
+    )
+    status_col = _gp3_exclusion_r_col(
+        df, None if status_col is _GP3_QC_R_UNSET else status_col, "status_col", optional=True
+    )
+    reason_col = _gp3_exclusion_r_col(
+        df, None if reason_col is _GP3_QC_R_UNSET else reason_col, "reason_col", optional=True
+    )
+    if include_col is None and exclude_col is None and status_col is None:
+        raise ValueError("One of include_col, exclude_col, or status_col must be supplied")
+    included_values = (
+        ["included", "include", "kept", "keep", "retained", "ok", "ready", "complete", "completed"]
+        if included_values is _GP3_QC_R_UNSET
+        else list(included_values)
+    )
+    excluded_values = (
+        [
+            "excluded",
+            "exclude",
+            "drop",
+            "dropped",
+            "removed",
+            "fail",
+            "failed",
+            "not_ready",
+            "review",
+            "invalid",
+        ]
+        if excluded_values is _GP3_QC_R_UNSET
+        else list(excluded_values)
+    )
+    min_retained_prop = 0.70 if min_retained_prop is _GP3_QC_R_UNSET else float(min_retained_prop)
+    max_condition_exclusion_ratio = (
+        2.0
+        if max_condition_exclusion_ratio is _GP3_QC_R_UNSET
+        else float(max_condition_exclusion_ratio)
+    )
+    if (
+        not 0 < min_retained_prop <= 1
+        or not np.isfinite(max_condition_exclusion_ratio)
+        or max_condition_exclusion_ratio <= 0
+    ):
+        raise ValueError("retention thresholds must be positive and min_retained_prop <= 1")
+    flags = pd.Series(pd.NA, index=df.index, dtype="boolean")
+    if include_col is not None:
+        flags = _gp3_exclusion_r_bool(df[include_col], "include_col")
+    if exclude_col is not None:
+        ex = _gp3_exclusion_r_bool(df[exclude_col], "exclude_col")
+        flags.loc[ex.notna()] = (~ex.loc[ex.notna()]).to_numpy()
+    if status_col is not None:
+        text = df[status_col].astype("string").str.lower()
+        st = pd.Series(pd.NA, index=df.index, dtype="boolean")
+        st.loc[text.isin({str(x).lower() for x in included_values})] = True
+        st.loc[text.isin({str(x).lower() for x in excluded_values})] = False
+        flags.loc[st.notna()] = st.loc[st.notna()].to_numpy()
+    reason = (
+        pd.Series(pd.NA, index=df.index, dtype="string")
+        if reason_col is None
+        else df[reason_col].astype("string").replace("", pd.NA)
+    )
+    units = _gp3_exclusion_r_units(df, flags, subject_col, condition_col, unit_cols, reason=reason)
+    excluded_units = units.loc[units["exclusion_flow_status"].ne("retained")].copy()
+    reasons = []
+    for value in excluded_units.get("exclusion_reason", pd.Series(dtype=str)).dropna():
+        reasons.extend([x for x in str(value).split("; ") if x])
+    reason_summary = (
+        pd.Series(reasons, dtype="string")
+        .value_counts()
+        .rename_axis("exclusion_reason")
+        .reset_index(name="n_units")
+        if reasons
+        else pd.DataFrame(columns=["exclusion_reason", "n_units"])
+    )
+    reason_summary["reason_prop"] = (
+        reason_summary["n_units"] / len(excluded_units)
+        if len(excluded_units)
+        else pd.Series(dtype=float)
     )
 
+    def summary(col, status_col_name):
+        if col is None:
+            return pd.DataFrame(
+                columns=[
+                    "condition" if status_col_name.startswith("condition") else "subject",
+                    "n_units",
+                    "n_retained_units",
+                    "n_excluded_units",
+                    "retained_prop",
+                    "excluded_prop",
+                    status_col_name,
+                ]
+            )
+        rows = []
+        for key, g in units.groupby(col, dropna=False, sort=True):
+            nr = int(g["retained"].sum())
+            prop = nr / len(g)
+            rows.append(
+                {
+                    col: key,
+                    "n_units": len(g),
+                    "n_retained_units": nr,
+                    "n_excluded_units": len(g) - nr,
+                    "retained_prop": prop,
+                    "excluded_prop": 1 - prop,
+                    status_col_name: "low_retention" if prop < min_retained_prop else "ok",
+                }
+            )
+        return pd.DataFrame(rows)
 
-def audit_gazepoint_exclusion_flow(data, stages: list[str] | None = None) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    if stages is None:
-        stages = [c for c in df.columns if c.lower().startswith(("exclude", "flag_", "excluded"))]
-    rows = [{"stage": "input", "n": len(df)}]
-    current = pd.Series(True, index=df.index)
-    for stage in stages:
-        current &= ~as_bool(df[stage])
-        rows.append({"stage": stage, "n": int(current.sum())})
-    return pd.DataFrame(rows)
+    condition_summary = summary(condition_col, "condition_exclusion_status")
+    subject_summary = summary(subject_col, "subject_exclusion_status")
+    ratio = _gp3_exclusion_r_ratio(
+        condition_summary.get("excluded_prop", []), zero_returns_one=True
+    )
+    retained_n = int(units["retained"].sum())
+    retained_prop = retained_n / len(units)
+    review = (
+        units["exclusion_flow_status"].isin(["conflicting_flags", "unclear_status"]).any()
+        or retained_prop < min_retained_prop
+        or (np.isfinite(ratio) and ratio > max_condition_exclusion_ratio)
+        or np.isinf(ratio)
+    )
+    overview = pd.DataFrame(
+        [
+            {
+                "n_rows": len(df),
+                "n_units": len(units),
+                "n_subjects": units[subject_col].nunique(dropna=False),
+                "n_retained_units": retained_n,
+                "n_excluded_units": len(units) - retained_n,
+                "retained_prop": retained_prop,
+                "excluded_prop": 1 - retained_prop,
+                "n_flagged_units": len(excluded_units),
+                "n_exclusion_reasons": len(reason_summary),
+                "condition_exclusion_ratio": ratio,
+                "exclusion_flow_status": "review" if review else "ok",
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "subject_col",
+                "condition_col",
+                "unit_cols",
+                "include_col",
+                "exclude_col",
+                "status_col",
+                "reason_col",
+                "included_values",
+                "excluded_values",
+                "min_retained_prop",
+                "max_condition_exclusion_ratio",
+            ],
+            "value": [
+                subject_col,
+                condition_col,
+                ", ".join(unit_cols),
+                include_col,
+                exclude_col,
+                status_col,
+                reason_col,
+                ", ".join(included_values),
+                ", ".join(excluded_values),
+                str(min_retained_prop),
+                str(max_condition_exclusion_ratio),
+            ],
+        }
+    )
+    return {
+        "overview": overview,
+        "unit_flow": units,
+        "reason_summary": reason_summary,
+        "condition_summary": condition_summary,
+        "subject_summary": subject_summary,
+        "flagged_units": excluded_units,
+        "settings": settings,
+    }
 
 
 def check_gazepoint_file_pairs(
