@@ -906,9 +906,85 @@ def summarise_tracking_quality(
     return out
 
 
-def flag_tracking_quality(data, min_usable_prop: float = 0.8, **kwargs) -> pd.DataFrame:
-    out = summarise_tracking_quality(data, **kwargs)
-    out["quality_flag"] = np.where(out["usable_prop"] >= min_usable_prop, "pass", "flag")
+def flag_tracking_quality(
+    quality=None,
+    sampling=None,
+    by=("USER_FILE", "MEDIA_ID"),
+    min_gaze_valid_pct=70,
+    min_pupil_valid_pct=70,
+    expected_hz=60,
+    hz_tolerance=5,
+    min_duration_sec=None,
+    **kwargs,
+) -> pd.DataFrame:
+    """Flag low-quality Gazepoint recordings with R v2.3.0 semantics."""
+    import numpy as np
+    import pandas as pd
+
+    # Backward-compatible raw-data path.
+    if sampling is None:
+        data = quality
+        min_usable_prop = kwargs.pop("min_usable_prop", 0.8)
+        if kwargs:
+            return summarise_tracking_quality(data, **kwargs).assign(
+                quality_flag=lambda x: np.where(x["usable_prop"] >= min_usable_prop, "pass", "flag")
+            )
+        out = summarise_tracking_quality(data)
+        out["quality_flag"] = np.where(out["usable_prop"] >= min_usable_prop, "pass", "flag")
+        return out
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+    if not isinstance(quality, pd.DataFrame):
+        raise ValueError("`quality` must be a data frame or tibble.")
+    if not isinstance(sampling, pd.DataFrame):
+        raise ValueError("`sampling` must be a data frame or tibble.")
+    by_cols = [by] if isinstance(by, str) else list(by)
+    missing_quality = [c for c in by_cols if c not in quality.columns]
+    missing_sampling = [c for c in by_cols if c not in sampling.columns]
+    if missing_quality:
+        raise ValueError("Missing join columns in `quality`: " + ", ".join(missing_quality))
+    if missing_sampling:
+        raise ValueError("Missing join columns in `sampling`: " + ", ".join(missing_sampling))
+    if "FPOGV_valid_pct" not in quality.columns:
+        raise ValueError("Missing required quality columns: FPOGV_valid_pct")
+    required_sampling = [c for c in ("estimated_hz", "duration_sec") if c not in sampling.columns]
+    if required_sampling:
+        raise ValueError("Missing required sampling columns: " + ", ".join(required_sampling))
+
+    out = quality.merge(sampling, on=by_cols, how="left", sort=False)
+    pupil_cols = [
+        c
+        for c in ("LPV_valid_pct", "RPV_valid_pct", "LPMMV_valid_pct", "RPMMV_valid_pct")
+        if c in out.columns
+    ]
+    if pupil_cols:
+        values = out[pupil_cols].apply(pd.to_numeric, errors="coerce")
+        out["min_pupil_valid_pct_observed"] = values.min(axis=1, skipna=True)
+    else:
+        out["min_pupil_valid_pct_observed"] = np.nan
+    out["flag_low_gaze_validity"] = (
+        pd.to_numeric(out["FPOGV_valid_pct"], errors="coerce") < min_gaze_valid_pct
+    )
+    out["flag_low_pupil_validity"] = (
+        pd.to_numeric(out["min_pupil_valid_pct_observed"], errors="coerce") < min_pupil_valid_pct
+    )
+    out["flag_sampling_rate"] = (
+        pd.to_numeric(out["estimated_hz"], errors="coerce") - expected_hz
+    ).abs() > hz_tolerance
+    if min_duration_sec is None:
+        out["flag_short_duration"] = False
+    else:
+        out["flag_short_duration"] = (
+            pd.to_numeric(out["duration_sec"], errors="coerce") < min_duration_sec
+        )
+    out["review_required"] = (
+        out["flag_low_gaze_validity"]
+        | out["flag_low_pupil_validity"]
+        | out["flag_sampling_rate"]
+        | out["flag_short_duration"]
+    )
     return out
 
 
@@ -4040,107 +4116,505 @@ def recommend_gazepoint_exclusions(
     data,
     participant_col=None,
     trial_col=None,
+    condition_col=None,
     validity_col=None,
     x_col=None,
     y_col=None,
     pupil_col=None,
     artifact_col=None,
-    min_trial_samples: int = 20,
-    max_trial_missing_prop: float = 0.5,
-    max_trial_artifact_prop: float = 0.5,
-    min_participant_trials: int = 1,
-    min_participant_valid_trials: int = 1,
-    max_participant_missing_prop: float = 0.5,
-    max_participant_artifact_prop: float = 0.5,
-    require_both_gaze_coordinates: bool = True,
-    name: str = "gazepoint_exclusions",
+    min_trial_samples=10,
+    max_trial_missing_prop=0.5,
+    max_trial_artifact_prop=0.5,
+    min_participant_trials=2,
+    min_participant_valid_trials=1,
+    max_participant_missing_prop=0.5,
+    max_participant_artifact_prop=0.5,
+    require_both_gaze_coordinates=True,
+    name="gazepoint_exclusion_recommendations",
     **kwargs,
 ) -> dict[str, Any]:
-    """Recommend exclusions without removing rows."""
-    df = ensure_dataframe(data, copy=False)
-    participant_col = infer_column(df, "subject", participant_col, required=True)
-    trial_col = infer_column(df, "trial", trial_col) or "__gp3_trial"
-    work = df.copy()
-    if trial_col == "__gp3_trial":
-        work[trial_col] = 1
-    validity_col = infer_column(work, "validity", validity_col)
-    x_col, y_col = infer_column(work, "x", x_col), infer_column(work, "y", y_col)
-    pupil_col = infer_column(work, "pupil", pupil_col)
-    usable = pd.Series(True, index=work.index)
-    if validity_col:
-        usable &= as_bool(work[validity_col], invert_trackloss=validity_col.lower() == "trackloss")
-    coords = pd.Series(True, index=work.index)
-    if x_col:
-        coords &= finite_numeric(work[x_col]).notna()
-    if y_col:
-        coords &= finite_numeric(work[y_col]).notna()
-    if require_both_gaze_coordinates:
-        usable &= coords
-    if pupil_col:
-        usable &= finite_numeric(work[pupil_col]).notna()
-    artifact = (
-        as_bool(work[artifact_col])
-        if artifact_col and artifact_col in work
-        else pd.Series(False, index=work.index)
-    )
-    work = work.assign(_usable=usable, _artifact=artifact)
-    trial = (
-        work.groupby([participant_col, trial_col], dropna=False)
-        .agg(
-            n_samples=("_usable", "size"),
-            usable_prop=("_usable", "mean"),
-            artifact_prop=("_artifact", "mean"),
+    """Recommend trial and participant exclusions without removing rows."""
+    import numpy as np
+    import pandas as pd
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+    if not isinstance(data, pd.DataFrame):
+        raise ValueError("`data` must be a data frame.")
+    if len(data) == 0:
+        raise ValueError("`data` must contain at least one row.")
+
+    if participant_col is None:
+        # Historical Python convenience mode: infer participant/trial/quality
+        # roles and preserve the legacy result keys.
+        inferred_participant = infer_column(data, "subject", required=True)
+        inferred_trial = infer_column(data, "trial", trial_col) or "__gp3_trial"
+        work = data.copy()
+        if inferred_trial == "__gp3_trial":
+            work[inferred_trial] = 1
+        inferred_validity = infer_column(work, "validity", validity_col)
+        inferred_x = infer_column(work, "x", x_col)
+        inferred_y = infer_column(work, "y", y_col)
+        inferred_pupil = infer_column(work, "pupil", pupil_col)
+        usable = pd.Series(True, index=work.index)
+        if inferred_validity:
+            text = work[inferred_validity]
+            if inferred_validity.lower() == "trackloss":
+                usable &= ~as_bool(text)
+            else:
+                usable &= as_bool(text)
+        coords = pd.Series(True, index=work.index)
+        if inferred_x:
+            coords &= (
+                pd.to_numeric(work[inferred_x], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .notna()
+            )
+        if inferred_y:
+            coords &= (
+                pd.to_numeric(work[inferred_y], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .notna()
+            )
+        if require_both_gaze_coordinates:
+            usable &= coords
+        if inferred_pupil:
+            usable &= (
+                pd.to_numeric(work[inferred_pupil], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .notna()
+            )
+        artifact = (
+            as_bool(work[artifact_col])
+            if artifact_col and artifact_col in work
+            else pd.Series(False, index=work.index)
         )
-        .reset_index()
-    )
-    trial["exclude"] = (
-        (trial.n_samples < min_trial_samples)
-        | ((1 - trial.usable_prop) > max_trial_missing_prop)
-        | (trial.artifact_prop > max_trial_artifact_prop)
-    )
-    part = (
-        trial.groupby(participant_col, dropna=False)
-        .agg(n_trials=(trial_col, "size"), n_valid_trials=("exclude", lambda s: int((~s).sum())))
-        .reset_index()
-    )
-    sample = (
-        work.groupby(participant_col, dropna=False)
-        .agg(
-            missing_prop=("_usable", lambda s: float(1 - s.mean())),
-            artifact_prop=("_artifact", "mean"),
+        work = work.assign(_usable=usable, _artifact=artifact)
+        trial = (
+            work.groupby([inferred_participant, inferred_trial], dropna=False)
+            .agg(
+                n_samples=("_usable", "size"),
+                usable_prop=("_usable", "mean"),
+                artifact_prop=("_artifact", "mean"),
+            )
+            .reset_index()
         )
-        .reset_index()
-    )
-    part = part.merge(sample, on=participant_col, how="left")
-    part["exclude"] = (
-        (part.n_trials < min_participant_trials)
-        | (part.n_valid_trials < min_participant_valid_trials)
-        | (part.missing_prop > max_participant_missing_prop)
-        | (part.artifact_prop > max_participant_artifact_prop)
-    )
-    exclusion_table = pd.concat(
-        [
-            trial.loc[trial.exclude, [participant_col, trial_col]].assign(level="trial"),
-            part.loc[part.exclude, [participant_col]].assign(
-                **{trial_col: pd.NA}, level="participant"
+        trial["exclude"] = (
+            (trial.n_samples < min_trial_samples)
+            | ((1 - trial.usable_prop) > max_trial_missing_prop)
+            | (trial.artifact_prop > max_trial_artifact_prop)
+        )
+        part = (
+            trial.groupby(inferred_participant, dropna=False)
+            .agg(
+                n_trials=(inferred_trial, "size"),
+                n_valid_trials=("exclude", lambda x: int((~x).sum())),
+            )
+            .reset_index()
+        )
+        sample = (
+            work.groupby(inferred_participant, dropna=False)
+            .agg(
+                missing_prop=("_usable", lambda x: float(1 - x.mean())),
+                artifact_prop=("_artifact", "mean"),
+            )
+            .reset_index()
+        )
+        part = part.merge(sample, on=inferred_participant, how="left")
+        part["exclude"] = (
+            (part.n_trials < min_participant_trials)
+            | (part.n_valid_trials < min_participant_valid_trials)
+            | (part.missing_prop > max_participant_missing_prop)
+            | (part.artifact_prop > max_participant_artifact_prop)
+        )
+        exclusions = pd.concat(
+            [
+                trial.loc[trial.exclude, [inferred_participant, inferred_trial]].assign(
+                    level="trial"
+                ),
+                part.loc[part.exclude, [inferred_participant]].assign(
+                    **{inferred_trial: pd.NA}, level="participant"
+                ),
+            ],
+            ignore_index=True,
+        )
+        return {
+            "name": name,
+            "overview": pd.DataFrame(
+                [
+                    {
+                        "n_trial_exclusions": int(trial.exclude.sum()),
+                        "n_participant_exclusions": int(part.exclude.sum()),
+                    }
+                ]
             ),
-        ],
-        ignore_index=True,
+            "trial_recommendations": trial,
+            "participant_recommendations": part,
+            "exclusions": exclusions,
+            "settings": {
+                "min_trial_samples": min_trial_samples,
+                "max_trial_missing_prop": max_trial_missing_prop,
+            },
+        }
+
+    def check_col(col, arg):
+        if not isinstance(col, str) or not col:
+            raise ValueError(f"`{arg}` must be a non-missing character scalar.")
+        if col not in data.columns:
+            raise ValueError(f"`{arg}` must be present in `data`.")
+
+    check_col(participant_col, "participant_col")
+    for col, arg in (
+        (trial_col, "trial_col"),
+        (condition_col, "condition_col"),
+        (validity_col, "validity_col"),
+        (x_col, "x_col"),
+        (y_col, "y_col"),
+        (pupil_col, "pupil_col"),
+        (artifact_col, "artifact_col"),
+    ):
+        if col is not None:
+            check_col(col, arg)
+
+    if all(c is None for c in (validity_col, x_col, y_col, pupil_col, artifact_col)):
+        raise ValueError(
+            "Supply at least one quality indicator: `validity_col`, gaze columns, `pupil_col`, or `artifact_col`."
+        )
+    if require_both_gaze_coordinates and ((x_col is None) != (y_col is None)):
+        raise ValueError(
+            "When `require_both_gaze_coordinates = TRUE`, supply both `x_col` and `y_col` or neither."
+        )
+
+    def positive_int(value, arg):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value)
+            or value < 1
+            or int(value) != value
+        ):
+            raise ValueError(f"`{arg}` must be a positive integer.")
+
+    def proportion(value, arg):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value)
+            or not 0 <= value <= 1
+        ):
+            raise ValueError(f"`{arg}` must be a finite number between 0 and 1.")
+
+    for value, arg in (
+        (min_trial_samples, "min_trial_samples"),
+        (min_participant_trials, "min_participant_trials"),
+        (min_participant_valid_trials, "min_participant_valid_trials"),
+    ):
+        positive_int(value, arg)
+    for value, arg in (
+        (max_trial_missing_prop, "max_trial_missing_prop"),
+        (max_trial_artifact_prop, "max_trial_artifact_prop"),
+        (max_participant_missing_prop, "max_participant_missing_prop"),
+        (max_participant_artifact_prop, "max_participant_artifact_prop"),
+    ):
+        proportion(value, arg)
+    if not isinstance(require_both_gaze_coordinates, (bool, np.bool_)):
+        raise ValueError("`require_both_gaze_coordinates` must be TRUE or FALSE.")
+    if not isinstance(name, str) or not name:
+        raise ValueError("`name` must be a non-missing character scalar.")
+
+    def as_logical(series):
+        if pd.api.types.is_bool_dtype(series):
+            return series.astype("boolean")
+        if pd.api.types.is_numeric_dtype(series):
+            out = pd.Series(pd.NA, index=series.index, dtype="boolean")
+            out.loc[pd.to_numeric(series, errors="coerce").eq(1)] = True
+            out.loc[pd.to_numeric(series, errors="coerce").eq(0)] = False
+            return out
+        text = series.astype("string").str.strip().str.lower()
+        out = pd.Series(pd.NA, index=series.index, dtype="boolean")
+        out.loc[text.isin(["true", "t", "yes", "y", "1", "valid", "good"])] = True
+        out.loc[text.isin(["false", "f", "no", "n", "0", "invalid", "bad"])] = False
+        return out
+
+    def collapse_unique(series):
+        values = []
+        for value in series:
+            if pd.isna(value):
+                continue
+            text = str(value)
+            if text and text not in values:
+                values.append(text)
+        return ", ".join(values) if values else pd.NA
+
+    prepared = data.copy()
+    prepared[".gp3_excl_row_id"] = np.arange(1, len(prepared) + 1)
+    prepared[".gp3_participant"] = prepared[participant_col].astype("string")
+    prepared[".gp3_trial"] = (
+        prepared[trial_col].astype("string") if trial_col is not None else "all_trials"
     )
+    prepared[".gp3_condition"] = (
+        prepared[condition_col].astype("string")
+        if condition_col is not None
+        else pd.Series(pd.NA, index=prepared.index, dtype="string")
+    )
+
+    validity_missing = pd.Series(False, index=prepared.index)
+    if validity_col is not None:
+        logical = as_logical(prepared[validity_col])
+        validity_missing = logical.isna() | ~logical.fillna(False)
+
+    gaze_missing = pd.Series(False, index=prepared.index)
+    if x_col is not None and y_col is not None:
+        gx = pd.to_numeric(prepared[x_col], errors="coerce")
+        gy = pd.to_numeric(prepared[y_col], errors="coerce")
+        x_missing = ~np.isfinite(gx.to_numpy(float))
+        y_missing = ~np.isfinite(gy.to_numpy(float))
+        gaze_missing = pd.Series(
+            x_missing | y_missing if require_both_gaze_coordinates else x_missing & y_missing,
+            index=prepared.index,
+        )
+    elif x_col is not None:
+        gx = pd.to_numeric(prepared[x_col], errors="coerce")
+        gaze_missing = pd.Series(~np.isfinite(gx.to_numpy(float)), index=prepared.index)
+    elif y_col is not None:
+        gy = pd.to_numeric(prepared[y_col], errors="coerce")
+        gaze_missing = pd.Series(~np.isfinite(gy.to_numpy(float)), index=prepared.index)
+
+    pupil_missing = pd.Series(False, index=prepared.index)
+    if pupil_col is not None:
+        pv = pd.to_numeric(prepared[pupil_col], errors="coerce")
+        pupil_missing = pd.Series(~np.isfinite(pv.to_numpy(float)), index=prepared.index)
+
+    artifact = pd.Series(False, index=prepared.index)
+    if artifact_col is not None:
+        artifact = as_logical(prepared[artifact_col]).fillna(False).astype(bool)
+
+    prepared[".gp3_validity_missing"] = validity_missing.astype(bool)
+    prepared[".gp3_gaze_missing"] = gaze_missing.astype(bool)
+    prepared[".gp3_pupil_missing"] = pupil_missing.astype(bool)
+    prepared[".gp3_artifact"] = artifact.astype(bool)
+    prepared[".gp3_missing_or_unusable"] = (
+        prepared[".gp3_validity_missing"]
+        | prepared[".gp3_gaze_missing"]
+        | prepared[".gp3_pupil_missing"]
+    )
+    prepared[".gp3_usable_sample"] = (
+        ~prepared[".gp3_missing_or_unusable"] & ~prepared[".gp3_artifact"]
+    )
+
+    trial_rows = []
+    grouped = prepared.groupby([".gp3_participant", ".gp3_trial"], dropna=False, sort=True)
+    for (participant, trial), frame in grouped:
+        n_samples = len(frame)
+        n_missing = int(frame[".gp3_missing_or_unusable"].sum())
+        n_artifact = int(frame[".gp3_artifact"].sum())
+        reasons = []
+        if n_samples < min_trial_samples:
+            reasons.append("too_few_trial_samples")
+        missing_prop = n_missing / n_samples
+        artifact_prop = n_artifact / n_samples
+        if np.isfinite(missing_prop) and missing_prop > max_trial_missing_prop:
+            reasons.append("high_trial_missingness")
+        if np.isfinite(artifact_prop) and artifact_prop > max_trial_artifact_prop:
+            reasons.append("high_trial_artifact_rate")
+        reason = "; ".join(reasons)
+        trial_rows.append(
+            {
+                "participant": participant,
+                "trial": trial,
+                "condition": collapse_unique(frame[".gp3_condition"]),
+                "n_samples": n_samples,
+                "n_missing_or_unusable": n_missing,
+                "missing_or_unusable_prop": missing_prop,
+                "n_artifact": n_artifact,
+                "artifact_prop": artifact_prop,
+                "n_usable": int(frame[".gp3_usable_sample"].sum()),
+                "exclusion_reason": reason,
+                "recommend_exclude": bool(reason),
+                "recommendation_status": "exclude" if reason else "retain",
+            }
+        )
+    trial_recommendations = (
+        pd.DataFrame(trial_rows)
+        .sort_values(["participant", "trial"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+    participant_rows = []
+    for participant, frame in prepared.groupby(".gp3_participant", dropna=False, sort=True):
+        trial_frame = trial_recommendations.loc[
+            trial_recommendations["participant"].eq(participant)
+            if pd.notna(participant)
+            else trial_recommendations["participant"].isna()
+        ]
+        n_samples = len(frame)
+        n_missing = int(frame[".gp3_missing_or_unusable"].sum())
+        n_artifact = int(frame[".gp3_artifact"].sum())
+        n_trials = len(trial_frame)
+        n_trial_exclusions = int(trial_frame["recommend_exclude"].sum())
+        n_retained = int((~trial_frame["recommend_exclude"]).sum())
+        missing_prop = n_missing / n_samples
+        artifact_prop = n_artifact / n_samples
+        reasons = []
+        if n_trials < min_participant_trials:
+            reasons.append("too_few_participant_trials")
+        if n_retained < min_participant_valid_trials:
+            reasons.append("too_few_retained_trials")
+        if np.isfinite(missing_prop) and missing_prop > max_participant_missing_prop:
+            reasons.append("high_participant_missingness")
+        if np.isfinite(artifact_prop) and artifact_prop > max_participant_artifact_prop:
+            reasons.append("high_participant_artifact_rate")
+        reason = "; ".join(reasons)
+        participant_rows.append(
+            {
+                "participant": participant,
+                "conditions": collapse_unique(frame[".gp3_condition"]),
+                "n_samples": n_samples,
+                "n_missing_or_unusable": n_missing,
+                "missing_or_unusable_prop": missing_prop,
+                "n_artifact": n_artifact,
+                "artifact_prop": artifact_prop,
+                "n_usable": int(frame[".gp3_usable_sample"].sum()),
+                "n_trials": n_trials,
+                "n_trial_exclusions": n_trial_exclusions,
+                "n_retained_trials": n_retained,
+                "exclusion_reason": reason,
+                "recommend_exclude": bool(reason),
+                "recommendation_status": "exclude" if reason else "retain",
+            }
+        )
+    participant_recommendations = (
+        pd.DataFrame(participant_rows)
+        .sort_values(["participant"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+    trial_level = pd.DataFrame(
+        {
+            "exclusion_level": "trial",
+            "participant": trial_recommendations["participant"],
+            "trial": trial_recommendations["trial"] if trial_col is not None else pd.NA,
+            "condition": trial_recommendations["condition"],
+            "n_samples": trial_recommendations["n_samples"],
+            "n_trials": pd.Series([pd.NA] * len(trial_recommendations), dtype="Int64"),
+            "n_retained_trials": pd.Series([pd.NA] * len(trial_recommendations), dtype="Int64"),
+            "missing_or_unusable_prop": trial_recommendations["missing_or_unusable_prop"],
+            "artifact_prop": trial_recommendations["artifact_prop"],
+            "recommend_exclude": trial_recommendations["recommend_exclude"],
+            "recommendation_status": trial_recommendations["recommendation_status"],
+            "exclusion_reason": trial_recommendations["exclusion_reason"],
+        }
+    )
+    participant_level = pd.DataFrame(
+        {
+            "exclusion_level": "participant",
+            "participant": participant_recommendations["participant"],
+            "trial": pd.NA,
+            "condition": participant_recommendations["conditions"],
+            "n_samples": participant_recommendations["n_samples"],
+            "n_trials": participant_recommendations["n_trials"],
+            "n_retained_trials": participant_recommendations["n_retained_trials"],
+            "missing_or_unusable_prop": participant_recommendations["missing_or_unusable_prop"],
+            "artifact_prop": participant_recommendations["artifact_prop"],
+            "recommend_exclude": participant_recommendations["recommend_exclude"],
+            "recommendation_status": participant_recommendations["recommendation_status"],
+            "exclusion_reason": participant_recommendations["exclusion_reason"],
+        }
+    )
+    exclusion_table = pd.concat([participant_level, trial_level], ignore_index=True, sort=False)
+    exclusion_table = exclusion_table.sort_values(
+        ["recommend_exclude", "exclusion_level", "participant", "trial"],
+        ascending=[False, True, True, True],
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+
+    def collapse_nullable(value):
+        if value is None:
+            return pd.NA
+        if isinstance(value, (list, tuple)):
+            return ", ".join(map(str, value)) if value else pd.NA
+        return str(value)
+
+    overview = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "recommendation_status": "complete",
+                "participant_col": participant_col,
+                "trial_col": collapse_nullable(trial_col),
+                "condition_col": collapse_nullable(condition_col),
+                "validity_col": collapse_nullable(validity_col),
+                "x_col": collapse_nullable(x_col),
+                "y_col": collapse_nullable(y_col),
+                "pupil_col": collapse_nullable(pupil_col),
+                "artifact_col": collapse_nullable(artifact_col),
+                "n_input_rows": len(data),
+                "n_participants": int(prepared[".gp3_participant"].nunique(dropna=True)),
+                "n_trials": len(trial_recommendations),
+                "n_recommended_participant_exclusions": int(
+                    participant_recommendations["recommend_exclude"].sum()
+                ),
+                "n_recommended_trial_exclusions": int(
+                    trial_recommendations["recommend_exclude"].sum()
+                ),
+                "min_trial_samples": min_trial_samples,
+                "max_trial_missing_prop": max_trial_missing_prop,
+                "max_trial_artifact_prop": max_trial_artifact_prop,
+                "min_participant_trials": min_participant_trials,
+                "min_participant_valid_trials": min_participant_valid_trials,
+                "max_participant_missing_prop": max_participant_missing_prop,
+                "max_participant_artifact_prop": max_participant_artifact_prop,
+            }
+        ]
+    )
+    setting_names = [
+        "participant_col",
+        "trial_col",
+        "condition_col",
+        "validity_col",
+        "x_col",
+        "y_col",
+        "pupil_col",
+        "artifact_col",
+        "min_trial_samples",
+        "max_trial_missing_prop",
+        "max_trial_artifact_prop",
+        "min_participant_trials",
+        "min_participant_valid_trials",
+        "max_participant_missing_prop",
+        "max_participant_artifact_prop",
+        "require_both_gaze_coordinates",
+        "name",
+    ]
+    setting_values = [
+        participant_col,
+        collapse_nullable(trial_col),
+        collapse_nullable(condition_col),
+        collapse_nullable(validity_col),
+        collapse_nullable(x_col),
+        collapse_nullable(y_col),
+        collapse_nullable(pupil_col),
+        collapse_nullable(artifact_col),
+        str(min_trial_samples),
+        str(max_trial_missing_prop),
+        str(max_trial_artifact_prop),
+        str(min_participant_trials),
+        str(min_participant_valid_trials),
+        str(max_participant_missing_prop),
+        str(max_participant_artifact_prop),
+        "TRUE" if require_both_gaze_coordinates else "FALSE",
+        name,
+    ]
+    settings = pd.DataFrame({"setting": setting_names, "value": setting_values})
     return {
-        "name": name,
-        "overview": result_table(
-            n_trial_exclusions=int(trial.exclude.sum()),
-            n_participant_exclusions=int(part.exclude.sum()),
-        ),
-        "trial_recommendations": trial,
-        "participant_recommendations": part,
+        "overview": overview,
+        "participant_recommendations": participant_recommendations,
+        "trial_recommendations": trial_recommendations,
+        "exclusion_table": exclusion_table,
+        "settings": settings,
         "exclusions": exclusion_table,
-        "settings": kwargs
-        | {
-            "min_trial_samples": min_trial_samples,
-            "max_trial_missing_prop": max_trial_missing_prop,
-        },
     }
 
 

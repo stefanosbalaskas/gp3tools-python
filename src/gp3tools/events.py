@@ -1544,18 +1544,115 @@ def summarise_gazepoint_event_detector_benchmark(
 
 
 def create_gazepoint_event_review_template(
-    data, path: str | Path | None = None, **kwargs
-) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    if "event_state" not in df:
-        df = classify_gazepoint_events_hmm(df, **kwargs)
-    out = df.copy()
-    out["review_state"] = out["event_state"]
-    out["reviewer_note"] = ""
-    out["reviewed"] = False
+    data,
+    id_col="USER_ID",
+    trial_col=None,
+    group_cols=None,
+    time_col="TIME",
+    rows_per_sequence=1,
+    event_type="fixation",
+    reviewer=None,
+    path=None,
+    **kwargs,
+):
+    """Create a sequence-level manual event-review template."""
+    import numpy as np
+    import pandas as pd
+
+    if not isinstance(data, pd.DataFrame):
+        raise ValueError("`data` must be a data frame.")
+
+    # Legacy event-state review path for pre-parity Python callers whose data do
+    # not use the R default USER_ID/TIME columns.
+    if (id_col == "USER_ID" and id_col not in data.columns) or (
+        time_col == "TIME" and time_col not in data.columns
+    ):
+        legacy = data.copy()
+        if "event_state" not in legacy.columns:
+            legacy = classify_gazepoint_events_hmm(legacy, **kwargs)
+        elif kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+        legacy["review_state"] = legacy["event_state"]
+        legacy["reviewer_note"] = ""
+        legacy["reviewed"] = False
+        if path is not None:
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.to_csv(target, index=False)
+        return legacy
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+    if len(data) == 0:
+        raise ValueError("`data` must contain at least one sample.")
+
+    extra = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    sequence_cols = []
+    for c in [id_col, trial_col, *extra]:
+        if c is not None and not pd.isna(c) and str(c) and c not in sequence_cols:
+            sequence_cols.append(c)
+    required = list(dict.fromkeys(sequence_cols + [time_col]))
+    missing = [c for c in required if c not in data.columns]
+    if missing:
+        raise ValueError(f"`data` is missing required column(s): {', '.join(missing)}.")
+    if (
+        isinstance(rows_per_sequence, (bool, np.bool_))
+        or not isinstance(rows_per_sequence, (int, float, np.integer, np.floating))
+        or not np.isfinite(rows_per_sequence)
+        or rows_per_sequence < 1
+        or int(rows_per_sequence) != rows_per_sequence
+    ):
+        raise ValueError("`rows_per_sequence` must be one positive integer.")
+    rows_per_sequence = int(rows_per_sequence)
+    if not isinstance(event_type, str) or not event_type:
+        raise ValueError("`event_type` must be one non-empty character value.")
+
+    time_values = pd.to_numeric(data[time_col], errors="coerce")
+    if not np.isfinite(time_values.to_numpy(float)).any():
+        raise ValueError(f"`{time_col}` must contain at least one finite timestamp.")
+
+    if sequence_cols:
+        key_frame = data[sequence_cols].astype("string").fillna("<NA>")
+        keys = key_frame.agg("\r".join, axis=1)
+    else:
+        keys = pd.Series([".all"] * len(data), index=data.index)
+
+    rows = []
+    for key in sorted(pd.unique(keys)):
+        idx = data.index[keys.eq(key)]
+        finite = pd.to_numeric(data.loc[idx, time_col], errors="coerce")
+        finite = finite[np.isfinite(finite)]
+        if finite.empty:
+            continue
+        base = {c: data.loc[idx[0], c] for c in sequence_cols}
+        for review_event_id in range(1, rows_per_sequence + 1):
+            rows.append(
+                {
+                    **base,
+                    "review_event_id": review_event_id,
+                    "sequence_start": float(finite.min()),
+                    "sequence_end": float(finite.max()),
+                    "start_time": np.nan,
+                    "end_time": np.nan,
+                    "event_type": event_type,
+                    "review_status": "pending",
+                    "reviewer": pd.NA if reviewer is None or pd.isna(reviewer) else str(reviewer),
+                    "notes": pd.NA,
+                }
+            )
+    if not rows:
+        raise ValueError("No sequence contained a finite timestamp.")
+    out = pd.DataFrame(rows)
     if path is not None:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        out.to_csv(path, index=False)
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(target, index=False)
     return out
 
 

@@ -5051,9 +5051,154 @@ def compute_gazepoint_aoi_entropy(
     return pd.DataFrame(rows)
 
 
-def compute_gazepoint_aoi_sequence_metrics(data=None, sequence=None, **kwargs) -> pd.DataFrame:
-    comp = compute_gazepoint_sequence_complexity(data=data, sequence=sequence, **kwargs)
-    return comp
+def compute_gazepoint_aoi_sequence_metrics(
+    data=None,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    include_missing=False,
+    missing_label="missing",
+    collapse_repeats=True,
+    *,
+    sequence=None,
+    **kwargs,
+) -> pd.DataFrame:
+    """Compute AOI sequence metrics with R gp3tools 2.3.0 semantics."""
+    import numpy as np
+    import pandas as pd
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    # Preserve the pre-parity convenience path for standalone sequences.
+    if data is None and sequence is not None:
+        data = pd.DataFrame({"__aoi": list(sequence)})
+        aoi_col = "__aoi"
+        group_cols = []
+    if not isinstance(data, pd.DataFrame):
+        raise ValueError("`data` must be a data frame.")
+    if not isinstance(aoi_col, str) or not aoi_col:
+        raise ValueError("`aoi_col` must be a non-missing character scalar.")
+    if group_cols is None:
+        groups = []
+    elif isinstance(group_cols, str):
+        groups = [group_cols]
+    else:
+        groups = list(group_cols)
+    if any(not isinstance(c, str) or not c for c in groups):
+        raise ValueError("`group_cols` must be a character vector without missing or empty values.")
+    if time_col is not None and (not isinstance(time_col, str) or not time_col):
+        raise ValueError("`time_col` must be a non-missing character scalar.")
+    if not isinstance(missing_label, str) or not missing_label:
+        raise ValueError("`missing_label` must be a non-missing character scalar.")
+    if not isinstance(include_missing, (bool, np.bool_)):
+        raise ValueError("`include_missing` must be TRUE or FALSE.")
+    if not isinstance(collapse_repeats, (bool, np.bool_)):
+        raise ValueError("`collapse_repeats` must be TRUE or FALSE.")
+
+    required = [aoi_col] + groups + ([time_col] if time_col else [])
+    missing = [c for c in dict.fromkeys(required) if c not in data.columns]
+    if missing:
+        raise ValueError(f"`data` is missing required column(s): {', '.join(missing)}")
+
+    if groups:
+        frames = [frame for _, frame in data.groupby(groups, dropna=True, sort=True)]
+    else:
+        frames = [data]
+
+    rows = []
+    for frame in frames:
+        if time_col is not None:
+            frame = frame.sort_values(time_col, kind="stable", na_position="last")
+        group_values = {c: frame.iloc[0][c] for c in groups} if len(frame) else {}
+
+        raw = []
+        for value in frame[aoi_col].tolist():
+            missing_value = pd.isna(value) or str(value).strip() == ""
+            if missing_value:
+                if include_missing:
+                    raw.append(missing_label)
+            else:
+                raw.append(str(value))
+
+        sequence_length = len(raw)
+        if sequence_length == 0:
+            rows.append(
+                {
+                    **group_values,
+                    "sequence_length": 0,
+                    "n_aoi_visits": 0,
+                    "n_unique_aoi": 0,
+                    "transition_count": 0,
+                    "revisit_count": np.nan,
+                    "revisit_prop": np.nan,
+                    "dominant_aoi": pd.NA,
+                    "first_aoi": pd.NA,
+                    "last_aoi": pd.NA,
+                    "mean_run_length": np.nan,
+                    "max_run_length": np.nan,
+                    "sequence_status": "no_valid_aoi",
+                }
+            )
+            continue
+
+        run_values = [raw[0]]
+        run_lengths = [1]
+        for value in raw[1:]:
+            if value == run_values[-1]:
+                run_lengths[-1] += 1
+            else:
+                run_values.append(value)
+                run_lengths.append(1)
+
+        analysis = run_values if collapse_repeats else raw
+        visits = len(analysis)
+        transitions = max(visits - 1, 0)
+        seen = set()
+        revisits = 0
+        for value in analysis:
+            if value in seen:
+                revisits += 1
+            else:
+                seen.add(value)
+
+        counts = {value: raw.count(value) for value in sorted(set(raw))}
+        dominant = max(counts, key=lambda value: counts[value])
+
+        rows.append(
+            {
+                **group_values,
+                "sequence_length": sequence_length,
+                "n_aoi_visits": visits,
+                "n_unique_aoi": len(set(analysis)),
+                "transition_count": transitions,
+                "revisit_count": revisits,
+                "revisit_prop": revisits / visits if visits else np.nan,
+                "dominant_aoi": dominant,
+                "first_aoi": analysis[0],
+                "last_aoi": analysis[-1],
+                "mean_run_length": float(np.mean(run_lengths)),
+                "max_run_length": int(max(run_lengths)),
+                "sequence_status": "ok",
+            }
+        )
+
+    columns = groups + [
+        "sequence_length",
+        "n_aoi_visits",
+        "n_unique_aoi",
+        "transition_count",
+        "revisit_count",
+        "revisit_prop",
+        "dominant_aoi",
+        "first_aoi",
+        "last_aoi",
+        "mean_run_length",
+        "max_run_length",
+        "sequence_status",
+    ]
+    return pd.DataFrame(rows, columns=columns)
 
 
 def compute_gazepoint_sequence_complexity(
@@ -6314,18 +6459,151 @@ def prepare_gazepoint_traminer_data(data, **kwargs):
 
 
 def flag_gazepoint_sequence_anomalies(
-    data=None, sequence=None, z_threshold=3.0, **kwargs
+    data=None,
+    aoi_col=None,
+    group_cols=None,
+    time_col=None,
+    min_length=2,
+    max_length=None,
+    max_missing_prop=0.5,
+    z_threshold=3.0,
+    min_unique_aoi=1,
+    *,
+    sequence=None,
+    **kwargs,
 ) -> pd.DataFrame:
-    comp = compute_gazepoint_sequence_complexity(data=data, sequence=sequence, **kwargs)
-    x = comp.complexity_index
-    z = (
-        (x - x.mean()) / x.std(ddof=0)
-        if len(x) > 1 and x.std(ddof=0) > 0
-        else pd.Series(0, index=x.index)
+    """Flag unusual AOI sequences using R gp3tools 2.3.0 semantics."""
+    import numpy as np
+    import pandas as pd
+
+    # Preserve the pre-parity standalone-sequence behavior exactly on the
+    # Python-only compatibility route. The canonical R route below remains
+    # data/aoi_col/group_cols based and continues to be oracle tested.
+    if data is None and sequence is not None:
+        comp = compute_gazepoint_sequence_complexity(
+            data=None,
+            sequence=sequence,
+            **kwargs,
+        )
+        x = pd.to_numeric(comp["complexity_index"], errors="coerce")
+        spread = float(x.std(ddof=0)) if len(x) > 1 else 0.0
+        if len(x) > 1 and np.isfinite(spread) and spread > 0:
+            z = (x - x.mean()) / spread
+        else:
+            z = pd.Series(0.0, index=x.index)
+        comp = comp.copy()
+        comp["anomaly_score"] = z.abs()
+        comp["anomaly"] = comp["anomaly_score"] > z_threshold
+        return comp
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+    if not isinstance(data, pd.DataFrame):
+        raise ValueError("data must be a data frame.")
+    if not isinstance(aoi_col, str) or not aoi_col:
+        raise ValueError("aoi_col must be a single non-empty column name.")
+    if group_cols is None:
+        raise ValueError("group_cols must contain one or more non-empty column names.")
+    if isinstance(group_cols, str):
+        group_cols = [group_cols]
+    else:
+        group_cols = list(group_cols)
+    if not group_cols or any(not isinstance(c, str) or not c for c in group_cols):
+        raise ValueError("group_cols must contain one or more non-empty column names.")
+    if time_col is not None and (not isinstance(time_col, str) or not time_col):
+        raise ValueError("time_col must be a single non-empty column name.")
+    required = [aoi_col] + group_cols + ([time_col] if time_col else [])
+    missing_cols = [c for c in required if c not in data.columns]
+    if missing_cols:
+        raise ValueError("`data` is missing required column(s): " + ", ".join(missing_cols))
+    if (
+        isinstance(min_length, (bool, np.bool_))
+        or not isinstance(min_length, (int, float, np.number))
+        or pd.isna(min_length)
+        or min_length < 0
+    ):
+        raise ValueError("min_length must be a non-negative number.")
+    if max_length is not None and (
+        isinstance(max_length, (bool, np.bool_))
+        or not isinstance(max_length, (int, float, np.number))
+        or pd.isna(max_length)
+    ):
+        raise ValueError("max_length must be NULL or a single number.")
+    if (
+        isinstance(max_missing_prop, (bool, np.bool_))
+        or not isinstance(max_missing_prop, (int, float, np.number))
+        or pd.isna(max_missing_prop)
+        or not 0 <= max_missing_prop <= 1
+    ):
+        raise ValueError("max_missing_prop must be between 0 and 1.")
+    if (
+        isinstance(z_threshold, (bool, np.bool_))
+        or not isinstance(z_threshold, (int, float, np.number))
+        or pd.isna(z_threshold)
+        or z_threshold <= 0
+    ):
+        raise ValueError("z_threshold must be positive.")
+
+    grouped = data.groupby(group_cols, dropna=True, sort=True)
+    rows = []
+    for _, frame in grouped:
+        if time_col is not None:
+            frame = frame.sort_values(time_col, kind="stable")
+        raw = frame[aoi_col]
+        missing = raw.isna() | raw.astype("string").str.strip().fillna("").eq("")
+        observed = raw.loc[~missing].astype(str).tolist()
+        key = "|".join(f"{c}={frame.iloc[0][c]}" for c in group_cols)
+        row = {
+            ".gp3_key": key,
+            "total_observations": int(len(raw)),
+            "sequence_length": int(len(observed)),
+            "missing_prop": float(missing.mean()) if len(raw) else np.nan,
+            "n_unique_aoi": int(len(set(observed))),
+        }
+        row.update({c: frame.iloc[0][c] for c in group_cols})
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    lengths = out["sequence_length"].astype(float)
+    len_sd = float(lengths.std(ddof=1)) if len(lengths) >= 2 else np.nan
+    len_mean = float(lengths.mean())
+    if not np.isfinite(len_sd) or len_sd == 0:
+        out["length_z"] = 0.0
+    else:
+        out["length_z"] = (lengths - len_mean) / len_sd
+    out["flag_short"] = out["sequence_length"] < min_length
+    out["flag_long"] = False if max_length is None else out["sequence_length"] > max_length
+    out["flag_high_missing"] = out["missing_prop"] > max_missing_prop
+    out["flag_length_outlier"] = out["length_z"].abs() > z_threshold
+    out["flag_low_unique"] = out["n_unique_aoi"] < min_unique_aoi
+    out["anomaly_flag"] = (
+        out["flag_short"]
+        | out["flag_long"]
+        | out["flag_high_missing"]
+        | out["flag_length_outlier"]
+        | out["flag_low_unique"]
     )
-    comp["anomaly_score"] = z.abs()
-    comp["anomaly"] = comp.anomaly_score > z_threshold
-    return comp
+
+    reasons = []
+    for _, row in out.iterrows():
+        current = []
+        if bool(row["flag_short"]):
+            current.append("short_sequence")
+        if bool(row["flag_long"]):
+            current.append("long_sequence")
+        if bool(row["flag_high_missing"]):
+            current.append("high_missing")
+        if bool(row["flag_length_outlier"]):
+            current.append("length_outlier")
+        if bool(row["flag_low_unique"]):
+            current.append("low_unique_aoi")
+        reasons.append(";".join(current) if current else "none")
+    out["anomaly_reason"] = reasons
+    out["anomaly_status"] = "ok"
+    return out.reset_index(drop=True)
 
 
 def summarise_gazepoint_aoi_trial_features(

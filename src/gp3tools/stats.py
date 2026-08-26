@@ -108,18 +108,173 @@ def prepare_gazepoint_gca_data(
 
 
 def prepare_gazepoint_timecourse_test_data(
-    data, time_col=None, value_col=None, subject_col=None, condition_col=None, **kwargs
+    data,
+    subject_col=None,
+    condition_col=None,
+    time_col=None,
+    outcome_col=None,
+    condition_order=None,
+    aggregate_fun=None,
+    complete_only=True,
+    **kwargs,
 ):
-    df = ensure_dataframe(data)
-    out = df.copy()
-    aliases = {
-        time_col or infer_column(df, "time"): "time",
-        value_col: "value",
-        subject_col or infer_column(df, "subject"): "subject",
-        condition_col or infer_column(df, "condition"): "condition",
-    }
-    aliases = {k: v for k, v in aliases.items() if k and k in out and k != v}
-    return out.rename(columns=aliases)
+    """Prepare conservative two-condition time-course data (R v2.3.0 parity)."""
+    import numpy as np
+    import pandas as pd
+
+    legacy_value_col = kwargs.pop("value_col", None)
+    if not isinstance(data, pd.DataFrame):
+        raise ValueError("`data` must be a data frame.")
+
+    if (
+        subject_col is None
+        and condition_col is None
+        and time_col is None
+        and outcome_col is None
+        and legacy_value_col is None
+        and condition_order is None
+        and aggregate_fun is None
+        and complete_only is True
+        and not kwargs
+    ):
+        out = data.copy()
+        subject_source = infer_column(out, "subject")
+        condition_source = infer_column(out, "condition")
+        time_source = infer_column(out, "time")
+        value_source = "value" if "value" in out.columns else infer_column(out, "pupil")
+        aliases = {
+            subject_source: "subject",
+            condition_source: "condition",
+            time_source: "time",
+            value_source: "value",
+        }
+        aliases = {
+            source: target
+            for source, target in aliases.items()
+            if source and source in out.columns and source != target
+        }
+        return out.rename(columns=aliases)
+
+    if outcome_col is None and legacy_value_col is not None:
+        # Preserve the historical Python rename-only helper.
+        out = data.copy()
+        aliases = {
+            time_col: "time",
+            legacy_value_col: "value",
+            subject_col: "subject",
+            condition_col: "condition",
+        }
+        aliases = {k: v for k, v in aliases.items() if k and k in out.columns and k != v}
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+        return out.rename(columns=aliases)
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+    for value, name in (
+        (subject_col, "subject_col"),
+        (condition_col, "condition_col"),
+        (time_col, "time_col"),
+        (outcome_col, "outcome_col"),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"`{name}` must be a non-empty character scalar.")
+    missing = [
+        c for c in (subject_col, condition_col, time_col, outcome_col) if c not in data.columns
+    ]
+    if missing:
+        raise ValueError("`data` is missing required column(s): " + ", ".join(missing))
+    if aggregate_fun is None:
+        aggregate_fun = np.mean
+    if not callable(aggregate_fun):
+        raise ValueError("`aggregate_fun` must be a function.")
+    if not isinstance(complete_only, (bool, np.bool_)):
+        raise ValueError("`complete_only` must be TRUE or FALSE.")
+
+    dat = pd.DataFrame(
+        {
+            ".gp3_cluster_subject": data[subject_col].astype("string"),
+            ".gp3_cluster_condition": data[condition_col].astype("string"),
+            ".gp3_cluster_time_bin": pd.to_numeric(data[time_col], errors="coerce"),
+            ".gp3_cluster_outcome": pd.to_numeric(data[outcome_col], errors="coerce"),
+        }
+    )
+    valid = (
+        dat[".gp3_cluster_subject"].notna()
+        & dat[".gp3_cluster_condition"].notna()
+        & np.isfinite(dat[".gp3_cluster_time_bin"].to_numpy(float))
+        & np.isfinite(dat[".gp3_cluster_outcome"].to_numpy(float))
+    )
+    dat = dat.loc[valid].copy()
+    if dat.empty:
+        raise ValueError("No valid time-course rows remained after preparation.")
+
+    available_conditions = list(pd.unique(dat[".gp3_cluster_condition"].astype(str)))
+    if condition_order is None:
+        condition_order = available_conditions
+    else:
+        condition_order = (
+            list(condition_order) if not isinstance(condition_order, str) else [condition_order]
+        )
+        if len(condition_order) != 2 or any(
+            not isinstance(x, str) or not x for x in condition_order
+        ):
+            raise ValueError("`condition_order` must be NULL or a character vector of length two.")
+    condition_order = list(dict.fromkeys(condition_order))
+    if len(condition_order) != 2:
+        raise ValueError(
+            "Cluster-permutation preparation requires exactly two conditions. Found: "
+            + ", ".join(available_conditions)
+        )
+    missing_conditions = [x for x in condition_order if x not in available_conditions]
+    if missing_conditions:
+        raise ValueError(
+            "Requested condition(s) not found in `data`: " + ", ".join(missing_conditions)
+        )
+    dat = dat.loc[dat[".gp3_cluster_condition"].astype(str).isin(condition_order)].copy()
+    dat[".gp3_cluster_condition"] = pd.Categorical(
+        dat[".gp3_cluster_condition"].astype(str),
+        categories=condition_order,
+        ordered=True,
+    )
+
+    def aggregate_series(series):
+        values = pd.to_numeric(series, errors="coerce")
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            return np.nan
+        try:
+            return float(aggregate_fun(values))
+        except TypeError:
+            return float(aggregate_fun(values, na_rm=True))
+
+    dat = (
+        dat.groupby(
+            [".gp3_cluster_subject", ".gp3_cluster_condition", ".gp3_cluster_time_bin"],
+            observed=True,
+            sort=True,
+            dropna=False,
+        )[".gp3_cluster_outcome"]
+        .apply(aggregate_series)
+        .reset_index()
+    )
+    if complete_only:
+        counts = dat.groupby(
+            [".gp3_cluster_subject", ".gp3_cluster_time_bin"],
+            dropna=False,
+        )[".gp3_cluster_condition"].transform("nunique")
+        dat = dat.loc[counts.eq(2)].copy()
+    if dat.empty:
+        raise ValueError("No complete paired subject-by-time cells remained after preparation.")
+
+    dat[".gp3_cluster_status"] = "ok"
+    dat = dat.sort_values(
+        [".gp3_cluster_subject", ".gp3_cluster_time_bin", ".gp3_cluster_condition"],
+        kind="stable",
+    ).reset_index(drop=True)
+    dat.attrs["r_class"] = "gp3_timecourse_test_data"
+    return dat
 
 
 def prepare_gazepoint_cluster_data(data, **kwargs):
@@ -1639,34 +1794,279 @@ def recommend_gazepoint_model_family(data, outcome_col=None, **kwargs) -> pd.Dat
 
 
 def analyze_gazepoint_window(
-    data, value_col=None, group_col=None, condition_col=None, **kwargs
-) -> dict[str, Any]:
-    df = ensure_dataframe(data)
-    value_col = value_col or infer_column(df, "pupil") or "value"
-    condition_col = condition_col or infer_column(df, "condition")
-    summary = (
-        df.groupby(condition_col, dropna=False)[value_col]
-        .agg(n="size", mean="mean", sd="std", se="sem")
-        .reset_index()
-        if condition_col
-        else pd.DataFrame(
-            {
-                "n": [len(df)],
-                "mean": [df[value_col].mean()],
-                "sd": [df[value_col].std()],
-                "se": [df[value_col].sem()],
-            }
-        )
+    et_data=None,
+    window_size=50,
+    step=10,
+    summary_stats=("mean", "sd"),
+    by="USER_ID",
+    condition_col=None,
+    value_cols=None,
+    ts_col="TIME",
+    window_unit="milliseconds",
+    time_unit="auto",
+    include_partial=False,
+    **kwargs,
+):
+    """Summarise gaze or pupil measures in sliding time windows (R v2.3.0 parity)."""
+    import numpy as np
+    import pandas as pd
+
+    # Legacy Python aliases retained without changing the R-style path.
+    if et_data is None and "data" in kwargs:
+        et_data = kwargs.pop("data")
+    legacy_value_col = kwargs.pop("value_col", None)
+    legacy_group_col = kwargs.pop("group_col", None)
+    if value_cols is None and legacy_value_col is not None:
+        value_cols = [legacy_value_col]
+    if legacy_group_col is not None and by == "USER_ID":
+        by = legacy_group_col
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    if not isinstance(et_data, pd.DataFrame):
+        raise ValueError("`et_data` must be a data frame.")
+    df = et_data.copy()
+
+    legacy_window_mode = legacy_value_col is not None and (
+        ts_col not in df.columns
+        or (by == "USER_ID" and "USER_ID" not in df.columns and legacy_group_col is None)
     )
-    test = None
-    if condition_col and df[condition_col].nunique() == 2:
-        vals = [
-            pd.to_numeric(g[value_col], errors="coerce").dropna()
-            for _, g in df.groupby(condition_col)
+    if legacy_window_mode:
+        from scipy import stats as scipy_stats
+
+        value_col = legacy_value_col
+        if value_col not in df.columns:
+            raise ValueError(f"Missing value column: {value_col}")
+        if condition_col is not None and condition_col not in df.columns:
+            raise ValueError(f"Missing condition column: {condition_col}")
+
+        if condition_col:
+            summary = (
+                df.groupby(condition_col, dropna=False)[value_col]
+                .agg(n="size", mean="mean", sd="std", se="sem")
+                .reset_index()
+            )
+        else:
+            values = pd.to_numeric(df[value_col], errors="coerce")
+            summary = pd.DataFrame(
+                {
+                    "n": [len(df)],
+                    "mean": [values.mean()],
+                    "sd": [values.std()],
+                    "se": [values.sem()],
+                }
+            )
+
+        test = None
+        if condition_col and df[condition_col].nunique(dropna=True) == 2:
+            vals = [
+                pd.to_numeric(group[value_col], errors="coerce").dropna()
+                for _, group in df.groupby(condition_col, dropna=True, sort=True)
+            ]
+            if len(vals) == 2:
+                statistic, p_value = scipy_stats.ttest_ind(vals[0], vals[1], equal_var=False)
+                test = {
+                    "statistic": float(statistic),
+                    "p_value": float(p_value),
+                }
+        return {"summary": summary, "test": test}
+
+    if window_unit not in {"milliseconds", "seconds", "native"}:
+        raise ValueError("`window_unit` must be one of: milliseconds, seconds, native.")
+    if time_unit not in {"auto", "seconds", "milliseconds"}:
+        raise ValueError("`time_unit` must be one of: auto, seconds, milliseconds.")
+
+    if isinstance(by, str):
+        by_cols = [by]
+    elif by is None:
+        by_cols = []
+    else:
+        by_cols = list(by)
+    if condition_col is not None:
+        by_cols.append(condition_col)
+    by_cols = list(dict.fromkeys(c for c in by_cols if c is not None and str(c) != ""))
+
+    required = list(dict.fromkeys(by_cols + [ts_col]))
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"`et_data` is missing required column(s): {', '.join(map(str, missing))}."
+        )
+
+    if value_cols is None:
+        candidates = [
+            "FPOGX",
+            "FPOGY",
+            "x",
+            "y",
+            "mean_pupil",
+            "pupil",
+            "pupil_clean",
+            "pupil_smoothed",
+            "LPupil",
+            "RPupil",
+            "LPD",
+            "RPD",
+            "LPMM",
+            "RPMM",
         ]
-        stat, p = stats.ttest_ind(vals[0], vals[1], equal_var=False)
-        test = {"statistic": float(stat), "p_value": float(p)}
-    return {"summary": summary, "test": test}
+        value_cols = [
+            c for c in candidates if c in df.columns and pd.api.types.is_numeric_dtype(df[c])
+        ]
+    elif isinstance(value_cols, str):
+        value_cols = [value_cols]
+    else:
+        value_cols = list(value_cols)
+
+    if not value_cols:
+        raise ValueError("No numeric `value_cols` were supplied or detected.")
+    missing_values = [c for c in value_cols if c not in df.columns]
+    if missing_values:
+        raise ValueError(
+            f"`et_data` is missing required column(s): {', '.join(map(str, missing_values))}."
+        )
+    non_numeric = [c for c in value_cols if not pd.api.types.is_numeric_dtype(df[c])]
+    if non_numeric:
+        raise ValueError(f"`value_cols` must be numeric. Non-numeric: {', '.join(non_numeric)}.")
+
+    if isinstance(summary_stats, str):
+        summary_stats = [summary_stats]
+    summary_stats = list(dict.fromkeys(summary_stats))
+    supported = {"mean", "sd", "median", "min", "max", "sum", "valid_prop"}
+    unsupported = [s for s in summary_stats if s not in supported]
+    if unsupported:
+        raise ValueError(f"Unsupported `summary_stats`: {', '.join(unsupported)}.")
+
+    for name, value in (("window_size", window_size), ("step", step)):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"`{name}` must be one finite positive number.")
+
+    def time_info(values):
+        if time_unit == "seconds":
+            return 1.0
+        if time_unit == "milliseconds":
+            return 0.001
+        finite = np.asarray(values, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        delta = np.diff(np.unique(np.sort(finite)))
+        delta = delta[np.isfinite(delta) & (delta > 0)]
+        typical = float(np.median(delta)) if len(delta) else np.nan
+        return 0.001 if np.isfinite(typical) and typical >= 1 else 1.0
+
+    def to_seconds(value, unit, input_to_seconds):
+        if unit == "milliseconds":
+            return float(value) / 1000.0
+        if unit == "seconds":
+            return float(value)
+        return float(value) * input_to_seconds
+
+    def stat_value(values, stat):
+        x = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(float)
+        finite = np.isfinite(x)
+        if stat == "valid_prop":
+            return float(finite.mean()) if len(x) else np.nan
+        if not finite.any():
+            return np.nan
+        z = x[finite]
+        if stat == "mean":
+            return float(np.mean(z))
+        if stat == "sd":
+            return float(np.std(z, ddof=1)) if len(z) >= 2 else np.nan
+        if stat == "median":
+            return float(np.median(z))
+        if stat == "min":
+            return float(np.min(z))
+        if stat == "max":
+            return float(np.max(z))
+        if stat == "sum":
+            return float(np.sum(z))
+        raise ValueError("Unknown summary statistic.")
+
+    if by_cols:
+        grouped = df.groupby(by_cols, dropna=False, sort=True)
+        groups = [frame for _, frame in grouped]
+    else:
+        groups = [df]
+
+    rows = []
+    for frame in groups:
+        frame = frame.assign(__gp3_time=pd.to_numeric(frame[ts_col], errors="coerce")).sort_values(
+            "__gp3_time", kind="stable", na_position="last"
+        )
+        time_raw = frame["__gp3_time"].to_numpy(float)
+        factor = time_info(time_raw)
+        time_sec = time_raw * factor
+        finite_time = np.isfinite(time_sec)
+        if not finite_time.any():
+            continue
+        window_sec = to_seconds(window_size, window_unit, factor)
+        step_sec = to_seconds(step, window_unit, factor)
+        min_time = float(np.min(time_sec[finite_time]))
+        max_time = float(np.max(time_sec[finite_time]))
+        if include_partial:
+            final_start = max_time
+        else:
+            final_start = max_time - window_sec
+            if final_start < min_time:
+                continue
+
+        starts = []
+        current = min_time
+        tol = max(abs(step_sec), 1.0) * 1e-12
+        while current <= final_start + tol:
+            starts.append(current)
+            current += step_sec
+
+        for start_sec in starts:
+            end_sec = start_sec + window_sec
+            if include_partial and end_sec > max_time:
+                mask = finite_time & (time_sec >= start_sec) & (time_sec <= max_time)
+            else:
+                mask = finite_time & (time_sec >= start_sec) & (time_sec < end_sec)
+            selected = frame.loc[mask]
+            if selected.empty:
+                continue
+            row = {c: selected.iloc[0][c] for c in by_cols}
+            clipped_end = min(end_sec, max_time)
+            row.update(
+                {
+                    "window_start": start_sec / factor,
+                    "window_end": clipped_end / factor,
+                    "window_mid": ((start_sec + clipped_end) / 2.0) / factor,
+                    "window_size": window_size,
+                    "window_step": step,
+                    "window_unit": window_unit,
+                    "n_samples": int(len(selected)),
+                }
+            )
+            for column in value_cols:
+                values = selected[column].to_numpy()
+                for stat in summary_stats:
+                    row[f"{column}_{stat}"] = stat_value(values, stat)
+            rows.append(row)
+
+    columns = (
+        by_cols
+        + [
+            "window_start",
+            "window_end",
+            "window_mid",
+            "window_size",
+            "window_step",
+            "window_unit",
+            "n_samples",
+        ]
+        + [f"{c}_{s}" for c in value_cols for s in summary_stats]
+    )
+    out = pd.DataFrame(rows, columns=columns)
+    out.attrs["r_class"] = "gp3_window_summary"
+    return out
 
 
 def _bin_condition_difference(

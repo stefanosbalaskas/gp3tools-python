@@ -1675,9 +1675,254 @@ def interpolate_gazepoint_pupil(
     return pd.concat([original, interpolated[output_cols]], axis=1)
 
 
-def interpolate_gazepoint_pupil_pchip(data, **kwargs) -> pd.DataFrame:
-    kwargs["method"] = "pchip"
-    return interpolate_gazepoint_pupil(data, **kwargs)
+def interpolate_gazepoint_pupil_pchip(
+    data,
+    pupil_col=None,
+    time_col=None,
+    grouping_cols=None,
+    max_gap_ms=500,
+    max_gap_samples=None,
+    min_valid_points=3,
+    output_col="pupil_interpolated_pchip",
+    flag_col="interpolated_pupil_pchip",
+    status_col="pchip_interpolation_status",
+    **kwargs,
+) -> pd.DataFrame:
+    """Shape-preserving PCHIP interpolation matching gp3tools R v2.3.0."""
+    import numpy as np
+    import pandas as pd
+    from scipy.interpolate import PchipInterpolator
+
+    legacy_group_cols = "group_cols" in kwargs
+    if legacy_group_cols and grouping_cols is None:
+        grouping_cols = kwargs.pop("group_cols")
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+    if not isinstance(data, pd.DataFrame):
+        raise ValueError("`data` must be a data frame.")
+    if len(data) == 0:
+        raise ValueError("`data` must contain at least one row.")
+
+    def positive_integer(value, name):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value)
+            or value < 1
+            or int(value) != value
+        ):
+            raise ValueError(f"`{name}` must be a positive integer.")
+
+    def label(value, name):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"`{name}` must be a non-missing character scalar.")
+
+    positive_integer(min_valid_points, "min_valid_points")
+    for value, name in (
+        (output_col, "output_col"),
+        (flag_col, "flag_col"),
+        (status_col, "status_col"),
+    ):
+        label(value, name)
+    if max_gap_ms is not None and (
+        isinstance(max_gap_ms, (bool, np.bool_))
+        or not isinstance(max_gap_ms, (int, float, np.integer, np.floating))
+        or not np.isfinite(max_gap_ms)
+        or max_gap_ms <= 0
+    ):
+        raise ValueError("`max_gap_ms` must be a finite positive number.")
+    if max_gap_samples is not None:
+        positive_integer(max_gap_samples, "max_gap_samples")
+
+    names_data = list(data.columns)
+    pupil_candidates = [
+        "pupil_clean",
+        "pupil_for_preprocessing",
+        "pupil_raw",
+        "mean_pupil",
+        "pupil",
+        "PUPIL",
+        "BPOPD",
+        "LPOPD",
+        "RPOPD",
+        "LPD",
+        "RPD",
+    ]
+    time_candidates = [
+        "time",
+        "time_ms",
+        "timestamp",
+        "TIMESTAMP",
+        "TIME",
+        "TIME_TICK",
+        "sample_index",
+        "CNT",
+    ]
+
+    def resolve(col, candidates, name):
+        if col is not None:
+            if not isinstance(col, str) or not col:
+                raise ValueError(f"`{name}` must be a non-missing character scalar.")
+            if col not in names_data:
+                raise ValueError(f"`{name}` must be present in `data`.")
+            return col
+        for candidate in candidates:
+            if candidate in names_data:
+                return candidate
+        raise ValueError(f"`{name}` could not be detected and must be supplied.")
+
+    pupil_col = resolve(pupil_col, pupil_candidates, "pupil_col")
+    time_col = resolve(time_col, time_candidates, "time_col")
+
+    if grouping_cols is None:
+        grouping_cols = [
+            c
+            for c in (
+                "subject",
+                "participant",
+                "participant_id",
+                "USER_FILE",
+                "recording_id",
+                "trial_global",
+                "trial",
+                "trial_id",
+                "media_id",
+                "MEDIA_ID",
+            )
+            if c in names_data and c not in {pupil_col, time_col}
+        ]
+    elif isinstance(grouping_cols, str):
+        grouping_cols = [grouping_cols]
+    else:
+        grouping_cols = list(grouping_cols)
+    if any(not isinstance(c, str) for c in grouping_cols):
+        raise ValueError("`grouping_cols` must be a character vector.")
+    missing_group = [c for c in grouping_cols if c not in names_data]
+    if missing_group:
+        raise ValueError("All `grouping_cols` must be present in `data`.")
+
+    out = data.copy()
+    out[".gp3_pchip_row_id"] = np.arange(1, len(out) + 1)
+
+    if grouping_cols:
+        key_data = out[grouping_cols].astype("string").fillna("missing")
+        key_data = key_data.replace("", "missing")
+        group_key = key_data.agg("||".join, axis=1)
+    else:
+        group_key = pd.Series(["all_data"] * len(out), index=out.index)
+
+    def gap_info(value_missing, time):
+        n = len(value_missing)
+        gap_id = np.full(n, np.nan)
+        gap_n = np.full(n, np.nan)
+        gap_duration = np.full(n, np.nan)
+        within = np.zeros(n, dtype=bool)
+        if not value_missing.any():
+            return gap_id, gap_n, gap_duration, within
+        starts = value_missing & np.r_[True, ~value_missing[:-1]]
+        running = np.cumsum(starts)
+        gap_id[value_missing] = running[value_missing]
+        finite_time = time[np.isfinite(time)]
+        steps = np.diff(np.unique(np.sort(finite_time)))
+        steps = steps[np.isfinite(steps) & (steps > 0)]
+        sample_step = float(np.median(steps)) if len(steps) else np.nan
+        for ident in np.unique(gap_id[np.isfinite(gap_id)]):
+            idx = np.flatnonzero(gap_id == ident)
+            count = len(idx)
+            finite_gap_times = time[idx][np.isfinite(time[idx])]
+            if len(finite_gap_times) == 0 or not np.isfinite(sample_step):
+                duration = np.nan
+            else:
+                duration = float(finite_gap_times.max() - finite_gap_times.min() + sample_step)
+            within_samples = True if max_gap_samples is None else count <= max_gap_samples
+            within_ms = (
+                True if max_gap_ms is None or not np.isfinite(duration) else duration <= max_gap_ms
+            )
+            gap_n[idx] = count
+            gap_duration[idx] = duration
+            within[idx] = bool(within_samples and within_ms)
+        return gap_id, gap_n, gap_duration, within
+
+    parts = []
+    for key in sorted(pd.unique(group_key)):
+        frame = (
+            out.loc[group_key.eq(key)]
+            .sort_values([time_col, ".gp3_pchip_row_id"], kind="stable", na_position="last")
+            .copy()
+        )
+        pupil = pd.to_numeric(frame[pupil_col], errors="coerce").to_numpy(float)
+        time = pd.to_numeric(frame[time_col], errors="coerce").to_numpy(float)
+        output = pupil.copy()
+        interp_flag = np.zeros(len(frame), dtype=bool)
+        status = np.full(len(frame), "observed", dtype=object)
+        value_missing = ~np.isfinite(pupil)
+        time_missing = ~np.isfinite(time)
+        status[value_missing] = "missing_unfilled"
+        status[time_missing] = "missing_time"
+        gid, gn, gd, within = gap_info(value_missing, time)
+
+        valid = ~value_missing & ~time_missing
+        valid_df = pd.DataFrame({"time": time[valid], "pupil": pupil[valid]})
+        if len(valid_df):
+            valid_df = (
+                valid_df.groupby("time", as_index=False, sort=True)["pupil"]
+                .mean()
+                .sort_values("time", kind="stable")
+            )
+        if len(valid_df) < min_valid_points:
+            status[value_missing & ~time_missing] = "missing_insufficient_valid_points"
+        else:
+            min_time = float(valid_df["time"].min())
+            max_time = float(valid_df["time"].max())
+            internal = value_missing & ~time_missing & (time >= min_time) & (time <= max_time)
+            eligible = internal & within
+            status[value_missing & ~time_missing & ~internal] = "missing_leading_or_trailing_gap"
+            status[internal & ~within] = "missing_long_gap"
+            if eligible.any():
+                try:
+                    interpolator = PchipInterpolator(
+                        valid_df["time"].to_numpy(float),
+                        valid_df["pupil"].to_numpy(float),
+                        extrapolate=False,
+                    )
+                    values = np.asarray(interpolator(time[eligible]), dtype=float)
+                except Exception:
+                    values = np.full(int(eligible.sum()), np.nan)
+                output[eligible] = values
+                success = eligible & np.isfinite(output)
+                interp_flag[success] = True
+                status[success] = "interpolated_pchip"
+                failed = eligible & ~success
+                status[failed] = "missing_pchip_failed"
+
+        frame[output_col] = output
+        frame[flag_col] = interp_flag
+        frame["pchip_gap_id"] = pd.array(gid, dtype="Int64")
+        frame["pchip_gap_n_samples"] = pd.array(gn, dtype="Int64")
+        frame["pchip_gap_duration_ms"] = gd
+        frame["pchip_gap_within_limit"] = within
+        frame[status_col] = status
+        parts.append(frame)
+
+    result = pd.concat(parts, ignore_index=False).sort_values(".gp3_pchip_row_id", kind="stable")
+    result = result.drop(columns=[".gp3_pchip_row_id"]).reset_index(drop=True)
+    result.attrs["gp3_pchip_settings"] = (
+        ("pupil_col", pupil_col),
+        ("time_col", time_col),
+        ("grouping_cols", ", ".join(grouping_cols) if grouping_cols else None),
+        ("max_gap_ms", None if max_gap_ms is None else str(max_gap_ms)),
+        ("max_gap_samples", None if max_gap_samples is None else str(max_gap_samples)),
+        ("min_valid_points", str(int(min_valid_points))),
+        ("output_col", output_col),
+        ("flag_col", flag_col),
+        ("status_col", status_col),
+    )
+    result.attrs["gp3_pchip_input_col"] = pupil_col
+    result.attrs["gp3_pchip_time_col"] = time_col
+    result.attrs["gp3_pchip_output_col"] = output_col
+    result.attrs["r_class"] = "gp3_pupil_pchip_interpolation"
+    return result
 
 
 def interpolate_gazepoint_blinks(data, pupil_col=None, blink_col="blink", **kwargs) -> pd.DataFrame:

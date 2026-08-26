@@ -658,11 +658,491 @@ def create_gazepoint_reporting_checklist(
     }
 
 
-def create_gazepoint_analysis_decision_audit(**decisions) -> pd.DataFrame:
-    return (
-        pd.DataFrame([{"decision": k, "value": str(v)} for k, v in decisions.items()])
-        if decisions
-        else pd.DataFrame(columns=["decision", "value"])
+def create_gazepoint_analysis_decision_audit(
+    results=None,
+    branch_roles=None,
+    required_confirmatory=(),
+    diagnostics_required=True,
+    require_clean_diagnostics=False,
+    **branches,
+):
+    """Create an R-v2.3.0-style analysis decision audit."""
+    import numpy as np
+    import pandas as pd
+
+    legacy_plain_decisions = (
+        results is None
+        and branch_roles is None
+        and not required_confirmatory
+        and bool(diagnostics_required) is True
+        and bool(require_clean_diagnostics) is False
+        and bool(branches)
+        and all(
+            value is None or isinstance(value, (str, int, float, bool, np.number, np.bool_))
+            for value in branches.values()
+        )
+    )
+    if legacy_plain_decisions:
+        return pd.DataFrame(
+            [{"decision": key, "value": str(value)} for key, value in branches.items()]
+        )
+
+    if results is not None:
+        if not isinstance(results, dict):
+            raise ValueError("`results` must be a named list when supplied.")
+        merged = dict(results)
+        merged.update(branches)
+        branches = merged
+    if not branches:
+        raise ValueError(
+            "At least one named analysis result must be supplied through `...` or `results`."
+        )
+    if any(not isinstance(name, str) or not name for name in branches):
+        raise ValueError("All analysis result objects must be named.")
+    if not isinstance(diagnostics_required, (bool, np.bool_)):
+        raise ValueError("`diagnostics_required` must be TRUE or FALSE.")
+    if not isinstance(require_clean_diagnostics, (bool, np.bool_)):
+        raise ValueError("`require_clean_diagnostics` must be TRUE or FALSE.")
+    required_confirmatory = list(required_confirmatory or [])
+
+    allowed = {
+        "confirmatory",
+        "sensitivity",
+        "exploratory",
+        "diagnostic",
+        "preprocessing",
+        "reporting",
+        "unknown",
+    }
+    branch_names = list(branches)
+
+    if branch_roles is None:
+        roles = pd.DataFrame(
+            {
+                "branch_name": branch_names,
+                "decision_type": ["unknown"] * len(branch_names),
+                "analysis_family": [pd.NA] * len(branch_names),
+                "interpretation_scope": [pd.NA] * len(branch_names),
+                "notes": [pd.NA] * len(branch_names),
+            }
+        )
+    else:
+        if not isinstance(branch_roles, pd.DataFrame):
+            raise ValueError("`branch_roles` must be a data frame when supplied.")
+        if not {"branch_name", "decision_type"}.issubset(branch_roles.columns):
+            missing = [c for c in ("branch_name", "decision_type") if c not in branch_roles.columns]
+            raise ValueError("`branch_roles` is missing required column(s): " + ", ".join(missing))
+        roles = branch_roles.copy()
+        roles["branch_name"] = roles["branch_name"].astype(str)
+        roles["decision_type"] = roles["decision_type"].astype(str).str.lower()
+        bad = [x for x in pd.unique(roles["decision_type"]) if x not in allowed]
+        if bad:
+            raise ValueError(
+                "`branch_roles$decision_type` contains unsupported value(s): "
+                + ", ".join(map(str, bad))
+            )
+        for c in ("analysis_family", "interpretation_scope", "notes"):
+            if c not in roles:
+                roles[c] = pd.NA
+        roles = roles[
+            ["branch_name", "decision_type", "analysis_family", "interpretation_scope", "notes"]
+        ]
+        missing_roles = [name for name in branch_names if name not in set(roles["branch_name"])]
+        if missing_roles:
+            roles = pd.concat(
+                [
+                    roles,
+                    pd.DataFrame(
+                        {
+                            "branch_name": missing_roles,
+                            "decision_type": ["unknown"] * len(missing_roles),
+                            "analysis_family": [pd.NA] * len(missing_roles),
+                            "interpretation_scope": [pd.NA] * len(missing_roles),
+                            "notes": [pd.NA] * len(missing_roles),
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
+        roles = roles.set_index("branch_name").loc[branch_names].reset_index()
+
+    def object_class(obj):
+        if obj is None:
+            return "NULL"
+        if isinstance(obj, pd.DataFrame):
+            return "data.frame"
+        if isinstance(obj, dict):
+            return "list"
+        if isinstance(obj, (list, tuple)):
+            return "list"
+        return type(obj).__name__
+
+    def object_type(obj):
+        if obj is None:
+            return "NULL"
+        if isinstance(obj, (dict, list, tuple, pd.DataFrame)):
+            return "list"
+        if isinstance(obj, (bool, np.bool_)):
+            return "logical"
+        if isinstance(obj, str):
+            return "character"
+        if isinstance(obj, (int, float, np.number)):
+            return "double"
+        return type(obj).__name__
+
+    def branch_status(obj):
+        if obj is None:
+            return "not_run"
+        if isinstance(obj, pd.DataFrame):
+            status_cols = [c for c in obj.columns if "status" in str(c)]
+            if status_cols:
+                vals = [str(x) for x in pd.unique(obj[status_cols[0]].dropna())]
+                if vals:
+                    return ", ".join(vals)
+            return "table_available"
+        if not isinstance(obj, dict):
+            return "object_available"
+        for nm in (
+            "model_status",
+            "sensitivity_status",
+            "cluster_status",
+            "summary_status",
+            "diagnostic_status",
+            "workflow_status",
+            "validation_status",
+            "status",
+        ):
+            if nm in obj and obj[nm] is not None:
+                value = obj[nm]
+                if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+                    return ", ".join(map(str, value))
+                return str(value)
+        overview = obj.get("overview")
+        if isinstance(overview, pd.DataFrame) and len(overview):
+            status_cols = [c for c in overview.columns if "status" in str(c)]
+            if status_cols:
+                vals = [str(x) for x in pd.unique(overview[status_cols[0]].dropna())]
+                if vals:
+                    return ", ".join(vals)
+        return "object_available"
+
+    def logical_field(obj, field):
+        if isinstance(obj, dict) and field in obj and isinstance(obj[field], (bool, np.bool_)):
+            return bool(obj[field])
+        return pd.NA
+
+    branch_rows = []
+    for name, obj in branches.items():
+        role = roles.loc[roles["branch_name"].eq(name)].iloc[0]
+        branch_rows.append(
+            {
+                "branch_name": name,
+                "decision_type": role["decision_type"],
+                "analysis_family": role["analysis_family"],
+                "interpretation_scope": role["interpretation_scope"],
+                "notes": role["notes"],
+                "branch_run": obj is not None,
+                "object_class": object_class(obj),
+                "object_type": object_type(obj),
+                "branch_status": branch_status(obj),
+                "fallback_used": logical_field(obj, "fallback_used"),
+                "singular_fit": logical_field(obj, "singular_fit"),
+                "has_model": isinstance(obj, dict) and obj.get("model") is not None,
+                "has_diagnostics": isinstance(obj, dict) and obj.get("diagnostics") is not None,
+            }
+        )
+    branch_audit = pd.DataFrame(branch_rows)
+
+    def status_is_warning(values):
+        out = []
+        for value in values:
+            x = str(value).lower()
+            out.append("warning" in x or "singular" in x or "overdispers" in x or "failed" in x)
+        return np.asarray(out, dtype=bool)
+
+    def status_is_error(values):
+        return np.asarray(["error" in str(x).lower() for x in values], dtype=bool)
+
+    def status_is_skipped(values):
+        return np.asarray(
+            [("skipped" in str(x).lower()) or ("not_applicable" in str(x).lower()) for x in values],
+            dtype=bool,
+        )
+
+    diagnostic_rows = []
+    for name, obj in branches.items():
+        if obj is None:
+            diagnostic_rows.append(
+                {
+                    "branch_name": name,
+                    "diagnostic_source": "none",
+                    "diagnostic_status": "not_run",
+                    "n_warning": np.nan,
+                    "n_error": np.nan,
+                    "n_skipped": np.nan,
+                    "message": "Branch was not run.",
+                }
+            )
+            continue
+        diagnostics = obj.get("diagnostics") if isinstance(obj, dict) else None
+        if diagnostics is None:
+            diagnostic_rows.append(
+                {
+                    "branch_name": name,
+                    "diagnostic_source": "none",
+                    "diagnostic_status": "not_available",
+                    "n_warning": np.nan,
+                    "n_error": np.nan,
+                    "n_skipped": np.nan,
+                    "message": "No diagnostics component was found.",
+                }
+            )
+            continue
+        tables = []
+        if isinstance(diagnostics, dict):
+            tables = [x for x in diagnostics.values() if isinstance(x, pd.DataFrame)]
+        elif isinstance(diagnostics, pd.DataFrame):
+            tables = [diagnostics]
+        if not tables:
+            diagnostic_rows.append(
+                {
+                    "branch_name": name,
+                    "diagnostic_source": "diagnostics",
+                    "diagnostic_status": "not_available",
+                    "n_warning": np.nan,
+                    "n_error": np.nan,
+                    "n_skipped": np.nan,
+                    "message": "Diagnostics object did not contain data-frame components.",
+                }
+            )
+            continue
+        combined = pd.concat(tables, ignore_index=True, sort=False)
+        status_cols = [c for c in combined.columns if "status" in str(c)]
+        message_cols = [c for c in combined.columns if "message" in str(c) or "warning" in str(c)]
+        status_values = []
+        for c in status_cols:
+            status_values.extend([str(x) for x in combined[c].tolist() if pd.notna(x) and str(x)])
+        messages = []
+        for c in message_cols:
+            messages.extend([str(x) for x in combined[c].tolist() if pd.notna(x) and str(x)])
+        if not status_values:
+            collapsed = "not_available"
+        elif status_is_error(status_values).any():
+            collapsed = "error"
+        elif status_is_warning(status_values).any():
+            collapsed = "diagnostic_warning"
+        elif status_is_skipped(status_values).any():
+            collapsed = "skipped"
+        else:
+            collapsed = "ok"
+        unique_messages = list(dict.fromkeys(messages))
+        diagnostic_rows.append(
+            {
+                "branch_name": name,
+                "diagnostic_source": "diagnostics",
+                "diagnostic_status": collapsed,
+                "n_warning": int(status_is_warning(status_values).sum()),
+                "n_error": int(status_is_error(status_values).sum()),
+                "n_skipped": int(status_is_skipped(status_values).sum()),
+                "message": " | ".join(unique_messages) if unique_messages else pd.NA,
+            }
+        )
+
+    diagnostics_summary = branch_audit[["branch_name", "decision_type"]].merge(
+        pd.DataFrame(diagnostic_rows), on="branch_name", how="left", sort=False
+    )
+
+    cautions = []
+
+    def add_caution(names, caution_type, level, message):
+        for name in names:
+            cautions.append(
+                {
+                    "branch_name": name,
+                    "caution_type": caution_type,
+                    "caution_level": level,
+                    "message": message,
+                }
+            )
+
+    add_caution(
+        branch_audit.loc[branch_audit["decision_type"].eq("unknown"), "branch_name"],
+        "unclassified_branch",
+        "moderate",
+        "Branch was run but not classified as confirmatory, sensitivity, exploratory, diagnostic, preprocessing, or reporting.",
+    )
+    add_caution(
+        branch_audit.loc[branch_audit["decision_type"].eq("exploratory"), "branch_name"],
+        "exploratory_not_confirmatory",
+        "moderate",
+        "Exploratory branches should not be reported as confirmatory hypothesis tests.",
+    )
+    add_caution(
+        branch_audit.loc[branch_audit["decision_type"].eq("sensitivity"), "branch_name"],
+        "sensitivity_not_primary",
+        "low",
+        "Sensitivity branches should be interpreted as robustness checks rather than primary confirmatory tests.",
+    )
+    run_names = set(branch_audit.loc[branch_audit["branch_run"], "branch_name"])
+    missing_required = [x for x in required_confirmatory if x not in run_names]
+    add_caution(
+        missing_required,
+        "missing_required_confirmatory_branch",
+        "high",
+        "A required confirmatory branch was not supplied or was not run.",
+    )
+    if diagnostics_required:
+        mask = (
+            branch_audit["decision_type"].eq("confirmatory")
+            & branch_audit["has_model"]
+            & ~branch_audit["has_diagnostics"]
+        )
+        add_caution(
+            branch_audit.loc[mask, "branch_name"],
+            "confirmatory_model_without_diagnostics",
+            "moderate",
+            "Confirmatory model branch has no extractable diagnostics component.",
+        )
+    warning_statuses = {"warning", "diagnostic_warning", "singular_fit", "overdispersed"}
+    warning_names = diagnostics_summary.loc[
+        diagnostics_summary["diagnostic_status"].isin(warning_statuses), "branch_name"
+    ]
+    add_caution(
+        warning_names,
+        "diagnostic_warning",
+        "high" if require_clean_diagnostics else "moderate",
+        "At least one diagnostic component returned a warning-like status.",
+    )
+    error_names = diagnostics_summary.loc[
+        diagnostics_summary["diagnostic_status"].eq("error"), "branch_name"
+    ]
+    add_caution(
+        error_names,
+        "diagnostic_error",
+        "high",
+        "At least one diagnostic component returned an error status.",
+    )
+    fallback_names = branch_audit.loc[
+        branch_audit["fallback_used"].fillna(False).astype(bool), "branch_name"
+    ]
+    add_caution(
+        fallback_names,
+        "fallback_model_used",
+        "moderate",
+        "A fallback model or fallback analysis path was used.",
+    )
+    singular_names = branch_audit.loc[
+        branch_audit["singular_fit"].fillna(False).astype(bool), "branch_name"
+    ]
+    add_caution(
+        singular_names,
+        "singular_fit",
+        "moderate",
+        "A singular random-effects structure was reported.",
+    )
+    interpretation_cautions = pd.DataFrame(
+        cautions, columns=["branch_name", "caution_type", "caution_level", "message"]
+    )
+
+    has_diag_error = diagnostics_summary["diagnostic_status"].eq("error").any()
+    has_required_warning = (
+        diagnostics_summary["branch_name"].isin(required_confirmatory)
+        & diagnostics_summary["diagnostic_status"].isin(warning_statuses)
+    ).any()
+    has_high = (
+        interpretation_cautions["caution_level"].eq("high").any()
+        if len(interpretation_cautions)
+        else False
+    )
+    has_any = bool(len(interpretation_cautions))
+    if missing_required:
+        readiness_status = "not_ready"
+        readiness_message = "Missing required confirmatory branch(es): " + ", ".join(
+            missing_required
+        )
+    elif has_diag_error:
+        readiness_status = "not_ready"
+        readiness_message = "At least one branch has a diagnostic error."
+    elif require_clean_diagnostics and has_required_warning:
+        readiness_status = "not_ready"
+        readiness_message = "A required confirmatory branch has diagnostic warnings and clean diagnostics were required."
+    elif has_high or has_any:
+        readiness_status = "ready_with_cautions"
+        readiness_message = (
+            "Analysis branches are available, but interpretation cautions should be reported."
+        )
+    else:
+        readiness_status = "ready"
+        readiness_message = (
+            "Analysis branches are available with no flagged interpretation cautions."
+        )
+
+    readiness = pd.DataFrame(
+        [
+            {
+                "readiness_status": readiness_status,
+                "message": readiness_message,
+                "n_required_confirmatory": len(required_confirmatory),
+                "n_missing_required_confirmatory": len(missing_required),
+                "n_cautions": len(interpretation_cautions),
+                "n_high_cautions": int(
+                    interpretation_cautions["caution_level"].eq("high").sum()
+                    if len(interpretation_cautions)
+                    else 0
+                ),
+                "require_clean_diagnostics": bool(require_clean_diagnostics),
+            }
+        ]
+    )
+    overview = pd.DataFrame(
+        [
+            {
+                "n_branches": len(branch_audit),
+                "n_confirmatory": int(branch_audit["decision_type"].eq("confirmatory").sum()),
+                "n_sensitivity": int(branch_audit["decision_type"].eq("sensitivity").sum()),
+                "n_exploratory": int(branch_audit["decision_type"].eq("exploratory").sum()),
+                "n_diagnostic": int(branch_audit["decision_type"].eq("diagnostic").sum()),
+                "n_preprocessing": int(branch_audit["decision_type"].eq("preprocessing").sum()),
+                "n_reporting": int(branch_audit["decision_type"].eq("reporting").sum()),
+                "n_unknown": int(branch_audit["decision_type"].eq("unknown").sum()),
+                "n_diagnostic_warnings": int(
+                    diagnostics_summary["diagnostic_status"].isin(warning_statuses).sum()
+                ),
+                "n_cautions": len(interpretation_cautions),
+                "readiness_status": readiness_status,
+                "readiness_message": readiness_message,
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "required_confirmatory",
+                "diagnostics_required",
+                "require_clean_diagnostics",
+            ],
+            "value": [
+                ", ".join(required_confirmatory),
+                "TRUE" if diagnostics_required else "FALSE",
+                "TRUE" if require_clean_diagnostics else "FALSE",
+            ],
+        }
+    )
+
+    class _AnalysisAuditResult(dict):
+        @property
+        def empty(self):
+            return False
+
+    return _AnalysisAuditResult(
+        {
+            "overview": overview,
+            "branch_audit": branch_audit,
+            "diagnostics_summary": diagnostics_summary,
+            "interpretation_cautions": interpretation_cautions,
+            "readiness": readiness,
+            "settings": settings,
+        }
     )
 
 

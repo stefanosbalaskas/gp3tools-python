@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from ._compat import r_aliases
-from ._utils import attach_attrs, ensure_dataframe, safe_path
+from ._utils import attach_attrs, safe_path
 
 _AUTO_COLUMN_RE = re.compile(r"^(?:\.\.\d+|Unnamed.*)$", re.IGNORECASE)
 
@@ -179,18 +179,81 @@ def read_gazepoint_face_export(path: str | Path, **kwargs) -> pd.DataFrame:
     return out
 
 
-def inspect_gazepoint_columns(data) -> pd.DataFrame:
-    """Return a compact audit of names, dtypes, missingness, and uniqueness."""
-    df = ensure_dataframe(data, copy=False)
-    return pd.DataFrame(
+def inspect_gazepoint_columns(data=None, *, x=None) -> pd.DataFrame:
+    """Inspect Gazepoint columns with R 2.3.0 semantics plus legacy aliases."""
+    import pandas as pd
+
+    if data is not None and x is not None:
+        raise TypeError(
+            "inspect_gazepoint_columns received both 'data' and "
+            "R-compatible alias 'x'; supply only one."
+        )
+    target = x if x is not None else data
+    if isinstance(target, (str, bytes)):
+        target = read_gazepoint(target)
+    else:
+        target = standardise_gazepoint_names(target)
+    if not isinstance(target, pd.DataFrame):
+        raise ValueError("x must be a data frame or path to a Gazepoint CSV export.")
+
+    groups = {
+        "identification": {"MEDIA_ID", "MEDIA_NAME", "CNT"},
+        "time": {"TIME", "TIMETICK"},
+        "fixation_gaze": {"FPOGX", "FPOGY", "FPOGS", "FPOGD", "FPOGID", "FPOGV"},
+        "best_gaze": {"BPOGX", "BPOGY", "BPOGV"},
+        "cursor_keyboard_user": {"CX", "CY", "CS", "KB", "KBS", "USER"},
+        "left_eye_pupil": {"LPCX", "LPCY", "LPD", "LPS", "LPV", "LPMM", "LPMMV"},
+        "right_eye_pupil": {"RPCX", "RPCY", "RPD", "RPS", "RPV", "RPMM", "RPMMV"},
+        "blink": {"BKID", "BKDUR", "BKPMIN"},
+        "biometrics": {
+            "DIAL",
+            "DIALV",
+            "GSR",
+            "GSR_US",
+            "GSR_US_TONIC",
+            "GSR_US_PHASIC",
+            "GSRV",
+            "HR",
+            "HRV",
+            "HRP",
+            "IBI",
+        },
+        "ttl": {"TTL0", "TTL1", "TTL2", "TTL3", "TTL4", "TTL5", "TTL6", "TTLV"},
+        "derived": {"PIXS", "PIXV", "AOI", "SACCADE_MAG", "SACCADE_DIR", "VID_FRAME"},
+    }
+
+    def semantic_group(column):
+        for name, members in groups.items():
+            if column in members:
+                return name
+        return "other"
+
+    def r_class(series):
+        dtype = series.dtype
+        if pd.api.types.is_bool_dtype(dtype):
+            return "logical"
+        if pd.api.types.is_integer_dtype(dtype):
+            return "integer"
+        if pd.api.types.is_float_dtype(dtype):
+            return "numeric"
+        if pd.api.types.is_datetime64_any_dtype(dtype):
+            return "POSIXct/POSIXt"
+        if isinstance(dtype, pd.CategoricalDtype):
+            return "factor"
+        return "character"
+
+    out = pd.DataFrame(
         {
-            "column": df.columns.astype(str),
-            "dtype": [str(t) for t in df.dtypes],
-            "n_missing": [int(df[c].isna().sum()) for c in df.columns],
-            "missing_prop": [float(df[c].isna().mean()) for c in df.columns],
-            "n_unique": [int(df[c].nunique(dropna=True)) for c in df.columns],
+            "column": [str(c) for c in target.columns],
+            "semantic_group": [semantic_group(str(c)) for c in target.columns],
+            "dtype": [r_class(target[c]) for c in target.columns],
+            "n_missing": [int(target[c].isna().sum()) for c in target.columns],
+            "pct_missing": [float(target[c].isna().mean() * 100) for c in target.columns],
         }
     )
+    out["missing_prop"] = out["pct_missing"] / 100.0
+    out["n_unique"] = [int(target[c].nunique(dropna=True)) for c in target.columns]
+    return out
 
 
 # BEGIN R V2.3.0 CALL-SURFACE ALIASES
