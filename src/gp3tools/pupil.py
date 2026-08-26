@@ -2192,55 +2192,695 @@ def audit_gazepoint_pupil_baseline(
 
 
 def audit_gazepoint_pupil_drift(
-    data, pupil_col=None, time_col=None, group_cols=None
-) -> pd.DataFrame:
+    data,
+    pupil_col=None,
+    time_col=None,
+    group_cols=None,
+    *,
+    order_col=None,
+    condition_col=None,
+    exclude_col=None,
+    include_excluded: bool = False,
+    min_valid_samples: int = 3,
+    max_abs_slope_per_min: float = 1.0,
+    max_condition_time_mean_diff_ms: float = 1000.0,
+    max_condition_order_mean_diff: float = 1.0,
+):
+    """Audit pupil drift using legacy or R v2.3.0 semantics."""
     df = ensure_dataframe(data, copy=False)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    time_col = infer_column(df, "time", time_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
-    rows = []
-    iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
-    for key, frame in iterator:
-        t = finite_numeric(frame[time_col]).to_numpy(float)
-        y = finite_numeric(frame[pupil_col]).to_numpy(float)
-        ok = np.isfinite(t) & np.isfinite(y)
-        slope, intercept, r, p, se = (
-            (np.nan,) * 5 if ok.sum() < 3 else stats.linregress(t[ok], y[ok])
+    r_mode = (
+        order_col is not None
+        or condition_col is not None
+        or exclude_col is not None
+        or include_excluded
+        or min_valid_samples != 3
+        or max_abs_slope_per_min != 1.0
+        or max_condition_time_mean_diff_ms != 1000.0
+        or max_condition_order_mean_diff != 1.0
+    )
+    if not r_mode:
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        time_col = infer_column(df, "time", time_col, required=True)
+        groups = normalize_group_cols(df, group_cols)
+        rows = []
+        iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
+        for key, frame in iterator:
+            if groups and not isinstance(key, tuple):
+                key = (key,)
+            t = finite_numeric(frame[time_col]).to_numpy(float)
+            y = finite_numeric(frame[pupil_col]).to_numpy(float)
+            ok = np.isfinite(t) & np.isfinite(y)
+            slope, intercept, r, p, se = (
+                (np.nan,) * 5 if ok.sum() < 3 else stats.linregress(t[ok], y[ok])
+            )
+            row = {c: v for c, v in zip(groups, key, strict=False)} if groups else {}
+            row.update(n=int(ok.sum()), slope=slope, r=r, p_value=p)
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    if group_cols is None:
+        groups = ["subject"]
+    elif isinstance(group_cols, str):
+        groups = [group_cols]
+    else:
+        groups = list(group_cols)
+    if (
+        not groups
+        or any(not isinstance(c, str) or not c for c in groups)
+        or len(set(groups)) != len(groups)
+    ):
+        raise ValueError("group_cols must contain unique non-empty column names")
+    if not isinstance(min_valid_samples, (int, np.integer)) or min_valid_samples < 1:
+        raise ValueError("min_valid_samples must be a positive integer")
+    for value, label in [
+        (max_abs_slope_per_min, "max_abs_slope_per_min"),
+        (max_condition_time_mean_diff_ms, "max_condition_time_mean_diff_ms"),
+        (max_condition_order_mean_diff, "max_condition_order_mean_diff"),
+    ]:
+        if not np.isfinite(value):
+            raise ValueError(f"{label} must be a finite numeric scalar")
+
+    if pupil_col is None:
+        pupil_col = next(
+            (
+                c
+                for c in [
+                    "pupil_smoothed",
+                    "pupil_baseline_corrected",
+                    "pupil_interpolated",
+                    "pupil_clean",
+                    "pupil",
+                ]
+                if c in df
+            ),
+            None,
         )
-        row = {c: v for c, v in zip(groups, key, strict=False)} if groups else {}
-        row.update(n=int(ok.sum()), slope=slope, r=r, p_value=p)
-        rows.append(row)
-    return pd.DataFrame(rows)
+    if pupil_col is None:
+        raise KeyError("Could not automatically detect a pupil column")
+    time_col = "time" if time_col is None else time_col
+    order_col = "trial" if order_col is None else order_col
+    condition_col = "condition" if condition_col is None else condition_col
+    exclude_col = "excluded_trial" if exclude_col is None else exclude_col
 
+    required = list(
+        dict.fromkeys(
+            groups
+            + [pupil_col, time_col]
+            + ([order_col] if order_col else [])
+            + ([condition_col] if condition_col else [])
+        )
+    )
+    missing = [c for c in required if c not in df]
+    if missing:
+        raise KeyError(f"Missing required columns: {', '.join(missing)}")
 
-def audit_gazepoint_pupil_reliability(
-    data, pupil_col=None, subject_col=None, split_col=None
-) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    subject_col = infer_column(df, "subject", subject_col)
-    if subject_col is None:
-        x = finite_numeric(df[pupil_col])
-        half = np.arange(len(df)) % 2
-        means = pd.DataFrame({"half": half, "x": x}).groupby("half").x.mean()
-        return pd.DataFrame(
+    work = df.copy()
+    work[".gp3_drift_pupil"] = pd.to_numeric(work[pupil_col], errors="coerce")
+    work[".gp3_drift_time"] = pd.to_numeric(work[time_col], errors="coerce")
+    work[".gp3_drift_order"] = (
+        pd.to_numeric(work[order_col], errors="coerce") if order_col else np.nan
+    )
+    work[".gp3_drift_condition"] = (
+        work[condition_col].astype("string")
+        if condition_col
+        else pd.Series(pd.NA, index=work.index, dtype="string")
+    )
+
+    if exclude_col and exclude_col in work and not include_excluded:
+        raw = work[exclude_col]
+        if pd.api.types.is_bool_dtype(raw):
+            excluded = raw.fillna(False).astype(bool)
+        elif pd.api.types.is_numeric_dtype(raw):
+            excluded = pd.to_numeric(raw, errors="coerce").fillna(0).ne(0)
+        else:
+            excluded = (
+                raw.astype("string").str.strip().str.lower().isin(["true", "t", "1", "yes", "y"])
+            )
+        work = work.loc[~excluded].copy()
+
+    def _num(series):
+        return pd.to_numeric(series, errors="coerce").astype(float)
+
+    def _summary(frame, cols):
+        rows = []
+        iterator = [((), frame)] if not cols else frame.groupby(cols, dropna=False, sort=False)
+        for key, part in iterator:
+            if cols and not isinstance(key, tuple):
+                key = (key,)
+            y = _num(part[".gp3_drift_pupil"]).to_numpy(float)
+            t = _num(part[".gp3_drift_time"]).to_numpy(float)
+            o = _num(part[".gp3_drift_order"]).to_numpy(float)
+            pair = np.isfinite(y) & np.isfinite(t)
+            yv = y[np.isfinite(y)]
+            tv = t[np.isfinite(t)]
+            ov = o[np.isfinite(o)]
+            slope = np.nan
+            corr = np.nan
+            if pair.sum() >= min_valid_samples and np.unique(t[pair]).size >= 2:
+                slope = float(np.polyfit(t[pair], y[pair], 1)[0])
+                if np.std(y[pair], ddof=1) > 0 and np.std(t[pair], ddof=1) > 0:
+                    corr = float(np.corrcoef(y[pair], t[pair])[0, 1])
+            row = {c: v for c, v in zip(cols, key, strict=False)} if cols else {}
+            row.update(
+                {
+                    "n_rows": int(len(part)),
+                    "n_valid_pupil": int(pair.sum()),
+                    "valid_pupil_pct": 100.0 * pair.sum() / len(part) if len(part) else np.nan,
+                    "pupil_mean": float(np.mean(yv)) if len(yv) else np.nan,
+                    "pupil_sd": float(np.std(yv, ddof=1)) if len(yv) >= 2 else np.nan,
+                    "time_min": float(np.min(tv)) if len(tv) else np.nan,
+                    "time_mean": float(np.mean(tv)) if len(tv) else np.nan,
+                    "time_max": float(np.max(tv)) if len(tv) else np.nan,
+                    "time_range": float(np.ptp(tv)) if len(tv) else np.nan,
+                    "order_min": float(np.min(ov)) if len(ov) else np.nan,
+                    "order_mean": float(np.mean(ov)) if len(ov) else np.nan,
+                    "order_max": float(np.max(ov)) if len(ov) else np.nan,
+                    "order_range": float(np.ptp(ov)) if len(ov) else np.nan,
+                    "pupil_time_slope_per_ms": slope,
+                    "pupil_time_r": corr,
+                }
+            )
+            per_min = slope * 60000 if np.isfinite(slope) else np.nan
+            abs_per_min = abs(per_min) if np.isfinite(per_min) else np.nan
+            warning = bool(np.isfinite(abs_per_min) and abs_per_min > max_abs_slope_per_min)
+            row.update(
+                {
+                    "pupil_time_slope_per_sec": slope * 1000 if np.isfinite(slope) else np.nan,
+                    "pupil_time_slope_per_min": per_min,
+                    "abs_pupil_time_slope_per_min": abs_per_min,
+                    "drift_direction": "not_estimated"
+                    if not np.isfinite(per_min)
+                    else ("increasing" if per_min > 0 else "decreasing" if per_min < 0 else "flat"),
+                    "drift_warning": warning,
+                    "drift_status": "insufficient_valid_samples"
+                    if pair.sum() < min_valid_samples
+                    else "not_estimated"
+                    if not np.isfinite(per_min)
+                    else "possible_drift"
+                    if warning
+                    else "ok",
+                }
+            )
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    by_group = _summary(work, groups)
+    by_subject = _summary(work, ["subject"]) if "subject" in work else pd.DataFrame()
+    has_condition = bool(condition_col and condition_col in work)
+    nonmissing_condition = has_condition and work[condition_col].notna().any()
+    by_condition = (
+        _summary(work.loc[work[condition_col].notna()], [condition_col])
+        if nonmissing_condition
+        else pd.DataFrame()
+    )
+
+    def _range(series):
+        vals = pd.to_numeric(series, errors="coerce").dropna().to_numpy(float)
+        return float(np.ptp(vals)) if len(vals) else np.nan
+
+    if nonmissing_condition:
+        time_range = _range(by_condition["time_mean"])
+        order_range = _range(by_condition["order_mean"])
+        time_warn = bool(np.isfinite(time_range) and time_range > max_condition_time_mean_diff_ms)
+        order_warn = bool(np.isfinite(order_range) and order_range > max_condition_order_mean_diff)
+        reason = (
+            "time_mean_diff;order_mean_diff"
+            if time_warn and order_warn
+            else "time_mean_diff"
+            if time_warn
+            else "order_mean_diff"
+            if order_warn
+            else "ok"
+        )
+        condition_balance = pd.DataFrame(
             [
                 {
-                    "split_half_correlation": np.nan,
-                    "mean_even": means.get(0, np.nan),
-                    "mean_odd": means.get(1, np.nan),
+                    "n_conditions": int(len(by_condition)),
+                    "condition_time_mean_range": time_range,
+                    "condition_order_mean_range": order_range,
+                    "condition_time_imbalance_warning": time_warn,
+                    "condition_order_imbalance_warning": order_warn,
+                    "condition_balance_warning": time_warn or order_warn,
+                    "condition_balance_reason": reason,
                 }
             ]
         )
-    work = df[[subject_col, pupil_col]].copy()
-    work["_half"] = work.groupby(subject_col).cumcount() % 2
-    work["_p"] = finite_numeric(work[pupil_col])
-    piv = work.groupby([subject_col, "_half"])._p.mean().unstack()
-    r = float(piv.corr().iloc[0, 1]) if piv.shape[1] >= 2 else np.nan
-    sb = 2 * r / (1 + r) if np.isfinite(r) and r != -1 else np.nan
-    return pd.DataFrame(
-        [{"n_subjects": len(piv), "split_half_correlation": r, "spearman_brown": sb}]
+    elif has_condition:
+        condition_balance = pd.DataFrame(
+            [
+                {
+                    "n_conditions": 0,
+                    "condition_time_mean_range": np.nan,
+                    "condition_order_mean_range": np.nan,
+                    "condition_time_imbalance_warning": False,
+                    "condition_order_imbalance_warning": False,
+                    "condition_balance_warning": False,
+                    "condition_balance_reason": "no_non_missing_conditions",
+                }
+            ]
+        )
+    else:
+        condition_balance = pd.DataFrame(
+            [
+                {
+                    "n_conditions": np.nan,
+                    "condition_time_mean_range": np.nan,
+                    "condition_order_mean_range": np.nan,
+                    "condition_time_imbalance_warning": np.nan,
+                    "condition_order_imbalance_warning": np.nan,
+                    "condition_balance_warning": np.nan,
+                    "condition_balance_reason": "condition_col_not_available",
+                }
+            ]
+        )
+
+    summary = pd.DataFrame(
+        [
+            {
+                "n_rows": int(len(work)),
+                "pupil_column": pupil_col,
+                "time_column": time_col,
+                "order_column": order_col,
+                "condition_column": condition_col,
+                "n_by_group": int(len(by_group)),
+                "n_subjects": int(len(by_subject)),
+                "n_conditions": condition_balance.iloc[0]["n_conditions"],
+                "n_group_drift_warnings": int(by_group["drift_warning"].sum())
+                if len(by_group)
+                else 0,
+                "n_subject_drift_warnings": int(by_subject["drift_warning"].sum())
+                if len(by_subject)
+                else np.nan,
+                "condition_balance_warning": condition_balance.iloc[0]["condition_balance_warning"],
+            }
+        ]
     )
+    return {
+        "by_group": by_group,
+        "by_subject": by_subject,
+        "by_condition": by_condition,
+        "condition_balance": condition_balance,
+        "summary": summary,
+        "_gp3_class": "gp3_pupil_drift_audit",
+    }
+
+
+def audit_gazepoint_pupil_reliability(
+    data,
+    pupil_col=None,
+    subject_col=None,
+    split_col=None,
+    *,
+    outcome_cols=None,
+    participant_col=None,
+    trial_col=None,
+    by_cols=None,
+    split_method="odd_even",
+    aggregate_function="mean",
+    correlation_method="pearson",
+    min_trials_per_split: int = 2,
+    name="gazepoint_pupil_reliability",
+):
+    """Audit split-half pupil reliability with legacy or R v2.3.0 outputs."""
+    df = ensure_dataframe(data, copy=False)
+    r_mode = (
+        outcome_cols is not None
+        or participant_col is not None
+        or trial_col is not None
+        or by_cols is not None
+        or split_method != "odd_even"
+        or aggregate_function != "mean"
+        or correlation_method != "pearson"
+        or min_trials_per_split != 2
+        or name != "gazepoint_pupil_reliability"
+    )
+    if not r_mode:
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        subject_col = infer_column(df, "subject", subject_col)
+        if subject_col is None:
+            x = finite_numeric(df[pupil_col])
+            half = np.arange(len(df)) % 2
+            means = pd.DataFrame({"half": half, "x": x}).groupby("half").x.mean()
+            return pd.DataFrame(
+                [
+                    {
+                        "split_half_correlation": np.nan,
+                        "mean_even": means.get(0, np.nan),
+                        "mean_odd": means.get(1, np.nan),
+                    }
+                ]
+            )
+        work = df[[subject_col, pupil_col]].copy()
+        work["_half"] = work.groupby(subject_col).cumcount() % 2
+        work["_p"] = finite_numeric(work[pupil_col])
+        piv = work.groupby([subject_col, "_half"])._p.mean().unstack()
+        r = float(piv.corr().iloc[0, 1]) if piv.shape[1] >= 2 else np.nan
+        sb = 2 * r / (1 + r) if np.isfinite(r) and r != -1 else np.nan
+        return pd.DataFrame(
+            [{"n_subjects": len(piv), "split_half_correlation": r, "spearman_brown": sb}]
+        )
+
+    if len(df) == 0:
+        raise ValueError("data must contain at least one row")
+    if split_method not in {"odd_even", "first_second"}:
+        raise ValueError("split_method must be odd_even or first_second")
+    if aggregate_function not in {"mean", "median"}:
+        raise ValueError("aggregate_function must be mean or median")
+    if correlation_method not in {"pearson", "spearman"}:
+        raise ValueError("correlation_method must be pearson or spearman")
+    if not isinstance(min_trials_per_split, (int, np.integer)) or min_trials_per_split < 1:
+        raise ValueError("min_trials_per_split must be a positive integer")
+    if not isinstance(name, str) or not name:
+        raise ValueError("name must be a non-empty string")
+
+    names = set(df.columns)
+    if participant_col is None:
+        participant_col = next(
+            (
+                c
+                for c in [
+                    "subject",
+                    "participant",
+                    "participant_id",
+                    "pID",
+                    "USER_FILE",
+                    "user",
+                    "user_id",
+                    "recording_id",
+                ]
+                if c in names
+            ),
+            None,
+        )
+    if participant_col is None or participant_col not in df:
+        raise KeyError("participant_col could not be detected")
+    if trial_col is None:
+        trial_col = next(
+            (
+                c
+                for c in [
+                    "trial_global",
+                    "trial",
+                    "trial_id",
+                    "TRIAL_INDEX",
+                    "trial_number",
+                    "item_trial",
+                    "sample_index",
+                ]
+                if c in names
+            ),
+            None,
+        )
+    elif trial_col not in df:
+        raise KeyError("trial_col must be present in data")
+    if split_col is not None and split_col not in df:
+        raise KeyError("split_col must be present in data")
+    by = [] if by_cols is None else ([by_cols] if isinstance(by_cols, str) else list(by_cols))
+    missing_by = [c for c in by if c not in df]
+    if missing_by:
+        raise KeyError(f"Missing by_cols: {missing_by}")
+
+    if outcome_cols is None:
+        preferred = [
+            "auc_pupil_0_2000",
+            "mean_pupil_0_2000",
+            "peak_pupil_0_2000",
+            "latency_to_peak_ms",
+            "mean_pupil_window",
+            "pupil_window_mean",
+            "pupil_mean",
+            "pupil_peak",
+            "pupil_auc",
+            "mean_pupil",
+            "peak_pupil",
+            "auc_pupil",
+            "pupil",
+        ]
+        outcomes = [c for c in preferred if c in df and pd.api.types.is_numeric_dtype(df[c])]
+        if not outcomes:
+            excluded = {participant_col, trial_col, split_col, *by}
+            bad_tokens = (
+                "count",
+                "prop",
+                "percent",
+                "missing",
+                "valid",
+                "sample",
+                "trial",
+                "time_bin",
+                "order",
+            )
+            outcomes = [
+                c
+                for c in df.columns
+                if c not in excluded
+                and pd.api.types.is_numeric_dtype(df[c])
+                and not c.startswith("n_")
+                and not c.endswith("_n")
+                and not any(token in c.lower() for token in bad_tokens)
+            ]
+    else:
+        outcomes = [outcome_cols] if isinstance(outcome_cols, str) else list(outcome_cols)
+        missing = [c for c in outcomes if c not in df]
+        if missing:
+            raise KeyError(f"Missing outcome_cols: {missing}")
+        outcomes = [c for c in outcomes if pd.api.types.is_numeric_dtype(df[c])]
+    if not outcomes:
+        raise ValueError("outcome_cols must include at least one numeric column")
+    by = [c for c in by if c not in {participant_col, trial_col, split_col, *outcomes}]
+
+    if trial_col is not None:
+        trial_raw = df[trial_col]
+        trial_text = trial_raw.astype("string")
+        if pd.api.types.is_numeric_dtype(trial_raw):
+            trial_order = pd.to_numeric(trial_raw, errors="coerce").to_numpy(float)
+        else:
+            trial_order = np.array(
+                [
+                    float(m[-1]) if (m := __import__("re").findall(r"[0-9]+", str(v))) else np.nan
+                    for v in trial_raw
+                ]
+            )
+    else:
+        trial_text = pd.Series(np.arange(1, len(df) + 1), index=df.index).astype("string")
+        trial_order = np.arange(1, len(df) + 1, dtype=float)
+
+    split_data = pd.DataFrame(
+        {
+            ".row_id": np.arange(1, len(df) + 1),
+            "participant": df[participant_col].astype("string"),
+            "trial": trial_text,
+            "trial_order": trial_order,
+        }
+    )
+    for c in by + outcomes:
+        split_data[c] = df[c].to_numpy(copy=False)
+
+    if split_col is not None:
+        raw = df[split_col].astype("string").replace("", pd.NA)
+        levels = sorted(raw.dropna().unique().tolist())
+        if len(levels) != 2:
+            raise ValueError("split_col must contain exactly two non-missing split levels")
+        split_data["split"] = raw
+        split_data = split_data.loc[split_data["split"].notna()].copy()
+        split_levels = levels
+        used_split_method = "predefined_split_col"
+    else:
+        split_parts = []
+        key_cols = ["participant"] + by
+        for _, part in split_data.groupby(key_cols, dropna=False, sort=False):
+            part = part.sort_values(
+                ["trial_order", ".row_id"], kind="stable", na_position="last"
+            ).copy()
+            part[".within_group_order"] = np.arange(1, len(part) + 1)
+            part[".n_in_group"] = len(part)
+            split_number = part["trial_order"].to_numpy(float)
+            fallback = part[".within_group_order"].to_numpy(float)
+            split_number = np.where(np.isfinite(split_number), split_number, fallback)
+            part[".split_number"] = split_number
+            if split_method == "odd_even":
+                part["split"] = np.where(split_number % 2 == 0, "even", "odd")
+            else:
+                part["split"] = np.where(
+                    part[".within_group_order"] <= np.ceil(len(part) / 2), "first", "second"
+                )
+            split_parts.append(part)
+        split_data = pd.concat(split_parts, ignore_index=True)
+        split_levels = ["odd", "even"] if split_method == "odd_even" else ["first", "second"]
+        used_split_method = split_method
+
+    long = split_data.melt(
+        id_vars=[".row_id", "participant", "trial", "trial_order"]
+        + by
+        + ["split"]
+        + [c for c in [".within_group_order", ".n_in_group", ".split_number"] if c in split_data],
+        value_vars=outcomes,
+        var_name="outcome",
+        value_name="value",
+    )
+    split_rows = []
+    group_keys = ["participant"] + by + ["outcome", "split"]
+    for key, part in long.groupby(group_keys, dropna=False, sort=False):
+        if not isinstance(key, tuple):
+            key = (key,)
+        vals = pd.to_numeric(part["value"], errors="coerce")
+        finite = vals[np.isfinite(vals.to_numpy(float))]
+        split_value = (
+            float(finite.median() if aggregate_function == "median" else finite.mean())
+            if len(finite)
+            else np.nan
+        )
+        row = {c: v for c, v in zip(group_keys, key, strict=False)}
+        row.update(n_trials=int(len(part)), n_valid=int(len(finite)), split_value=split_value)
+        split_rows.append(row)
+    split_summary = pd.DataFrame(split_rows)
+
+    key_cols = ["participant"] + by + ["outcome"]
+
+    def _side(label, prefix):
+        side = split_summary.loc[
+            split_summary["split"].astype(str) == str(label),
+            key_cols + ["n_trials", "n_valid", "split_value"],
+        ].copy()
+        return side.rename(
+            columns={
+                "n_trials": f"{prefix}_n_trials",
+                "n_valid": f"{prefix}_n_valid",
+                "split_value": f"{prefix}_value",
+            }
+        )
+
+    left = _side(split_levels[0], "split1")
+    right = _side(split_levels[1], "split2")
+    pairs = left.merge(right, on=key_cols, how="outer", sort=False)
+    pairs["split1_label"] = split_levels[0]
+    pairs["split2_label"] = split_levels[1]
+    if len(pairs):
+        pairs["complete_pair"] = (
+            np.isfinite(pd.to_numeric(pairs["split1_value"], errors="coerce"))
+            & np.isfinite(pd.to_numeric(pairs["split2_value"], errors="coerce"))
+            & (pairs["split1_n_valid"].fillna(0) >= min_trials_per_split)
+            & (pairs["split2_n_valid"].fillna(0) >= min_trials_per_split)
+        )
+    else:
+        pairs["complete_pair"] = pd.Series(dtype=bool)
+
+    rel_rows = []
+    rel_keys = by + ["outcome"]
+    for key, part in pairs.groupby(rel_keys, dropna=False, sort=False) if len(pairs) else []:
+        if not isinstance(key, tuple):
+            key = (key,)
+        ok = part["complete_pair"].fillna(False).to_numpy(bool)
+        x = pd.to_numeric(part.loc[ok, "split1_value"], errors="coerce").to_numpy(float)
+        y = pd.to_numeric(part.loc[ok, "split2_value"], errors="coerce").to_numpy(float)
+        n_complete = len(x)
+        sd1 = float(np.std(x, ddof=1)) if n_complete >= 2 else np.nan
+        sd2 = float(np.std(y, ddof=1)) if n_complete >= 2 else np.nan
+        corr = np.nan
+        if n_complete >= 3 and np.isfinite(sd1) and np.isfinite(sd2) and sd1 != 0 and sd2 != 0:
+            corr = (
+                float(np.corrcoef(x, y)[0, 1])
+                if correlation_method == "pearson"
+                else float(stats.spearmanr(x, y).statistic)
+            )
+        sb = 2 * corr / (1 + corr) if np.isfinite(corr) and (1 + corr) != 0 else np.nan
+        status = (
+            "too_few_complete_pairs"
+            if n_complete < 3 or not np.isfinite(sd1) or not np.isfinite(sd2)
+            else "constant_split_values"
+            if sd1 == 0 or sd2 == 0
+            else "correlation_unavailable"
+            if not np.isfinite(corr)
+            else "ready"
+        )
+        row = {c: v for c, v in zip(rel_keys, key, strict=False)}
+        row.update(
+            {
+                "n_participants": int(part["participant"].nunique(dropna=True)),
+                "n_complete_pairs": int(n_complete),
+                "split1_label": split_levels[0],
+                "split2_label": split_levels[1],
+                "split1_mean": float(np.mean(x)) if n_complete else np.nan,
+                "split2_mean": float(np.mean(y)) if n_complete else np.nan,
+                "split1_sd": sd1,
+                "split2_sd": sd2,
+                "split_half_correlation": corr,
+                "spearman_brown_reliability": sb,
+                "reliability_status": status,
+            }
+        )
+        rel_rows.append(row)
+    reliability_summary = pd.DataFrame(rel_rows)
+
+    n_by_groups = 1 if not by else split_data[by].drop_duplicates().shape[0]
+    overview = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "n_input_rows": int(len(df)),
+                "n_rows_used": int(len(split_data)),
+                "n_participants": int(split_data["participant"].nunique(dropna=True)),
+                "n_outcomes": int(len(outcomes)),
+                "n_by_groups": int(n_by_groups),
+                "n_reliability_rows": int(len(reliability_summary)),
+                "n_ready_reliability_rows": int(
+                    (
+                        reliability_summary.get("reliability_status", pd.Series(dtype=object))
+                        == "ready"
+                    ).sum()
+                ),
+                "split_method": used_split_method,
+                "aggregate_function": aggregate_function,
+                "correlation_method": correlation_method,
+                "min_trials_per_split": int(min_trials_per_split),
+            }
+        ]
+    )
+
+    def _collapse(value):
+        if value is None:
+            return "NULL"
+        if isinstance(value, (list, tuple)):
+            return ",".join(map(str, value)) if value else "NULL"
+        return str(value)
+
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "outcome_cols",
+                "participant_col",
+                "trial_col",
+                "split_col",
+                "by_cols",
+                "split_method",
+                "aggregate_function",
+                "correlation_method",
+                "min_trials_per_split",
+                "name",
+            ],
+            "value": [
+                _collapse(outcomes),
+                participant_col,
+                _collapse(trial_col),
+                _collapse(split_col),
+                _collapse(by),
+                split_method,
+                aggregate_function,
+                correlation_method,
+                str(min_trials_per_split),
+                name,
+            ],
+        }
+    )
+    return {
+        "overview": overview,
+        "split_data": split_data,
+        "split_summary": split_summary,
+        "reliability_pairs": pairs,
+        "reliability_summary": reliability_summary,
+        "settings": settings,
+        "_gp3_class": "gp3_pupil_reliability_audit",
+    }
 
 
 def audit_gazepoint_pupil_imbalance(
@@ -2381,27 +3021,301 @@ def audit_gazepoint_pupil_imbalance(
 
 
 def audit_gazepoint_pupil_overlap_risk(
-    data, trial_duration_ms=3000, event_gap_ms=1000, trial_col=None, time_col=None
-) -> pd.DataFrame:
+    data,
+    trial_duration_ms=3000,
+    event_gap_ms=1000,
+    trial_col=None,
+    time_col=None,
+    *,
+    group_cols=None,
+    event_time_cols=None,
+    window_start_ms=None,
+    window_end_ms=None,
+    min_event_gap_ms=None,
+    exclude_col=None,
+    include_excluded: bool = False,
+):
+    """Audit event-related pupil-window overlap using legacy or R semantics."""
     df = ensure_dataframe(data, copy=False)
-    trial_col = infer_column(df, "trial", trial_col)
-    time_col = infer_column(df, "time", time_col)
-    if trial_col and time_col:
-        work = df.copy()
-        work["_t"] = finite_numeric(work[time_col])
-        out = work.groupby(trial_col, dropna=False)._t.agg(["min", "max", "count"]).reset_index()
-        out["duration"] = out["max"] - out["min"]
-        out["overlap_risk"] = out["duration"] < trial_duration_ms
-        return out
-    return pd.DataFrame(
+    r_mode = (
+        group_cols is not None
+        or event_time_cols is not None
+        or window_start_ms is not None
+        or window_end_ms is not None
+        or min_event_gap_ms is not None
+        or exclude_col is not None
+        or include_excluded
+    )
+    if not r_mode:
+        trial_col = infer_column(df, "trial", trial_col)
+        time_col = infer_column(df, "time", time_col)
+        if trial_col and time_col:
+            work = df.copy()
+            work["_t"] = finite_numeric(work[time_col])
+            out = (
+                work.groupby(trial_col, dropna=False)._t.agg(["min", "max", "count"]).reset_index()
+            )
+            out["duration"] = out["max"] - out["min"]
+            out["overlap_risk"] = out["duration"] < trial_duration_ms
+            return out
+        return pd.DataFrame(
+            [
+                {
+                    "trial_duration_ms_threshold": trial_duration_ms,
+                    "event_gap_ms_threshold": event_gap_ms,
+                    "status": "insufficient_columns",
+                }
+            ]
+        )
+
+    groups = (
+        ["subject"]
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    if (
+        not groups
+        or len(set(groups)) != len(groups)
+        or any(not isinstance(c, str) or not c for c in groups)
+    ):
+        raise ValueError("group_cols must contain unique non-empty column names")
+    trial_col = "trial_global" if trial_col is None else trial_col
+    time_col = "time" if time_col is None else time_col
+    event_time_cols = (
+        ["stimulus_onset_time", "target_onset_time", "response_time"]
+        if event_time_cols is None
+        else ([event_time_cols] if isinstance(event_time_cols, str) else list(event_time_cols))
+    )
+    if not event_time_cols or len(set(event_time_cols)) != len(event_time_cols):
+        raise ValueError("event_time_cols must be a non-empty vector of unique column names")
+    window_start_ms = 0.0 if window_start_ms is None else float(window_start_ms)
+    window_end_ms = 2000.0 if window_end_ms is None else float(window_end_ms)
+    min_event_gap_ms = 1000.0 if min_event_gap_ms is None else float(min_event_gap_ms)
+    exclude_col = "excluded_trial" if exclude_col is None else exclude_col
+    if not all(np.isfinite(v) for v in [window_start_ms, window_end_ms, min_event_gap_ms]):
+        raise ValueError("window/gap arguments must be finite")
+    if window_end_ms <= window_start_ms:
+        raise ValueError("window_end_ms must be greater than window_start_ms")
+    required = list(dict.fromkeys(groups + [trial_col, time_col] + event_time_cols))
+    missing = [c for c in required if c not in df]
+    if missing:
+        raise KeyError(f"Missing required columns: {', '.join(missing)}")
+
+    work = df.copy()
+    if exclude_col and exclude_col in work and not include_excluded:
+        raw = work[exclude_col]
+        if pd.api.types.is_bool_dtype(raw):
+            excluded = raw.fillna(False).astype(bool)
+        elif pd.api.types.is_numeric_dtype(raw):
+            excluded = pd.to_numeric(raw, errors="coerce").fillna(0).ne(0)
+        else:
+            excluded = (
+                raw.astype("string").str.strip().str.lower().isin(["true", "t", "1", "yes", "y"])
+            )
+        work = work.loc[~excluded].copy()
+
+    keys = list(dict.fromkeys(groups + [trial_col]))
+    trial_rows = []
+    iterator = work.groupby(keys, dropna=False, sort=False)
+    for key, part in iterator:
+        if not isinstance(key, tuple):
+            key = (key,)
+        t = pd.to_numeric(part[time_col], errors="coerce").dropna().to_numpy(float)
+        row = {c: v for c, v in zip(keys, key, strict=False)}
+        row.update(
+            {
+                "n_rows": int(len(part)),
+                "trial_time_min": float(np.min(t)) if len(t) else np.nan,
+                "trial_time_mean": float(np.mean(t)) if len(t) else np.nan,
+                "trial_time_max": float(np.max(t)) if len(t) else np.nan,
+                "trial_time_range_ms": float(np.ptp(t)) if len(t) else np.nan,
+            }
+        )
+        trial_rows.append(row)
+    by_trial_base = pd.DataFrame(trial_rows)
+
+    event_frames = []
+    for event_col in event_time_cols:
+        e = work[keys].copy()
+        e["event_name"] = event_col
+        e["event_time_ms"] = pd.to_numeric(work[event_col], errors="coerce")
+        e = e.loc[e["event_time_ms"].notna()].drop_duplicates()
+        event_frames.append(e)
+    events = (
+        pd.concat(event_frames, ignore_index=True)
+        if event_frames
+        else pd.DataFrame(columns=keys + ["event_name", "event_time_ms"])
+    )
+    if len(events):
+        events["response_window_start_ms"] = events["event_time_ms"] + window_start_ms
+        events["response_window_end_ms"] = events["event_time_ms"] + window_end_ms
+        events["response_window_duration_ms"] = window_end_ms - window_start_ms
+        events = events.sort_values(
+            keys + ["event_time_ms", "event_name"], kind="stable"
+        ).reset_index(drop=True)
+    else:
+        for c in [
+            "response_window_start_ms",
+            "response_window_end_ms",
+            "response_window_duration_ms",
+        ]:
+            events[c] = pd.Series(dtype=float)
+
+    event_gaps = events.copy()
+    if len(event_gaps):
+        parts = []
+        for _, part in event_gaps.groupby(keys, dropna=False, sort=False):
+            part = part.copy()
+            part["previous_event_name"] = part["event_name"].shift(1)
+            part["previous_event_time_ms"] = part["event_time_ms"].shift(1)
+            part["previous_response_window_end_ms"] = part["response_window_end_ms"].shift(1)
+            part["event_gap_ms"] = part["event_time_ms"] - part["previous_event_time_ms"]
+            part["short_event_gap"] = part["event_gap_ms"].notna() & (
+                part["event_gap_ms"] < min_event_gap_ms
+            )
+            part["response_window_overlap"] = part["previous_response_window_end_ms"].notna() & (
+                part["response_window_start_ms"] < part["previous_response_window_end_ms"]
+            )
+            part["overlap_amount_ms"] = np.where(
+                part["response_window_overlap"],
+                part["previous_response_window_end_ms"] - part["response_window_start_ms"],
+                0.0,
+            )
+            part["event_gap_status"] = np.select(
+                [
+                    part["previous_event_time_ms"].isna(),
+                    part["response_window_overlap"] & part["short_event_gap"],
+                    part["response_window_overlap"],
+                    part["short_event_gap"],
+                ],
+                [
+                    "first_event",
+                    "overlap_and_short_gap",
+                    "overlapping_response_window",
+                    "short_event_gap",
+                ],
+                default="ok",
+            )
+            parts.append(part)
+        event_gaps = pd.concat(parts, ignore_index=True)
+    else:
+        for c, dtype in [
+            ("previous_event_name", object),
+            ("previous_event_time_ms", float),
+            ("previous_response_window_end_ms", float),
+            ("event_gap_ms", float),
+            ("short_event_gap", bool),
+            ("response_window_overlap", bool),
+            ("overlap_amount_ms", float),
+            ("event_gap_status", object),
+        ]:
+            event_gaps[c] = pd.Series(dtype=dtype)
+
+    summary_rows = []
+    if len(event_gaps):
+        for key, part in event_gaps.groupby(keys, dropna=False, sort=False):
+            if not isinstance(key, tuple):
+                key = (key,)
+            gaps = pd.to_numeric(part["event_gap_ms"], errors="coerce").dropna().to_numpy(float)
+            overlap_amount = (
+                pd.to_numeric(part["overlap_amount_ms"], errors="coerce").dropna().to_numpy(float)
+            )
+            n_short = int(part["short_event_gap"].sum())
+            n_overlap = int(part["response_window_overlap"].sum())
+            row = {c: v for c, v in zip(keys, key, strict=False)}
+            row.update(
+                {
+                    "n_events": int(len(part)),
+                    "n_event_gaps": int(len(gaps)),
+                    "min_event_gap_observed_ms": float(np.min(gaps)) if len(gaps) else np.nan,
+                    "mean_event_gap_observed_ms": float(np.mean(gaps)) if len(gaps) else np.nan,
+                    "max_event_gap_observed_ms": float(np.max(gaps)) if len(gaps) else np.nan,
+                    "n_short_event_gaps": n_short,
+                    "n_overlapping_response_windows": n_overlap,
+                    "max_overlap_amount_ms": float(np.max(overlap_amount))
+                    if len(overlap_amount)
+                    else np.nan,
+                    "overlap_risk_warning": bool(n_short > 0 or n_overlap > 0),
+                    "overlap_risk_reason": "short_event_gap;overlapping_response_window"
+                    if n_short and n_overlap
+                    else "short_event_gap"
+                    if n_short
+                    else "overlapping_response_window"
+                    if n_overlap
+                    else "ok",
+                }
+            )
+            summary_rows.append(row)
+    event_summary = pd.DataFrame(summary_rows)
+    if len(by_trial_base):
+        by_trial = (
+            by_trial_base.merge(event_summary, on=keys, how="left")
+            if len(event_summary)
+            else by_trial_base.copy()
+        )
+        for c in [
+            "n_events",
+            "n_event_gaps",
+            "n_short_event_gaps",
+            "n_overlapping_response_windows",
+        ]:
+            if c not in by_trial:
+                by_trial[c] = 0
+            by_trial[c] = by_trial[c].fillna(0).astype(int)
+        if "overlap_risk_warning" not in by_trial:
+            by_trial["overlap_risk_warning"] = False
+        by_trial["overlap_risk_warning"] = (
+            by_trial["overlap_risk_warning"].fillna(False).astype(bool)
+        )
+        if "overlap_risk_reason" not in by_trial:
+            by_trial["overlap_risk_reason"] = "no_usable_event_times"
+        by_trial["overlap_risk_reason"] = by_trial["overlap_risk_reason"].fillna(
+            "no_usable_event_times"
+        )
+    else:
+        by_trial = by_trial_base.copy()
+
+    n_trials = len(by_trial)
+    n_events = len(events)
+    n_with_events = int((by_trial["n_events"] > 0).sum()) if n_trials else 0
+    n_short_trials = int((by_trial["n_short_event_gaps"] > 0).sum()) if n_trials else 0
+    n_overlap_trials = (
+        int((by_trial["n_overlapping_response_windows"] > 0).sum()) if n_trials else 0
+    )
+    n_risk = int(by_trial["overlap_risk_warning"].sum()) if n_trials else 0
+    status = (
+        "no_usable_event_times"
+        if n_events == 0
+        else "possible_overlap_risk"
+        if n_risk > 0
+        else "ok"
+    )
+    summary = pd.DataFrame(
         [
             {
-                "trial_duration_ms_threshold": trial_duration_ms,
-                "event_gap_ms_threshold": event_gap_ms,
-                "status": "insufficient_columns",
+                "n_trials": int(n_trials),
+                "n_events": int(n_events),
+                "n_trials_with_events": n_with_events,
+                "n_trials_without_events": int(n_trials - n_with_events),
+                "n_trials_with_short_event_gaps": n_short_trials,
+                "n_trials_with_overlapping_windows": n_overlap_trials,
+                "n_overlap_risk_trials": n_risk,
+                "pct_overlap_risk_trials": 100.0 * n_risk / n_trials if n_trials else np.nan,
+                "window_start_ms": window_start_ms,
+                "window_end_ms": window_end_ms,
+                "response_window_duration_ms": window_end_ms - window_start_ms,
+                "min_event_gap_ms": min_event_gap_ms,
+                "overlap_assessment_status": status,
             }
         ]
     )
+    return {
+        "events": events,
+        "event_gaps": event_gaps,
+        "by_trial": by_trial,
+        "summary": summary,
+        "_gp3_class": "gp3_pupil_overlap_risk_audit",
+    }
 
 
 def audit_gazepoint_stimulus_luminance(
