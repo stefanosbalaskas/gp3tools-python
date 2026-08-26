@@ -749,6 +749,266 @@ def detect_gazepoint_blinks(
     return {"events": events, "samples": labelled, "_gp3_class": "gp3_blink_detection_result"}
 
 
+_GP3_FINAL_R_UNSET = object()
+
+
+def _gp3_final_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def _gp3_final_detect(df, supplied, candidates, label, required=False):
+    if supplied is not None:
+        if not isinstance(supplied, str) or not supplied:
+            raise ValueError(f"{label} must be None or a non-empty string")
+        if supplied not in df.columns:
+            raise ValueError(f"{label} was not found in data")
+        return supplied
+    for candidate in candidates:
+        if candidate in df.columns:
+            return candidate
+    if required:
+        raise ValueError(f"{label} could not be detected and must be supplied")
+    return None
+
+
+def _gp3_final_bool(values, index):
+    series = pd.Series(values, index=index)
+    if pd.api.types.is_bool_dtype(series.dtype):
+        return series.fillna(False).astype(bool)
+    if pd.api.types.is_numeric_dtype(series.dtype):
+        return pd.to_numeric(series, errors="coerce").fillna(0).ne(0)
+    text = series.astype("string").str.strip().str.lower()
+    return text.isin({"true", "t", "yes", "y", "1", "valid", "ok"})
+
+
+def _gp3_final_registry_value(registry, parameter, default):
+    if registry is None:
+        return default
+    if not isinstance(registry, pd.DataFrame) or not {"parameter", "value"}.issubset(
+        registry.columns
+    ):
+        raise ValueError("registry must contain parameter and value columns")
+    values = registry.loc[registry["parameter"].eq(parameter), "value"]
+    if len(values) != 1:
+        raise ValueError(f"Expected exactly one registry value for: {parameter}")
+    return float(values.iloc[0])
+
+
+def _gp3_final_mad(values):
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if not len(arr):
+        return np.nan
+    center = float(np.median(arr))
+    return float(np.median(np.abs(arr - center)))
+
+
+def _gp3_final_group_positions(df, group_cols):
+    if not group_cols:
+        return [((), np.arange(len(df), dtype=int))]
+    return [
+        (key, np.asarray(pos, dtype=int))
+        for key, pos in df.groupby(group_cols, sort=False, dropna=False).indices.items()
+    ]
+
+
+def _gp3_final_merge_args(defaults, overrides, protected=()):
+    if overrides is None:
+        return dict(defaults)
+    if not isinstance(overrides, dict):
+        raise ValueError("workflow override arguments must be dictionaries")
+    blocked = sorted(set(overrides).intersection(protected))
+    if blocked:
+        raise ValueError(
+            "These workflow-managed arguments cannot be overridden: " + ", ".join(blocked)
+        )
+    out = dict(defaults)
+    out.update(overrides)
+    return out
+
+
+def _gp3_final_luminance_path(stimulus_file, image_dir, recursive):
+    from pathlib import Path as _Path
+
+    if stimulus_file is None or pd.isna(stimulus_file) or not str(stimulus_file).strip():
+        return None
+    raw = _Path(str(stimulus_file).strip())
+    if raw.exists():
+        return str(raw.resolve())
+    candidate = (_Path(image_dir) / raw) if image_dir is not None else raw
+    if candidate.exists():
+        return str(candidate.resolve())
+    if image_dir is not None and recursive:
+        root = _Path(image_dir)
+        if root.is_dir():
+            for match in root.rglob(raw.name):
+                if match.is_file():
+                    return str(match.resolve())
+    return str(candidate.absolute())
+
+
+def _gp3_final_read_luminance(stimulus_id, stimulus_file, image_dir, recursive):
+    row = {
+        "stimulus_id": stimulus_id,
+        "stimulus_file": stimulus_file,
+        "resolved_path": _gp3_final_luminance_path(stimulus_file, image_dir, recursive),
+        "file_exists": False,
+        "luminance_available": False,
+        "image_width_px": np.nan,
+        "image_height_px": np.nan,
+        "n_pixels": np.nan,
+        "mean_luminance": np.nan,
+        "median_luminance": np.nan,
+        "sd_luminance": np.nan,
+        "min_luminance": np.nan,
+        "max_luminance": np.nan,
+        "mean_brightness": np.nan,
+        "rms_contrast": np.nan,
+        "michelson_contrast": np.nan,
+        "luminance_status": None,
+        "error_message": None,
+    }
+    if stimulus_file is None or pd.isna(stimulus_file) or not str(stimulus_file).strip():
+        row["luminance_status"] = "missing_file_name"
+        return row
+    resolved = row["resolved_path"]
+    from pathlib import Path as _Path
+
+    exists = resolved is not None and _Path(resolved).is_file()
+    row["file_exists"] = bool(exists)
+    if not exists:
+        row["luminance_status"] = "file_missing"
+        return row
+    try:
+        from matplotlib import image as mpimg
+
+        image = np.asarray(mpimg.imread(resolved))
+        if image.ndim == 2:
+            rgb = np.repeat(image[..., None], 3, axis=2)
+        elif image.ndim == 3 and image.shape[2] >= 3:
+            rgb = image[..., :3]
+        else:
+            raise ValueError("unsupported image dimensions")
+        rgb = rgb.astype(float)
+        if np.issubdtype(image.dtype, np.integer):
+            rgb /= float(np.iinfo(image.dtype).max)
+        elif np.nanmax(rgb) > 1.0:
+            rgb /= 255.0
+        rgb = np.clip(rgb, 0.0, 1.0)
+        linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+        luminance = 0.2126 * linear[..., 0] + 0.7152 * linear[..., 1] + 0.0722 * linear[..., 2]
+        values = luminance[np.isfinite(luminance)].reshape(-1)
+        if not len(values):
+            raise ValueError("image contains no finite luminance values")
+        mean = float(np.mean(values))
+        sd = float(np.std(values, ddof=1)) if len(values) > 1 else np.nan
+        minimum = float(np.min(values))
+        maximum = float(np.max(values))
+        row.update(
+            file_exists=True,
+            luminance_available=True,
+            image_width_px=int(rgb.shape[1]),
+            image_height_px=int(rgb.shape[0]),
+            n_pixels=int(len(values)),
+            mean_luminance=mean,
+            median_luminance=float(np.median(values)),
+            sd_luminance=sd,
+            min_luminance=minimum,
+            max_luminance=maximum,
+            mean_brightness=mean,
+            rms_contrast=(sd / mean) if np.isfinite(sd) and mean > 0 else np.nan,
+            michelson_contrast=((maximum - minimum) / (maximum + minimum))
+            if maximum + minimum > 0
+            else np.nan,
+            luminance_status="available",
+        )
+    except Exception as exc:
+        row["luminance_status"] = "read_error"
+        row["error_message"] = str(exc)
+    return row
+
+
+def _gp3_final_signal_summary(original, processed, returned, pupil_col, x_col, y_col):
+    def count_finite(frame, column):
+        if column is None or column not in frame.columns:
+            return np.nan
+        return int(np.isfinite(pd.to_numeric(frame[column], errors="coerce")).sum())
+
+    return pd.DataFrame(
+        {
+            "stage": ["original", "full_resolution_processed", "returned"],
+            "n_rows": [len(original), len(processed), len(returned)],
+            "finite_pupil": [
+                count_finite(original, pupil_col),
+                count_finite(processed, pupil_col),
+                count_finite(returned, pupil_col),
+            ],
+            "finite_x": [
+                count_finite(original, x_col),
+                count_finite(processed, x_col),
+                count_finite(returned, x_col),
+            ],
+            "finite_y": [
+                count_finite(original, y_col),
+                count_finite(processed, y_col),
+                count_finite(returned, y_col),
+            ],
+        }
+    )
+
+
+def _gp3_final_event_summary(events, kind):
+    if kind == "blink":
+        columns = ["reason", "n_blinks", "mean_duration_ms", "max_duration_ms"]
+        if not isinstance(events, pd.DataFrame) or events.empty:
+            return pd.DataFrame(columns=columns)
+        reason = (
+            events["reason"].astype(str)
+            if "reason" in events
+            else pd.Series("unspecified", index=events.index)
+        )
+        duration = pd.to_numeric(events.get("duration_ms", np.nan), errors="coerce")
+        frame = pd.DataFrame({"reason": reason, "duration": duration})
+        rows = []
+        for label, group in frame.groupby("reason", sort=False, dropna=False):
+            finite = group["duration"][np.isfinite(group["duration"])]
+            rows.append(
+                {
+                    "reason": label,
+                    "n_blinks": len(group),
+                    "mean_duration_ms": float(finite.mean()) if len(finite) else np.nan,
+                    "max_duration_ms": float(finite.max()) if len(finite) else np.nan,
+                }
+            )
+        return pd.DataFrame(rows, columns=columns)
+    columns = ["algorithm", "n_fixations", "mean_duration_ms", "median_duration_ms"]
+    if not isinstance(events, pd.DataFrame) or events.empty:
+        return pd.DataFrame(columns=columns)
+    algorithm = (
+        events["algorithm"].astype(str)
+        if "algorithm" in events
+        else pd.Series("unspecified", index=events.index)
+    )
+    duration = pd.to_numeric(events.get("duration_ms", np.nan), errors="coerce")
+    frame = pd.DataFrame({"algorithm": algorithm, "duration": duration})
+    rows = []
+    for label, group in frame.groupby("algorithm", sort=False, dropna=False):
+        finite = group["duration"][np.isfinite(group["duration"])]
+        rows.append(
+            {
+                "algorithm": label,
+                "n_fixations": len(group),
+                "mean_duration_ms": float(finite.mean()) if len(finite) else np.nan,
+                "median_duration_ms": float(finite.median()) if len(finite) else np.nan,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
 def flag_gazepoint_pupil_artifacts(
     data,
     pupil_col=None,
@@ -759,43 +1019,407 @@ def flag_gazepoint_pupil_artifacts(
     blink_padding_pre_ms: float = 100.0,
     blink_padding_post_ms: float = 100.0,
     output_col="pupil_artifact",
-) -> pd.DataFrame:
-    df = flag_gazepoint_pupil(
-        data,
-        pupil_col=pupil_col,
-        physiological_min=physiological_min,
-        physiological_max=physiological_max,
+    *,
+    left_pupil_col=_GP3_FINAL_R_UNSET,
+    right_pupil_col=_GP3_FINAL_R_UNSET,
+    blink_col=_GP3_FINAL_R_UNSET,
+    trackloss_col=_GP3_FINAL_R_UNSET,
+    missing_pupil_col=_GP3_FINAL_R_UNSET,
+    pupil_unit_col=_GP3_FINAL_R_UNSET,
+    group_cols=_GP3_FINAL_R_UNSET,
+    registry=_GP3_FINAL_R_UNSET,
+    pupil_min_mm=_GP3_FINAL_R_UNSET,
+    pupil_max_mm=_GP3_FINAL_R_UNSET,
+    binocular_mad_k=_GP3_FINAL_R_UNSET,
+    max_physio_outlier_prop=_GP3_FINAL_R_UNSET,
+    flag_speed_outliers=_GP3_FINAL_R_UNSET,
+    flag_binocular_disagreement=_GP3_FINAL_R_UNSET,
+    flag_physiological_outliers=_GP3_FINAL_R_UNSET,
+):
+    """Flag pupil artifacts with legacy Python or R v2.3.0 semantics."""
+    r_mode = any(
+        value is not _GP3_FINAL_R_UNSET
+        for value in (
+            left_pupil_col,
+            right_pupil_col,
+            blink_col,
+            trackloss_col,
+            missing_pupil_col,
+            pupil_unit_col,
+            group_cols,
+            registry,
+            pupil_min_mm,
+            pupil_max_mm,
+            binocular_mad_k,
+            max_physio_outlier_prop,
+            flag_speed_outliers,
+            flag_binocular_disagreement,
+            flag_physiological_outliers,
+        )
     )
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    time_col = infer_column(df, "time", time_col)
-    x = finite_numeric(df[pupil_col])
-    t = (
-        time_to_seconds(df[time_col])
-        if time_col
-        else pd.Series(np.arange(len(df)) / 60.0, index=df.index)
+    if not r_mode:
+        df = flag_gazepoint_pupil(
+            data,
+            pupil_col=pupil_col,
+            physiological_min=physiological_min,
+            physiological_max=physiological_max,
+        )
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        time_col = infer_column(df, "time", time_col)
+        x = finite_numeric(df[pupil_col])
+        t = (
+            time_to_seconds(df[time_col])
+            if time_col
+            else pd.Series(np.arange(len(df)) / 60.0, index=df.index)
+        )
+        dt = t.diff().replace(0, np.nan)
+        speed = x.diff().abs() / dt
+        med, mad = np.nanmedian(speed), robust_mad(speed.dropna())
+        speed_flag = (
+            speed > (med + pupil_speed_mad_k * 1.4826 * mad)
+            if np.isfinite(mad)
+            else pd.Series(False, index=df.index)
+        )
+        artifact = ~df["pupil_valid"] | speed_flag.fillna(False)
+        diffs = np.diff(t.dropna().to_numpy(float))
+        hz = 1 / np.median(diffs[diffs > 0]) if np.any(diffs > 0) else 60.0
+        pre = int(round(blink_padding_pre_ms / 1000 * hz))
+        post = int(round(blink_padding_post_ms / 1000 * hz))
+        arr = artifact.to_numpy(bool)
+        padded = arr.copy()
+        for i in np.flatnonzero(arr):
+            padded[max(0, i - pre) : min(len(arr), i + post + 1)] = True
+        df[output_col] = padded
+        df["pupil_speed"] = speed
+        return df
+
+    df = ensure_dataframe(data, copy=False)
+    left_pupil_col = None if left_pupil_col is _GP3_FINAL_R_UNSET else left_pupil_col
+    right_pupil_col = None if right_pupil_col is _GP3_FINAL_R_UNSET else right_pupil_col
+    blink_col = None if blink_col is _GP3_FINAL_R_UNSET else blink_col
+    trackloss_col = None if trackloss_col is _GP3_FINAL_R_UNSET else trackloss_col
+    missing_pupil_col = None if missing_pupil_col is _GP3_FINAL_R_UNSET else missing_pupil_col
+    pupil_unit_col = None if pupil_unit_col is _GP3_FINAL_R_UNSET else pupil_unit_col
+    groups = (
+        ["subject", "media_id"] if group_cols is _GP3_FINAL_R_UNSET else _gp3_final_list(group_cols)
     )
-    dt = t.diff().replace(0, np.nan)
-    speed = x.diff().abs() / dt
-    med, mad = np.nanmedian(speed), robust_mad(speed.dropna())
-    speed_flag = (
-        speed > (med + pupil_speed_mad_k * 1.4826 * mad)
-        if np.isfinite(mad)
-        else pd.Series(False, index=df.index)
+    registry = None if registry is _GP3_FINAL_R_UNSET else registry
+    pupil_min_mm = (
+        _gp3_final_registry_value(registry, "pupil_physiological_min", 1.0)
+        if pupil_min_mm is _GP3_FINAL_R_UNSET
+        else float(pupil_min_mm)
     )
-    artifact = ~df["pupil_valid"] | speed_flag.fillna(False)
-    # Pad artifacts in sample units estimated from timing.
-    diffs = np.diff(t.dropna().to_numpy(float))
-    hz = 1 / np.median(diffs[diffs > 0]) if np.any(diffs > 0) else 60.0
-    pre = int(round(blink_padding_pre_ms / 1000 * hz))
-    post = int(round(blink_padding_post_ms / 1000 * hz))
-    arr = artifact.to_numpy(bool)
-    padded = arr.copy()
-    bad = np.flatnonzero(arr)
-    for i in bad:
-        padded[max(0, i - pre) : min(len(arr), i + post + 1)] = True
-    df[output_col] = padded
-    df["pupil_speed"] = speed
-    return df
+    pupil_max_mm = (
+        _gp3_final_registry_value(registry, "pupil_physiological_max", 9.0)
+        if pupil_max_mm is _GP3_FINAL_R_UNSET
+        else float(pupil_max_mm)
+    )
+    binocular_mad_k = (
+        _gp3_final_registry_value(registry, "binocular_mad_k", 6.0)
+        if binocular_mad_k is _GP3_FINAL_R_UNSET
+        else float(binocular_mad_k)
+    )
+    max_physio_outlier_prop = (
+        0.80 if max_physio_outlier_prop is _GP3_FINAL_R_UNSET else float(max_physio_outlier_prop)
+    )
+    flag_speed_outliers = True if flag_speed_outliers is _GP3_FINAL_R_UNSET else flag_speed_outliers
+    flag_binocular_disagreement = (
+        True if flag_binocular_disagreement is _GP3_FINAL_R_UNSET else flag_binocular_disagreement
+    )
+    flag_physiological_outliers = (
+        True if flag_physiological_outliers is _GP3_FINAL_R_UNSET else flag_physiological_outliers
+    )
+    if registry is not None:
+        if blink_padding_pre_ms == 100.0:
+            blink_padding_pre_ms = _gp3_final_registry_value(
+                registry, "blink_padding_pre_ms", 100.0
+            )
+        if blink_padding_post_ms == 100.0:
+            blink_padding_post_ms = _gp3_final_registry_value(
+                registry, "blink_padding_post_ms", 100.0
+            )
+        if pupil_speed_mad_k == 6.0:
+            pupil_speed_mad_k = _gp3_final_registry_value(registry, "pupil_speed_mad_k", 6.0)
+    for value, label in (
+        (blink_padding_pre_ms, "blink_padding_pre_ms"),
+        (blink_padding_post_ms, "blink_padding_post_ms"),
+        (pupil_speed_mad_k, "pupil_speed_mad_k"),
+        (binocular_mad_k, "binocular_mad_k"),
+    ):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{label} must be finite and non-negative")
+    if (
+        not np.isfinite(pupil_min_mm)
+        or not np.isfinite(pupil_max_mm)
+        or pupil_max_mm <= pupil_min_mm
+    ):
+        raise ValueError("pupil_max_mm must be greater than pupil_min_mm")
+    if not 0 <= max_physio_outlier_prop <= 1:
+        raise ValueError("max_physio_outlier_prop must be between 0 and 1")
+    for value, label in (
+        (flag_speed_outliers, "flag_speed_outliers"),
+        (flag_binocular_disagreement, "flag_binocular_disagreement"),
+        (flag_physiological_outliers, "flag_physiological_outliers"),
+    ):
+        if not isinstance(value, (bool, np.bool_)):
+            raise ValueError(f"{label} must be TRUE or FALSE")
+
+    pupil_source = _gp3_final_detect(
+        df,
+        pupil_col,
+        ["mean_pupil", "pupil_raw", "pupil", "left_pupil", "right_pupil"],
+        "pupil_col",
+        required=True,
+    )
+    left_source = _gp3_final_detect(
+        df, left_pupil_col, ["left_pupil", "LEFT_PUPIL"], "left_pupil_col"
+    )
+    right_source = _gp3_final_detect(
+        df, right_pupil_col, ["right_pupil", "RIGHT_PUPIL"], "right_pupil_col"
+    )
+    time_source = _gp3_final_detect(
+        df, time_col, ["time_ms", "time", "time_orig", "time_orig_ms"], "time_col", required=True
+    )
+    blink_source = _gp3_final_detect(df, blink_col, ["blink"], "blink_col")
+    trackloss_source = _gp3_final_detect(
+        df, trackloss_col, ["trackloss", "Trackloss"], "trackloss_col"
+    )
+    missing_source = _gp3_final_detect(
+        df, missing_pupil_col, ["missing_pupil"], "missing_pupil_col"
+    )
+    unit_source = _gp3_final_detect(
+        df, pupil_unit_col, ["pupil_unit", "PUPIL_UNIT", "pupil_unit_text"], "pupil_unit_col"
+    )
+    roles = {
+        "subject": _gp3_final_detect(df, None, ["subject", "pID", "participant"], "subject"),
+        "media_id": _gp3_final_detect(df, None, ["media_id", "MEDIA_ID"], "media_id"),
+        "trial": _gp3_final_detect(df, None, ["trial"], "trial"),
+        "trial_global": _gp3_final_detect(df, None, ["trial_global"], "trial_global"),
+    }
+    processing = []
+    for group in groups:
+        if group in roles:
+            if roles[group] is None:
+                raise ValueError(f"grouping column role not found: {group}")
+            processing.append(group)
+        elif group in df.columns:
+            processing.append(group)
+        else:
+            raise ValueError(f"grouping column not found: {group}")
+
+    work = pd.DataFrame({"row_id": np.arange(len(df), dtype=int)})
+    for role, source_col in roles.items():
+        work[role] = (
+            df[source_col].astype("string").to_numpy()
+            if source_col
+            else pd.array([pd.NA] * len(df), dtype="string")
+        )
+    for group in groups:
+        if group not in roles:
+            work[group] = df[group].to_numpy()
+    pupil = pd.to_numeric(df[pupil_source], errors="coerce").to_numpy(float)
+    left = (
+        pd.to_numeric(df[left_source], errors="coerce").to_numpy(float)
+        if left_source
+        else np.full(len(df), np.nan)
+    )
+    right = (
+        pd.to_numeric(df[right_source], errors="coerce").to_numpy(float)
+        if right_source
+        else np.full(len(df), np.nan)
+    )
+    time = pd.to_numeric(df[time_source], errors="coerce").to_numpy(float)
+    work["time_ms"] = time
+    work["pupil_artifact_raw_value"] = pupil
+    work["left_pupil_artifact_raw_value"] = left
+    work["right_pupil_artifact_raw_value"] = right
+    unit_text = (
+        df[unit_source].astype("string").str.lower()
+        if unit_source
+        else pd.Series(pd.NA, index=df.index, dtype="string")
+    )
+    unit_mm = (
+        unit_text.fillna("").str.contains(r"diameter_mm|\bmm\b|millimet", regex=True).to_numpy(bool)
+    )
+    work["pupil_unit_text"] = unit_text.to_numpy()
+    work["pupil_unit_is_mm"] = unit_mm
+    missing_flag = (
+        _gp3_final_bool(df[missing_source], df.index).to_numpy(bool)
+        if missing_source
+        else ~np.isfinite(pupil)
+    )
+    blink_flag = (
+        _gp3_final_bool(df[blink_source], df.index).to_numpy(bool)
+        if blink_source
+        else np.zeros(len(df), bool)
+    )
+    track_flag = (
+        _gp3_final_bool(df[trackloss_source], df.index).to_numpy(bool)
+        if trackloss_source
+        else np.zeros(len(df), bool)
+    )
+    prior_flag = (
+        _gp3_final_bool(df["pupil_flag_invalid"], df.index).to_numpy(bool)
+        if "pupil_flag_invalid" in df
+        else np.zeros(len(df), bool)
+    )
+    work["pupil_flag_missing_source"] = missing_flag
+    work["pupil_flag_blink_source"] = blink_flag
+    work["pupil_flag_trackloss_source"] = track_flag
+    work["pupil_flag_prior_invalid_source"] = prior_flag
+    nonfinite = ~np.isnan(pupil) & ~np.isfinite(pupil)
+    nonpositive = np.isfinite(pupil) & (pupil <= 0)
+    candidate = np.where(np.isfinite(pupil) & (pupil > 0), pupil, np.nan)
+    physio_candidate = (
+        bool(flag_physiological_outliers)
+        & unit_mm
+        & np.isfinite(candidate)
+        & ((candidate < pupil_min_mm) | (candidate > pupil_max_mm))
+    )
+    denominator = int(np.sum(unit_mm & np.isfinite(candidate)))
+    candidate_prop = float(np.sum(physio_candidate) / denominator) if denominator else 0.0
+    suppress_physio = (
+        bool(flag_physiological_outliers)
+        and denominator > 0
+        and candidate_prop > max_physio_outlier_prop
+    )
+    physio = (
+        np.zeros_like(physio_candidate, dtype=bool) if suppress_physio else physio_candidate.copy()
+    )
+    lr_diff = np.abs(
+        np.where(np.isfinite(left) & (left > 0), left, np.nan)
+        - np.where(np.isfinite(right) & (right > 0), right, np.nan)
+    )
+    finite_lr = lr_diff[np.isfinite(lr_diff)]
+    if not flag_binocular_disagreement or not len(finite_lr):
+        lr_threshold = np.inf
+    else:
+        mad = _gp3_final_mad(finite_lr)
+        lr_threshold = (
+            float(np.quantile(finite_lr, 0.99))
+            if not np.isfinite(mad) or mad == 0
+            else float(np.median(finite_lr) + binocular_mad_k * mad)
+        )
+    lr_flag = bool(flag_binocular_disagreement) & np.isfinite(lr_diff) & (lr_diff > lr_threshold)
+
+    speed = np.full(len(df), np.nan)
+    speed_abs = np.full(len(df), np.nan)
+    speed_threshold = np.full(len(df), np.inf)
+    speed_outlier = np.zeros(len(df), bool)
+    for _, pos in _gp3_final_group_positions(work, processing):
+        order = pos[np.argsort(np.where(np.isfinite(time[pos]), time[pos], np.inf), kind="stable")]
+        local_speed = np.full(len(order), np.nan)
+        if len(order) > 1:
+            dt = np.diff(time[order])
+            dp = np.diff(candidate[order])
+            valid = np.isfinite(dt) & (dt > 0) & np.isfinite(dp)
+            local_speed[1:][valid] = dp[valid] / dt[valid]
+        local_abs = np.abs(local_speed)
+        finite = local_abs[np.isfinite(local_abs)]
+        if not flag_speed_outliers or len(finite) < 3:
+            threshold = np.inf
+        else:
+            mad = _gp3_final_mad(finite)
+            threshold = (
+                float(np.quantile(finite, 0.99))
+                if not np.isfinite(mad) or mad == 0
+                else float(np.median(finite) + pupil_speed_mad_k * mad)
+            )
+        speed[order] = local_speed
+        speed_abs[order] = local_abs
+        speed_threshold[order] = threshold
+        speed_outlier[order] = (
+            bool(flag_speed_outliers) & np.isfinite(local_abs) & (local_abs > threshold)
+        )
+
+    basic = (
+        missing_flag
+        | blink_flag
+        | track_flag
+        | prior_flag
+        | nonfinite
+        | nonpositive
+        | physio
+        | lr_flag
+        | speed_outlier
+    )
+    padding = np.zeros(len(df), bool)
+    for _, pos in _gp3_final_group_positions(work, processing):
+        event_times = time[pos][basic[pos] & np.isfinite(time[pos])]
+        if len(event_times):
+            for idx in pos[np.isfinite(time[pos])]:
+                padding[idx] = bool(
+                    np.any(
+                        (time[idx] >= event_times - blink_padding_pre_ms)
+                        & (time[idx] <= event_times + blink_padding_post_ms)
+                    )
+                )
+    artifact = basic | padding
+    reasons = []
+    reason_specs = [
+        (missing_flag, "missing_pupil"),
+        (blink_flag, "blink"),
+        (track_flag, "trackloss"),
+        (prior_flag, "prior_pupil_invalid"),
+        (nonfinite, "nonfinite_pupil"),
+        (nonpositive, "nonpositive_pupil"),
+        (physio, "physiologically_implausible_pupil"),
+        (lr_flag, "binocular_pupil_disagreement"),
+        (speed_outlier, "pupil_speed_outlier"),
+        (padding, "artifact_padding"),
+    ]
+    for i in range(len(df)):
+        labels = [label for flag, label in reason_specs if bool(flag[i])]
+        reasons.append(";".join(labels) if labels else "valid")
+
+    columns = {
+        "pupil_artifact_raw_value": pupil,
+        "left_pupil_artifact_raw_value": left,
+        "right_pupil_artifact_raw_value": right,
+        "pupil_unit_text": unit_text.to_numpy(),
+        "pupil_unit_is_mm": unit_mm,
+        "pupil_artifact_nonfinite": nonfinite,
+        "pupil_artifact_nonpositive": nonpositive,
+        "pupil_physio_outlier": physio,
+        "pupil_physio_outlier_candidate": physio_candidate,
+        "pupil_physio_candidate_prop": candidate_prop,
+        "pupil_physio_rule_suppressed": suppress_physio,
+        "pupil_lr_absdiff": lr_diff,
+        "pupil_binocular_disagreement_threshold": lr_threshold,
+        "pupil_binocular_disagreement": lr_flag,
+        "pupil_speed": speed,
+        "pupil_speed_abs": speed_abs,
+        "pupil_speed_threshold": speed_threshold,
+        "pupil_speed_outlier": speed_outlier,
+        "pupil_flag_missing_source": missing_flag,
+        "pupil_flag_blink_source": blink_flag,
+        "pupil_flag_trackloss_source": track_flag,
+        "pupil_flag_prior_invalid_source": prior_flag,
+        "pupil_bad_sample_basic": basic,
+        "pupil_artifact_padding_flag": padding,
+        "pupil_artifact_flag": artifact,
+        "pupil_artifact_reason": reasons,
+        "pupil_clean": np.where(artifact, np.nan, candidate),
+        "pupil_artifact_pupil_column": pupil_source,
+        "pupil_artifact_left_pupil_column": left_source,
+        "pupil_artifact_right_pupil_column": right_source,
+        "pupil_artifact_time_column": time_source,
+        "pupil_artifact_unit_column": unit_source,
+        "pupil_artifact_blink_column": blink_source,
+        "pupil_artifact_trackloss_column": trackloss_source,
+        "pupil_artifact_missing_pupil_column": missing_source,
+        "pupil_artifact_padding_pre_ms": float(blink_padding_pre_ms),
+        "pupil_artifact_padding_post_ms": float(blink_padding_post_ms),
+        "pupil_artifact_min_mm": float(pupil_min_mm),
+        "pupil_artifact_max_mm": float(pupil_max_mm),
+        "pupil_artifact_speed_mad_k": float(pupil_speed_mad_k),
+        "pupil_artifact_binocular_mad_k": float(binocular_mad_k),
+        "pupil_artifact_max_physio_outlier_prop": float(max_physio_outlier_prop),
+    }
+    out = df.copy()
+    for column, values in columns.items():
+        out[column] = values
+    return out
 
 
 def _interpolate_series(x: pd.Series, method: str, limit: int | None = None) -> pd.Series:
@@ -3317,17 +3941,235 @@ def audit_gazepoint_pupil_overlap_risk(
 
 
 def audit_gazepoint_stimulus_luminance(
-    data, luminance_col="luminance", pupil_col=None, group_cols=None
-) -> pd.DataFrame:
+    data,
+    luminance_col="luminance",
+    pupil_col=None,
+    group_cols=None,
+    *,
+    stimulus_file_col=_GP3_FINAL_R_UNSET,
+    stimulus_id_col=_GP3_FINAL_R_UNSET,
+    condition_col=_GP3_FINAL_R_UNSET,
+    image_dir=_GP3_FINAL_R_UNSET,
+    recursive=_GP3_FINAL_R_UNSET,
+    name=_GP3_FINAL_R_UNSET,
+):
+    """Audit stimulus luminance with legacy Python or R v2.3.0 semantics."""
+    r_mode = any(
+        value is not _GP3_FINAL_R_UNSET
+        for value in (stimulus_file_col, stimulus_id_col, condition_col, image_dir, recursive, name)
+    )
     df = ensure_dataframe(data, copy=False)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    if luminance_col not in df:
-        return pd.DataFrame([{"status": "luminance_column_missing"}])
-    x = finite_numeric(df[luminance_col])
-    y = finite_numeric(df[pupil_col])
-    ok = x.notna() & y.notna()
-    r, p = stats.pearsonr(x[ok], y[ok]) if ok.sum() > 2 else (np.nan, np.nan)
-    return pd.DataFrame([{"n": int(ok.sum()), "correlation": r, "p_value": p}])
+    if not r_mode:
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        if luminance_col not in df:
+            return pd.DataFrame([{"status": "luminance_column_missing"}])
+        x = finite_numeric(df[luminance_col])
+        y = finite_numeric(df[pupil_col])
+        ok = x.notna() & y.notna()
+        r, p = stats.pearsonr(x[ok], y[ok]) if ok.sum() > 2 else (np.nan, np.nan)
+        return pd.DataFrame([{"n": int(ok.sum()), "correlation": r, "p_value": p}])
+
+    if df.empty:
+        raise ValueError("data must contain at least one row")
+    stimulus_file_col = None if stimulus_file_col is _GP3_FINAL_R_UNSET else stimulus_file_col
+    stimulus_id_col = None if stimulus_id_col is _GP3_FINAL_R_UNSET else stimulus_id_col
+    condition_col = None if condition_col is _GP3_FINAL_R_UNSET else condition_col
+    image_dir = None if image_dir is _GP3_FINAL_R_UNSET else image_dir
+    recursive = True if recursive is _GP3_FINAL_R_UNSET else recursive
+    name = "gazepoint_stimulus_luminance" if name is _GP3_FINAL_R_UNSET else name
+    if not isinstance(recursive, (bool, np.bool_)):
+        raise ValueError("recursive must be TRUE or FALSE")
+    if not isinstance(name, str) or not name:
+        raise ValueError("name must be a non-empty string")
+    if image_dir is not None and (not isinstance(image_dir, (str, bytes)) or not str(image_dir)):
+        raise ValueError("image_dir must be None or a non-empty path string")
+
+    file_col = _gp3_final_detect(
+        df,
+        stimulus_file_col,
+        [
+            "stimulus_file",
+            "STIMULUS_FILE",
+            "image_file",
+            "IMAGE_FILE",
+            "file_name",
+            "filename",
+            "media_file",
+            "MEDIA_FILE",
+            "stimulus_path",
+            "image_path",
+            "file_path",
+        ],
+        "stimulus_file_col",
+        required=True,
+    )
+    id_col = _gp3_final_detect(
+        df,
+        stimulus_id_col,
+        [
+            "stimulus_id",
+            "STIMULUS_ID",
+            "media_id",
+            "MEDIA_ID",
+            "item_id",
+            "ITEM_ID",
+            "image_id",
+            "stimulus",
+            "media",
+            "item",
+        ],
+        "stimulus_id_col",
+    )
+    cond_col = _gp3_final_detect(
+        df,
+        condition_col,
+        ["condition", "CONDITION", "group", "GROUP", "trial_type", "TRIAL_TYPE"],
+        "condition_col",
+    )
+    stimulus_index = pd.DataFrame({"stimulus_file": df[file_col].astype("string")})
+    stimulus_index["stimulus_id"] = (
+        df[id_col].astype("string") if id_col else stimulus_index["stimulus_file"]
+    )
+    stimulus_index["condition"] = df[cond_col].astype("string") if cond_col else "all_data"
+    stimulus_index["stimulus_file"] = stimulus_index["stimulus_file"].str.strip()
+    stimulus_index["stimulus_id"] = stimulus_index["stimulus_id"].str.strip()
+    stimulus_index["condition"] = (
+        stimulus_index["condition"].fillna("missing_condition").replace("", "missing_condition")
+    )
+    stimulus_index = stimulus_index.drop_duplicates(
+        ["stimulus_id", "stimulus_file", "condition"], ignore_index=True
+    )
+    unique_files = stimulus_index[["stimulus_id", "stimulus_file"]].drop_duplicates(
+        ignore_index=True
+    )
+    rows = [
+        _gp3_final_read_luminance(row.stimulus_id, row.stimulus_file, image_dir, bool(recursive))
+        for row in unique_files.itertuples(index=False)
+    ]
+    stimulus_luminance = pd.DataFrame(rows)
+    condition_data = stimulus_index.merge(
+        stimulus_luminance, on=["stimulus_id", "stimulus_file"], how="left"
+    )
+    summaries = []
+    for condition, group in condition_data.groupby("condition", sort=False, dropna=False):
+        values = pd.to_numeric(group["mean_luminance"], errors="coerce")
+        rms = pd.to_numeric(group["rms_contrast"], errors="coerce")
+        mic = pd.to_numeric(group["michelson_contrast"], errors="coerce")
+        available = int(group["luminance_available"].fillna(False).sum())
+        summaries.append(
+            {
+                "condition": condition,
+                "n_stimulus_rows": len(group),
+                "n_unique_stimuli": group["stimulus_id"].nunique(dropna=False),
+                "n_unique_files": group["resolved_path"].nunique(dropna=True),
+                "n_files_available": int(group["file_exists"].fillna(False).sum()),
+                "n_luminance_available": available,
+                "mean_luminance": float(values.mean()) if values.notna().any() else np.nan,
+                "median_luminance": float(values.median()) if values.notna().any() else np.nan,
+                "sd_luminance": float(values.std(ddof=1)) if values.notna().sum() > 1 else np.nan,
+                "mean_rms_contrast": float(rms.mean()) if rms.notna().any() else np.nan,
+                "mean_michelson_contrast": float(mic.mean()) if mic.notna().any() else np.nan,
+                "condition_luminance_status": "no_luminance_available"
+                if available == 0
+                else (
+                    "partial_luminance_available"
+                    if available < len(group)
+                    else "complete_luminance_available"
+                ),
+            }
+        )
+    condition_summary = pd.DataFrame(summaries)
+    available_conditions = (
+        condition_summary.loc[condition_summary["mean_luminance"].notna()]
+        if len(condition_summary)
+        else condition_summary
+    )
+    if not len(condition_summary):
+        balance_status = "no_conditions"
+    elif not len(available_conditions):
+        balance_status = "no_luminance_available"
+    elif len(available_conditions) < len(condition_summary):
+        balance_status = "partial_condition_luminance_available"
+    elif len(available_conditions) < 2:
+        balance_status = "single_condition_available"
+    else:
+        balance_status = "condition_luminance_summarised"
+    vals = (
+        available_conditions["mean_luminance"].to_numpy(float)
+        if len(available_conditions)
+        else np.array([])
+    )
+    pairwise = max(
+        (abs(float(a) - float(b)) for i, a in enumerate(vals) for b in vals[i + 1 :]),
+        default=np.nan,
+    )
+    balance_summary = pd.DataFrame(
+        [
+            {
+                "n_conditions": len(condition_summary),
+                "n_conditions_with_luminance": len(available_conditions),
+                "min_condition_mean_luminance": float(np.min(vals)) if len(vals) else np.nan,
+                "max_condition_mean_luminance": float(np.max(vals)) if len(vals) else np.nan,
+                "range_condition_mean_luminance": float(np.ptp(vals)) if len(vals) else np.nan,
+                "max_abs_pairwise_condition_difference": pairwise,
+                "luminance_balance_status": balance_status,
+            }
+        ]
+    )
+    n_lum = (
+        int(stimulus_luminance["luminance_available"].fillna(False).sum())
+        if len(stimulus_luminance)
+        else 0
+    )
+    audit_status = (
+        "no_luminance_available"
+        if n_lum == 0
+        else (
+            "partial_luminance_available"
+            if n_lum < len(stimulus_luminance)
+            else "complete_luminance_available"
+        )
+    )
+    overview = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "n_input_rows": len(df),
+                "n_stimulus_rows": len(stimulus_index),
+                "n_unique_stimuli": stimulus_index["stimulus_id"].nunique(dropna=False),
+                "n_unique_files": stimulus_index["stimulus_file"].nunique(dropna=False),
+                "n_conditions": stimulus_index["condition"].nunique(dropna=False),
+                "n_files_available": int(stimulus_luminance["file_exists"].fillna(False).sum())
+                if len(stimulus_luminance)
+                else 0,
+                "n_luminance_available": n_lum,
+                "magick_available": True,
+                "audit_status": audit_status,
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "stimulus_file_col",
+                "stimulus_id_col",
+                "condition_col",
+                "image_dir",
+                "recursive",
+                "name",
+            ],
+            "value": [file_col, id_col, cond_col, image_dir, str(bool(recursive)), name],
+        }
+    )
+    return {
+        "overview": overview,
+        "stimulus_index": stimulus_index,
+        "stimulus_luminance": stimulus_luminance,
+        "condition_summary": condition_summary,
+        "balance_summary": balance_summary,
+        "settings": settings,
+        "_gp3_class": "gp3_stimulus_luminance_audit",
+    }
 
 
 def summarise_gazepoint_pupil(
@@ -6542,34 +7384,556 @@ def preprocess_gazepoint_signals(
     smooth=True,
     baseline=None,
     time_col=None,
-) -> pd.DataFrame:
-    df = flag_gazepoint_pupil_artifacts(
-        data,
-        pupil_col=pupil_col,
-        time_col=time_col,
-        physiological_min=physiological_min,
-        physiological_max=physiological_max,
+    *,
+    id_col=_GP3_FINAL_R_UNSET,
+    group_cols=_GP3_FINAL_R_UNSET,
+    x_col=_GP3_FINAL_R_UNSET,
+    y_col=_GP3_FINAL_R_UNSET,
+    left_pupil_col=_GP3_FINAL_R_UNSET,
+    right_pupil_col=_GP3_FINAL_R_UNSET,
+    pupil_mode=_GP3_FINAL_R_UNSET,
+    detect_blinks=_GP3_FINAL_R_UNSET,
+    interpolate_blinks=_GP3_FINAL_R_UNSET,
+    smooth_pupil=_GP3_FINAL_R_UNSET,
+    smooth_coordinates=_GP3_FINAL_R_UNSET,
+    downsample_factor=_GP3_FINAL_R_UNSET,
+    detect_fixations=_GP3_FINAL_R_UNSET,
+    blink_args=_GP3_FINAL_R_UNSET,
+    interpolation_args=_GP3_FINAL_R_UNSET,
+    pupil_args=_GP3_FINAL_R_UNSET,
+    pupil_smoothing_args=_GP3_FINAL_R_UNSET,
+    coordinate_smoothing_args=_GP3_FINAL_R_UNSET,
+    downsampling_args=_GP3_FINAL_R_UNSET,
+    fixation_args=_GP3_FINAL_R_UNSET,
+):
+    """Run legacy pupil cleaning or the R v2.3.0 signal workflow."""
+    r_mode = any(
+        value is not _GP3_FINAL_R_UNSET
+        for value in (
+            id_col,
+            group_cols,
+            x_col,
+            y_col,
+            left_pupil_col,
+            right_pupil_col,
+            pupil_mode,
+            detect_blinks,
+            interpolate_blinks,
+            smooth_pupil,
+            smooth_coordinates,
+            downsample_factor,
+            detect_fixations,
+            blink_args,
+            interpolation_args,
+            pupil_args,
+            pupil_smoothing_args,
+            coordinate_smoothing_args,
+            downsampling_args,
+            fixation_args,
+        )
     )
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    work_col = pupil_col
-    df.loc[df["pupil_artifact"], work_col] = np.nan
-    if interpolate:
-        df = interpolate_gazepoint_pupil(
-            df, pupil_col=work_col, time_col=time_col, output_col=f"{pupil_col}_clean"
-        )
-        work_col = f"{pupil_col}_clean"
-    if smooth:
-        df = smooth_gazepoint_pupil(df, pupil_col=work_col, output_col=f"{pupil_col}_processed")
-        work_col = f"{pupil_col}_processed"
-    if baseline is not None:
-        df = baseline_correct_gazepoint_pupil(
-            df,
-            pupil_col=work_col,
+    if not r_mode:
+        df = flag_gazepoint_pupil_artifacts(
+            data,
+            pupil_col=pupil_col,
             time_col=time_col,
-            baseline=baseline,
-            output_col=f"{pupil_col}_baseline_corrected",
+            physiological_min=physiological_min,
+            physiological_max=physiological_max,
         )
-    return df
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        work_col = pupil_col
+        df.loc[df["pupil_artifact"], work_col] = np.nan
+        if interpolate:
+            df = interpolate_gazepoint_pupil(
+                df, pupil_col=work_col, time_col=time_col, output_col=f"{pupil_col}_clean"
+            )
+            work_col = f"{pupil_col}_clean"
+        if smooth:
+            df = smooth_gazepoint_pupil(df, pupil_col=work_col, output_col=f"{pupil_col}_processed")
+            work_col = f"{pupil_col}_processed"
+        if baseline is not None:
+            df = baseline_correct_gazepoint_pupil(
+                df,
+                pupil_col=work_col,
+                time_col=time_col,
+                baseline=baseline,
+                output_col=f"{pupil_col}_baseline_corrected",
+            )
+        return df
+
+    df = ensure_dataframe(data, copy=False)
+    id_col = "USER_ID" if id_col is _GP3_FINAL_R_UNSET else id_col
+    groups = [] if group_cols is _GP3_FINAL_R_UNSET else _gp3_final_list(group_cols)
+    time_col = "TIME" if time_col is None else time_col
+    x_col = "FPOGX" if x_col is _GP3_FINAL_R_UNSET else x_col
+    y_col = "FPOGY" if y_col is _GP3_FINAL_R_UNSET else y_col
+    left_pupil_col = None if left_pupil_col is _GP3_FINAL_R_UNSET else left_pupil_col
+    right_pupil_col = None if right_pupil_col is _GP3_FINAL_R_UNSET else right_pupil_col
+    pupil_mode = "mean" if pupil_mode is _GP3_FINAL_R_UNSET else str(pupil_mode)
+    detect_blinks = True if detect_blinks is _GP3_FINAL_R_UNSET else detect_blinks
+    interpolate_blinks = True if interpolate_blinks is _GP3_FINAL_R_UNSET else interpolate_blinks
+    smooth_pupil = True if smooth_pupil is _GP3_FINAL_R_UNSET else smooth_pupil
+    smooth_coordinates = True if smooth_coordinates is _GP3_FINAL_R_UNSET else smooth_coordinates
+    downsample_factor = 1 if downsample_factor is _GP3_FINAL_R_UNSET else downsample_factor
+    detect_fixations = True if detect_fixations is _GP3_FINAL_R_UNSET else detect_fixations
+    blink_args = {} if blink_args is _GP3_FINAL_R_UNSET else blink_args
+    interpolation_args = {} if interpolation_args is _GP3_FINAL_R_UNSET else interpolation_args
+    pupil_args = {} if pupil_args is _GP3_FINAL_R_UNSET else pupil_args
+    pupil_smoothing_args = (
+        {} if pupil_smoothing_args is _GP3_FINAL_R_UNSET else pupil_smoothing_args
+    )
+    coordinate_smoothing_args = (
+        {} if coordinate_smoothing_args is _GP3_FINAL_R_UNSET else coordinate_smoothing_args
+    )
+    downsampling_args = {} if downsampling_args is _GP3_FINAL_R_UNSET else downsampling_args
+    fixation_args = {} if fixation_args is _GP3_FINAL_R_UNSET else fixation_args
+    if pupil_mode not in {"mean", "regression", "none"}:
+        raise ValueError("pupil_mode must be mean, regression, or none")
+    switches = [
+        detect_blinks,
+        interpolate_blinks,
+        smooth_pupil,
+        smooth_coordinates,
+        detect_fixations,
+    ]
+    if not all(isinstance(value, (bool, np.bool_)) for value in switches):
+        raise ValueError("workflow switches must be TRUE or FALSE")
+    if (
+        isinstance(downsample_factor, (bool, np.bool_))
+        or not float(downsample_factor).is_integer()
+        or int(downsample_factor) < 1
+    ):
+        raise ValueError("downsample_factor must be one positive integer")
+    downsample_factor = int(downsample_factor)
+    for value in (
+        blink_args,
+        interpolation_args,
+        pupil_args,
+        pupil_smoothing_args,
+        coordinate_smoothing_args,
+        downsampling_args,
+        fixation_args,
+    ):
+        if not isinstance(value, dict):
+            raise ValueError("workflow override arguments must be dictionaries")
+    required = [id_col, *groups, time_col]
+    if smooth_coordinates or detect_fixations:
+        required += [x_col, y_col]
+    missing = [column for column in dict.fromkeys(required) if column not in df.columns]
+    if missing:
+        raise ValueError("data is missing required column(s): " + ", ".join(missing))
+
+    left = _gp3_final_detect(
+        df,
+        left_pupil_col,
+        ["LPupil", "LPD", "LPMM", "left_pupil", "pupil_left"],
+        "left_pupil_col",
+        required=pupil_mode in {"mean", "regression"},
+    )
+    right = _gp3_final_detect(
+        df,
+        right_pupil_col,
+        ["RPupil", "RPD", "RPMM", "right_pupil", "pupil_right"],
+        "right_pupil_col",
+        required=pupil_mode in {"mean", "regression"},
+    )
+    existing = None
+    if pupil_mode == "none":
+        existing = _gp3_final_detect(
+            df,
+            pupil_col,
+            [
+                "pupil_smoothed",
+                "pupil_interpolated",
+                "pupil_clean",
+                "pupil_for_preprocessing",
+                "mean_pupil",
+                "pupil_regressed",
+                "pupil",
+                "pupil_raw",
+                "LPupil",
+                "RPupil",
+                "LPD",
+                "RPD",
+                "LPMM",
+                "RPMM",
+            ],
+            "pupil_col",
+            required=True,
+        )
+
+    working = df.copy()
+    original = df.copy()
+    log_rows = []
+    blinks = pd.DataFrame()
+    fixations = pd.DataFrame()
+    current = existing
+
+    def log(operation, requested, status, input_rows, output_rows, details):
+        log_rows.append(
+            {
+                "step": len(log_rows) + 1,
+                "operation": operation,
+                "requested": bool(requested),
+                "status": status,
+                "input_rows": int(input_rows),
+                "output_rows": int(output_rows),
+                "details": details,
+            }
+        )
+
+    if pupil_mode == "mean":
+        before = len(working)
+        opts = _gp3_final_merge_args(
+            {"left_col": left, "right_col": right, "output_col": "gp3_pupil_fused", "min_eyes": 1},
+            pupil_args,
+            {"left_col", "right_col", "output_col"},
+        )
+        working = mean_gazepoint_pupil(working, **opts)
+        current = "gp3_pupil_fused"
+        log("binocular_pupil_mean", True, "applied", before, len(working), f"{left} + {right}")
+    elif pupil_mode == "regression":
+        before = len(working)
+        opts = _gp3_final_merge_args(
+            {
+                "lp_col": left,
+                "rp_col": right,
+                "id_col": id_col,
+                "group_cols": groups,
+                "direction": "bidirectional",
+                "output_col": "gp3_pupil_fused",
+                "residual_col": "gp3_pupil_regression_residual",
+                "min_complete": 10,
+            },
+            pupil_args,
+            {"lp_col", "rp_col", "id_col", "group_cols", "output_col", "residual_col"},
+        )
+        working = regress_gazepoint_pupils(master_df=working, **opts)
+        current = "gp3_pupil_fused"
+        log(
+            "binocular_pupil_regression", True, "applied", before, len(working), f"{left} ~ {right}"
+        )
+    else:
+        log(
+            "binocular_pupil_fusion",
+            False,
+            "skipped",
+            len(working),
+            len(working),
+            f"Using existing pupil column: {current}",
+        )
+
+    if detect_blinks:
+        before = len(working)
+        opts = _gp3_final_merge_args(
+            {
+                "min_duration_ms": 50.0,
+                "z_thresh": 4.0,
+                "zero_threshold": 0.0,
+                "merge_gap_ms": 20.0,
+                "time_unit": "auto",
+                "include_rapid_changes": True,
+            },
+            blink_args,
+            {"pupil_col", "time_col", "id_col", "group_cols", "return", "return_mode"},
+        )
+        result = detect_gazepoint_blinks(
+            working,
+            pupil_col=current,
+            time_col=time_col,
+            id_col=id_col,
+            group_cols=groups,
+            return_mode="both",
+            **opts,
+        )
+        working = result["samples"]
+        blinks = result["events"]
+        log(
+            "blink_detection",
+            True,
+            "applied",
+            before,
+            len(working),
+            f"{len(blinks)} blink interval(s)",
+        )
+    else:
+        log(
+            "blink_detection",
+            False,
+            "skipped",
+            len(working),
+            len(working),
+            "Blink detection disabled.",
+        )
+
+    if interpolate_blinks:
+        if not detect_blinks:
+            raise ValueError("interpolate_blinks = TRUE requires detect_blinks = TRUE")
+        before = len(working)
+        opts = _gp3_final_merge_args(
+            {"suffix": "_blink_interp", "max_gap_ms": 500.0, "method": "linear"},
+            interpolation_args,
+            {"pupil_col", "time_col", "group_cols"},
+        )
+        suffix = str(opts.pop("suffix"))
+        source = working.copy()
+        flag_col = (
+            "blink_detected"
+            if "blink_detected" in source
+            else ("blink" if "blink" in source else None)
+        )
+        if flag_col:
+            source.loc[source[flag_col].fillna(False).astype(bool), current] = np.nan
+        output = current + suffix
+        working = interpolate_gazepoint_pupil(
+            source,
+            pupil_col=current,
+            time_col=time_col,
+            group_cols=[id_col, *groups],
+            output_col=output,
+            **opts,
+        )
+        current = output
+        log(
+            "blink_interpolation",
+            True,
+            "applied",
+            before,
+            len(working),
+            f"Output pupil column: {current}",
+        )
+    else:
+        log(
+            "blink_interpolation",
+            False,
+            "skipped",
+            len(working),
+            len(working),
+            "Blink interpolation disabled.",
+        )
+
+    if smooth_pupil:
+        before = len(working)
+        opts = _gp3_final_merge_args(
+            {
+                "window_samples": 5,
+                "method": "mean",
+                "align": "center",
+                "min_points": 1,
+                "preserve_missing": True,
+            },
+            pupil_smoothing_args,
+            {"pupil_col", "time_col", "group_cols", "output_col"},
+        )
+        working = smooth_gazepoint_pupil(
+            working,
+            pupil_col=current,
+            time_col=time_col,
+            group_cols=[id_col, *groups],
+            output_col="pupil_smoothed",
+            **opts,
+        )
+        current = "pupil_smoothed"
+        log(
+            "pupil_smoothing",
+            True,
+            "applied",
+            before,
+            len(working),
+            "Output pupil column: pupil_smoothed",
+        )
+    else:
+        log(
+            "pupil_smoothing",
+            False,
+            "skipped",
+            len(working),
+            len(working),
+            "Pupil smoothing disabled.",
+        )
+
+    fixation_x = x_col
+    fixation_y = y_col
+    if smooth_coordinates:
+        before = len(working)
+        opts = _gp3_final_merge_args(
+            {
+                "method": "median",
+                "window": 5,
+                "suffix": "_smooth",
+                "min_valid": 1,
+                "preserve_missing": True,
+            },
+            coordinate_smoothing_args,
+            {"x_col", "y_col", "id_col", "group_cols", "all_gaze"},
+        )
+        suffix = str(opts.get("suffix", "_smooth"))
+        working = smooth_gazepoint_coordinate(
+            all_gaze=working, x_col=x_col, y_col=y_col, id_col=id_col, group_cols=groups, **opts
+        )
+        fixation_x, fixation_y = x_col + suffix, y_col + suffix
+        log(
+            "coordinate_smoothing",
+            True,
+            "applied",
+            before,
+            len(working),
+            f"{fixation_x}, {fixation_y}",
+        )
+    else:
+        log(
+            "coordinate_smoothing",
+            False,
+            "skipped",
+            len(working),
+            len(working),
+            "Coordinate smoothing disabled.",
+        )
+
+    if detect_fixations:
+        from .events import detect_gazepoint_fixations_velocity
+
+        opts = _gp3_final_merge_args(
+            {
+                "velocity_threshold": 10.0,
+                "min_duration_ms": 50.0,
+                "time_unit": "auto",
+                "x_scale": 1.0,
+                "y_scale": 1.0,
+                "keep_single_sample": False,
+            },
+            fixation_args,
+            {"x_col", "y_col", "time_col", "id_col", "group_cols", "return", "return_mode"},
+        )
+        fixations = detect_gazepoint_fixations_velocity(
+            working,
+            x_col=fixation_x,
+            y_col=fixation_y,
+            time_col=time_col,
+            id_col=id_col,
+            group_cols=groups,
+            return_mode="events",
+            **opts,
+        )
+        log(
+            "velocity_fixation_detection",
+            True,
+            "applied",
+            len(working),
+            len(working),
+            f"{len(fixations)} fixation event(s)",
+        )
+    else:
+        log(
+            "velocity_fixation_detection",
+            False,
+            "skipped",
+            len(working),
+            len(working),
+            "Velocity-based fixation detection disabled.",
+        )
+
+    full_resolution = working.copy()
+    if downsample_factor > 1:
+        before = len(working)
+        candidates = [
+            column
+            for column in dict.fromkeys([current, "gp3_pupil_fused", "pupil_smoothed"])
+            if column in working.columns
+        ]
+        opts = _gp3_final_merge_args(
+            {"method": "mean", "keep_bin": False},
+            downsampling_args,
+            {"master_df", "factor", "id_col", "group_cols", "ts_col"},
+        )
+        working = downsample_gazepoint_pupil(
+            master_df=working,
+            factor=downsample_factor,
+            pupil_cols=candidates,
+            id_col=id_col,
+            group_cols=groups,
+            ts_col=time_col,
+            **opts,
+        )
+        log(
+            "downsampling",
+            True,
+            "applied",
+            before,
+            len(working),
+            f"Aggregation factor: {downsample_factor}",
+        )
+    else:
+        log(
+            "downsampling",
+            False,
+            "skipped",
+            len(working),
+            len(working),
+            "Downsampling factor equals 1.",
+        )
+
+    overview = pd.DataFrame(
+        [
+            {
+                "original_rows": len(original),
+                "full_resolution_processed_rows": len(full_resolution),
+                "returned_rows": len(working),
+                "original_columns": original.shape[1],
+                "returned_columns": working.shape[1],
+                "n_blinks": len(blinks),
+                "n_fixations": len(fixations),
+                "pupil_mode": pupil_mode,
+                "final_pupil_col": current,
+                "fixation_x_col": fixation_x,
+                "fixation_y_col": fixation_y,
+                "downsample_factor": downsample_factor,
+                "workflow_status": "ok",
+            }
+        ]
+    )
+    diagnostics = {
+        "overview": overview,
+        "signal_summary": _gp3_final_signal_summary(
+            original, full_resolution, working, current, fixation_x, fixation_y
+        ),
+        "blink_summary": _gp3_final_event_summary(blinks, "blink"),
+        "fixation_summary": _gp3_final_event_summary(fixations, "fixation"),
+    }
+    settings = {
+        "id_col": id_col,
+        "group_cols": groups,
+        "time_col": time_col,
+        "x_col": x_col,
+        "y_col": y_col,
+        "left_pupil_col": left,
+        "right_pupil_col": right,
+        "input_pupil_col": existing,
+        "final_pupil_col": current,
+        "pupil_mode": pupil_mode,
+        "detect_blinks": bool(detect_blinks),
+        "interpolate_blinks": bool(interpolate_blinks),
+        "smooth_pupil": bool(smooth_pupil),
+        "smooth_coordinates": bool(smooth_coordinates),
+        "downsample_factor": downsample_factor,
+        "detect_fixations": bool(detect_fixations),
+        "blink_args": blink_args,
+        "interpolation_args": interpolation_args,
+        "pupil_args": pupil_args,
+        "pupil_smoothing_args": pupil_smoothing_args,
+        "coordinate_smoothing_args": coordinate_smoothing_args,
+        "downsampling_args": downsampling_args,
+        "fixation_args": fixation_args,
+    }
+    return {
+        "data": working,
+        "blinks": blinks,
+        "fixations": fixations,
+        "diagnostics": diagnostics,
+        "decision_log": pd.DataFrame(log_rows),
+        "settings": settings,
+        "_gp3_class": "gp3_signal_preprocessing_result",
+    }
 
 
 def create_gazepoint_preprocessing_registry(
