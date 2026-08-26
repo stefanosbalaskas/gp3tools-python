@@ -316,32 +316,604 @@ def fit_gazepoint_aoi_brms(data, formula=None, **kwargs):
     )
 
 
-def tidy_gazepoint_model_summary(model) -> pd.DataFrame:
+_GP3_MODEL_R_UNSET = object()
+
+
+def _gp3_model_r_requested(*values) -> bool:
+    return any(value is not _GP3_MODEL_R_UNSET for value in values)
+
+
+def _gp3_model_validate_bool(value, name: str) -> bool:
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be True or False")
+    return bool(value)
+
+
+def _gp3_model_validate_positive(value, name: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not np.isfinite(value) or float(value) <= 0:
+        raise ValueError(f"{name} must be a positive finite numeric scalar")
+    return float(value)
+
+
+def _gp3_model_validate_seed(value) -> int:
+    if isinstance(value, (bool, np.bool_)) or not np.isfinite(value):
+        raise ValueError("seed must be a finite numeric scalar")
+    return int(value)
+
+
+def _gp3_model_class(model) -> str:
+    return type(model).__name__
+
+
+def _gp3_model_collection(model) -> list[tuple[str, Any]] | None:
+    if isinstance(model, dict):
+        if "model" in model or "idata" in model:
+            return None
+        if not model:
+            return None
+        return [(str(name), value) for name, value in model.items()]
+    if isinstance(model, (list, tuple)) and model:
+        return [(f"model_{i + 1}", value) for i, value in enumerate(model)]
+    return None
+
+
+def _gp3_model_family_link(model) -> tuple[object, object]:
+    family_obj = getattr(model, "family", None)
+    if family_obj is None:
+        inner = getattr(model, "model", None)
+        family_obj = getattr(inner, "family", None)
+    if family_obj is None:
+        return pd.NA, pd.NA
+    family = getattr(family_obj, "family", None)
+    if family is None:
+        family = type(family_obj).__name__
+    link_obj = getattr(family_obj, "link", None)
+    link = getattr(link_obj, "__class__", type(None)).__name__ if link_obj is not None else pd.NA
+    return str(family), link
+
+
+def _gp3_model_formula(model):
+    inner = getattr(model, "model", None)
+    formula = getattr(inner, "formula", None)
+    if formula is None:
+        formula = getattr(model, "formula", None)
+    return pd.NA if formula is None else str(formula)
+
+
+def _gp3_model_info_table(model, model_name: str) -> pd.DataFrame:
+    family, link = _gp3_model_family_link(model)
+
+    def numeric_attr(name):
+        value = getattr(model, name, np.nan)
+        try:
+            value = float(value)
+        except Exception:
+            return np.nan
+        return value if np.isfinite(value) else np.nan
+
+    nobs = numeric_attr("nobs")
+    return pd.DataFrame(
+        {
+            "model_name": [model_name],
+            "model_class": [_gp3_model_class(model)],
+            "model_family": [family],
+            "model_link": [link],
+            "formula": [_gp3_model_formula(model)],
+            "n_observations": [pd.NA if not np.isfinite(nobs) else int(nobs)],
+            "df_residual": [numeric_attr("df_resid")],
+            "aic": [numeric_attr("aic")],
+            "bic": [numeric_attr("bic")],
+            "log_lik": [numeric_attr("llf")],
+        }
+    )
+
+
+def _gp3_model_legacy_summary(model) -> pd.DataFrame:
     if isinstance(model, dict) and "idata" in model:
         try:
             import arviz as az
 
-            s = az.summary(model["idata"]).reset_index().rename(columns={"index": "term"})
-            return s
+            return az.summary(model["idata"]).reset_index().rename(columns={"index": "term"})
         except Exception:
             return pd.DataFrame({"term": [], "estimate": []})
     params = getattr(model, "params", None)
     if params is None:
         return pd.DataFrame({"term": [], "estimate": []})
-    ci = model.conf_int() if hasattr(model, "conf_int") else None
-    out = pd.DataFrame({"term": params.index, "estimate": params.values})
+    if isinstance(params, pd.Series):
+        terms = list(params.index)
+        estimates = params.to_numpy(dtype=float)
+    else:
+        estimates = np.asarray(params, dtype=float).reshape(-1)
+        names = getattr(getattr(model, "model", None), "exog_names", None)
+        terms = (
+            list(names)
+            if names is not None and len(names) == len(estimates)
+            else [f"term_{i + 1}" for i in range(len(estimates))]
+        )
+    out = pd.DataFrame({"term": terms, "estimate": estimates})
     if hasattr(model, "bse"):
-        out["std_error"] = np.asarray(model.bse)
+        out["std_error"] = np.asarray(model.bse, dtype=float).reshape(-1)
     if hasattr(model, "pvalues"):
-        out["p_value"] = np.asarray(model.pvalues)
-    if ci is not None:
-        out["conf_low"] = ci.iloc[:, 0].to_numpy()
-        out["conf_high"] = ci.iloc[:, 1].to_numpy()
+        out["p_value"] = np.asarray(model.pvalues, dtype=float).reshape(-1)
+    if hasattr(model, "conf_int"):
+        try:
+            ci = np.asarray(model.conf_int(), dtype=float)
+            if ci.ndim == 2 and ci.shape[1] >= 2 and len(ci) == len(out):
+                out["conf_low"] = ci[:, 0]
+                out["conf_high"] = ci[:, 1]
+        except Exception:
+            pass
     return out
 
 
-def summarise_gazepoint_fixed_effects(model, **kwargs):
-    return tidy_gazepoint_model_summary(model)
+def _gp3_model_pstars(p):
+    if not np.isfinite(p):
+        return ""
+    if p < 0.001:
+        return "***"
+    if p < 0.01:
+        return "**"
+    if p < 0.05:
+        return "*"
+    if p < 0.10:
+        return "."
+    return ""
+
+
+def _gp3_model_fixed_effects_r(
+    model,
+    model_name: str,
+    conf_level: float,
+    exponentiate: bool,
+    drop_intercept: bool,
+) -> pd.DataFrame:
+    fitted, _ = _gp3_model_for_diagnostics(model, model_name)
+    legacy = _gp3_model_legacy_summary(fitted)
+    model_class = _gp3_model_class(fitted)
+    columns = [
+        "model_name",
+        "model_class",
+        "term",
+        "estimate",
+        "std_error",
+        "statistic",
+        "statistic_type",
+        "df",
+        "p_value",
+        "conf_low",
+        "conf_high",
+        "response_scale",
+        "significance",
+        "diagnostic_status",
+        "message",
+    ]
+    if legacy.empty or "estimate" not in legacy:
+        row = {c: pd.NA for c in columns}
+        row.update(
+            {
+                "model_name": model_name,
+                "model_class": model_class,
+                "response_scale": "exponentiated" if exponentiate else "link_or_original",
+                "diagnostic_status": "unsupported_model_class",
+                "message": "Unsupported model class for fixed-effect summaries.",
+            }
+        )
+        return pd.DataFrame([row], columns=columns)
+    out = pd.DataFrame()
+    out["term"] = legacy.get(
+        "term", pd.Series([f"term_{i + 1}" for i in range(len(legacy))])
+    ).astype(str)
+    out["estimate"] = pd.to_numeric(legacy["estimate"], errors="coerce")
+    out["std_error"] = pd.to_numeric(legacy.get("std_error", np.nan), errors="coerce")
+    statistic = getattr(fitted, "tvalues", None)
+    if statistic is None:
+        statistic = getattr(fitted, "zvalues", None)
+    if statistic is None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            statistic = out["estimate"].to_numpy(float) / out["std_error"].to_numpy(float)
+    statistic = np.asarray(statistic, dtype=float).reshape(-1)
+    if len(statistic) != len(out):
+        statistic = np.full(len(out), np.nan)
+    out["statistic"] = statistic
+    family, _ = _gp3_model_family_link(fitted)
+    out["statistic_type"] = "z" if family is not pd.NA else "t"
+    df_resid = getattr(fitted, "df_resid", np.nan)
+    try:
+        df_resid = float(df_resid)
+    except Exception:
+        df_resid = np.nan
+    out["df"] = df_resid if np.isfinite(df_resid) else np.nan
+    out["p_value"] = pd.to_numeric(legacy.get("p_value", np.nan), errors="coerce")
+    alpha = 1.0 - conf_level
+    ci = None
+    if hasattr(fitted, "conf_int"):
+        try:
+            ci = np.asarray(fitted.conf_int(alpha=alpha), dtype=float)
+        except TypeError:
+            try:
+                ci = np.asarray(fitted.conf_int(), dtype=float)
+            except Exception:
+                ci = None
+        except Exception:
+            ci = None
+    if ci is not None and ci.ndim == 2 and ci.shape[1] >= 2 and len(ci) == len(out):
+        out["conf_low"] = ci[:, 0]
+        out["conf_high"] = ci[:, 1]
+    else:
+        z = float(stats.norm.ppf(1.0 - alpha / 2.0))
+        out["conf_low"] = out["estimate"] - z * out["std_error"]
+        out["conf_high"] = out["estimate"] + z * out["std_error"]
+    if exponentiate:
+        out[["estimate", "conf_low", "conf_high"]] = np.exp(
+            out[["estimate", "conf_low", "conf_high"]]
+        )
+    out.insert(0, "model_class", model_class)
+    out.insert(0, "model_name", model_name)
+    out["response_scale"] = "exponentiated" if exponentiate else "link_or_original"
+    out["significance"] = [
+        _gp3_model_pstars(float(p)) if pd.notna(p) else "" for p in out["p_value"]
+    ]
+    out["diagnostic_status"] = "ok"
+    out["message"] = "Fixed-effect summary extracted."
+    if drop_intercept:
+        out = out.loc[~out["term"].str.lower().isin({"intercept", "(intercept)"})].copy()
+    if out.empty:
+        row = {c: pd.NA for c in columns}
+        row.update(
+            {
+                "model_name": model_name,
+                "model_class": model_class,
+                "response_scale": "exponentiated" if exponentiate else "link_or_original",
+                "diagnostic_status": "not_available",
+                "message": "No fixed-effect rows remained after filtering.",
+            }
+        )
+        return pd.DataFrame([row], columns=columns)
+    return out[columns].reset_index(drop=True)
+
+
+def _gp3_model_skipped_row(model_name, model_class, diagnostic, status, message):
+    base = {
+        "model_name": [model_name],
+        "model_class": [model_class],
+        "diagnostic": [diagnostic],
+        "diagnostic_status": [status],
+        "message": [message],
+    }
+    if diagnostic == "convergence":
+        base["converged"] = [pd.NA]
+    elif diagnostic == "singularity":
+        base["singular_fit"] = [pd.NA]
+        base["tolerance"] = [np.nan]
+    elif diagnostic == "overdispersion":
+        base.update(
+            {
+                "dispersion_ratio": [np.nan],
+                "pearson_chisq": [np.nan],
+                "residual_df": [np.nan],
+                "overdispersed": [pd.NA],
+                "ratio_threshold": [np.nan],
+            }
+        )
+    return pd.DataFrame(base)
+
+
+def _gp3_model_dharma_row(model_name, model_class, use_dharma, simulations, seed):
+    if not use_dharma:
+        status = "skipped_disabled"
+        message = "DHARMa diagnostics were disabled."
+        dharma_status = "skipped_disabled"
+    else:
+        status = "skipped_missing_package"
+        message = (
+            "DHARMa diagnostics require the R DHARMa backend and are unavailable in native Python."
+        )
+        dharma_status = "skipped_missing_package"
+    return pd.DataFrame(
+        {
+            "model_name": [model_name],
+            "model_class": [model_class],
+            "diagnostic": ["dharma"],
+            "dharma_status": [dharma_status],
+            "uniformity_p": [np.nan],
+            "dispersion_p": [np.nan],
+            "outlier_p": [np.nan],
+            "diagnostic_status": [status],
+            "message": [message],
+            "simulations": [int(simulations)],
+            "seed": [int(seed)],
+        }
+    )
+
+
+def _gp3_model_status(statuses) -> str:
+    values = [str(x) for x in statuses if pd.notna(x)]
+    if any(x in {"error", "unsupported_model_class"} for x in values):
+        return "error"
+    if any(
+        x
+        in {
+            "convergence_warning",
+            "singular_fit",
+            "overdispersed",
+            "basis_warning",
+            "diagnostic_warning",
+        }
+        for x in values
+    ):
+        return "diagnostic_warning"
+    if any(x == "ok" for x in values):
+        return "ok"
+    for value in values:
+        if value not in {"skipped_disabled", "skipped_missing_package", "not_applicable"}:
+            return value
+    return values[0] if values else "not_available"
+
+
+def _gp3_model_messages(*tables) -> object:
+    messages = []
+    for table in tables:
+        if isinstance(table, pd.DataFrame) and "message" in table:
+            for value in table["message"].dropna().astype(str):
+                if value and value not in messages:
+                    messages.append(value)
+    return " | ".join(messages) if messages else pd.NA
+
+
+def _gp3_model_basis_table(model, model_name: str, enabled: bool) -> pd.DataFrame:
+    model_class = _gp3_model_class(model)
+    columns = [
+        "model_name",
+        "model_class",
+        "diagnostic",
+        "smooth",
+        "k_index",
+        "edf",
+        "k_prime",
+        "p_value",
+        "basis_status",
+        "diagnostic_status",
+        "message",
+    ]
+    if not enabled:
+        return pd.DataFrame(
+            [
+                [
+                    model_name,
+                    model_class,
+                    "basis",
+                    pd.NA,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    "skipped_disabled",
+                    "skipped_disabled",
+                    "GAM basis diagnostics were disabled.",
+                ]
+            ],
+            columns=columns,
+        )
+    raw = getattr(model, "basis_diagnostics", None)
+    if raw is None:
+        raw = getattr(model, "k_check", None)
+    if isinstance(raw, pd.DataFrame) and len(raw):
+        rows = []
+        for idx, row in raw.iterrows():
+            p = pd.to_numeric(
+                pd.Series([row.get("p_value", row.get("p-value", np.nan))]), errors="coerce"
+            ).iloc[0]
+            status = "basis_warning" if np.isfinite(p) and float(p) < 0.05 else "ok"
+            rows.append(
+                {
+                    "model_name": model_name,
+                    "model_class": model_class,
+                    "diagnostic": "basis",
+                    "smooth": str(row.get("smooth", idx)),
+                    "k_index": row.get("k_index", row.get("k-index", np.nan)),
+                    "edf": row.get("edf", np.nan),
+                    "k_prime": row.get("k_prime", row.get("k'", np.nan)),
+                    "p_value": p,
+                    "basis_status": status,
+                    "diagnostic_status": status,
+                    "message": "Basis-dimension check returned p < .05."
+                    if status == "basis_warning"
+                    else "Basis-dimension check did not return p < .05.",
+                }
+            )
+        return pd.DataFrame(rows, columns=columns)
+    return pd.DataFrame(
+        [
+            [
+                model_name,
+                model_class,
+                "basis",
+                pd.NA,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                "not_applicable",
+                "not_applicable",
+                "GAM basis diagnostics are not available for this native Python model.",
+            ]
+        ],
+        columns=columns,
+    )
+
+
+def tidy_gazepoint_model_summary(
+    model,
+    model_name=_GP3_MODEL_R_UNSET,
+    conf_level=_GP3_MODEL_R_UNSET,
+    exponentiate=_GP3_MODEL_R_UNSET,
+    drop_intercept=_GP3_MODEL_R_UNSET,
+    include_diagnostics=_GP3_MODEL_R_UNSET,
+    use_dharma=_GP3_MODEL_R_UNSET,
+    dharma_simulations=_GP3_MODEL_R_UNSET,
+    seed=_GP3_MODEL_R_UNSET,
+):
+    r_mode = _gp3_model_r_requested(
+        model_name,
+        conf_level,
+        exponentiate,
+        drop_intercept,
+        include_diagnostics,
+        use_dharma,
+        dharma_simulations,
+        seed,
+    )
+    if not r_mode:
+        return _gp3_model_legacy_summary(model)
+    model_name = None if model_name is _GP3_MODEL_R_UNSET else model_name
+    conf_level = 0.95 if conf_level is _GP3_MODEL_R_UNSET else float(conf_level)
+    exponentiate = (
+        False
+        if exponentiate is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(exponentiate, "exponentiate")
+    )
+    drop_intercept = (
+        False
+        if drop_intercept is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(drop_intercept, "drop_intercept")
+    )
+    include_diagnostics = (
+        True
+        if include_diagnostics is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(include_diagnostics, "include_diagnostics")
+    )
+    use_dharma = (
+        False
+        if use_dharma is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(use_dharma, "use_dharma")
+    )
+    dharma_simulations = (
+        250
+        if dharma_simulations is _GP3_MODEL_R_UNSET
+        else int(_gp3_model_validate_positive(dharma_simulations, "dharma_simulations"))
+    )
+    seed = 123 if seed is _GP3_MODEL_R_UNSET else _gp3_model_validate_seed(seed)
+    if not np.isfinite(conf_level) or not 0 < conf_level < 1:
+        raise ValueError("conf_level must be a finite numeric scalar between 0 and 1")
+    fitted, resolved_name = _gp3_model_for_diagnostics(model, model_name)
+    fixed = _gp3_model_fixed_effects_r(
+        fitted, resolved_name, conf_level, exponentiate, drop_intercept
+    )
+    info = _gp3_model_info_table(fitted, resolved_name)
+    if include_diagnostics:
+        diagnostics = diagnose_gazepoint_glmm(
+            fitted,
+            model_name=resolved_name,
+            use_dharma=use_dharma,
+            dharma_simulations=dharma_simulations,
+            seed=seed,
+        )
+    else:
+        diagnostics = {
+            "overview": pd.DataFrame(
+                {
+                    "model_name": [resolved_name],
+                    "model_class": [_gp3_model_class(fitted)],
+                    "diagnostic_status": ["skipped_disabled"],
+                    "message": ["Model diagnostics were disabled."],
+                }
+            )
+        }
+    diag_over = diagnostics.get("overview", pd.DataFrame())
+    diag_status = (
+        str(diag_over.iloc[0]["diagnostic_status"])
+        if len(diag_over) and "diagnostic_status" in diag_over
+        else "not_available"
+    )
+    diag_message = (
+        diag_over.iloc[0].get("message", pd.NA)
+        if len(diag_over)
+        else "Diagnostics overview was not available."
+    )
+    fixed_statuses = (
+        fixed["diagnostic_status"].dropna().astype(str).tolist()
+        if "diagnostic_status" in fixed
+        else []
+    )
+    fixed_status = (
+        "error"
+        if any(x in {"error", "unsupported_model_class"} for x in fixed_statuses)
+        else (
+            "ok" if fixed_statuses and all(x == "ok" for x in fixed_statuses) else "not_available"
+        )
+    )
+    summary_status = fixed_status
+    if fixed_status == "ok" and include_diagnostics:
+        summary_status = (
+            "diagnostic_warning"
+            if diag_status == "diagnostic_warning"
+            else (
+                "diagnostic_error" if diag_status in {"error", "unsupported_model_class"} else "ok"
+            )
+        )
+    overview = pd.DataFrame(
+        {
+            "model_name": [resolved_name],
+            "model_class": [_gp3_model_class(fitted)],
+            "model_family": [info.iloc[0]["model_family"]],
+            "model_link": [info.iloc[0]["model_link"]],
+            "n_observations": [info.iloc[0]["n_observations"]],
+            "n_fixed_effects": [int((fixed["diagnostic_status"] == "ok").sum())],
+            "fixed_effects_status": [fixed_status],
+            "diagnostics_status": [diag_status],
+            "summary_status": [summary_status],
+            "message": [_gp3_model_messages(fixed, pd.DataFrame({"message": [diag_message]}))],
+        }
+    )
+    return {
+        "overview": overview,
+        "model_info": info,
+        "fixed_effects": fixed,
+        "diagnostics": diagnostics,
+        "settings": {
+            "conf_level": conf_level,
+            "exponentiate": exponentiate,
+            "drop_intercept": drop_intercept,
+            "include_diagnostics": include_diagnostics,
+            "use_dharma": use_dharma,
+            "dharma_simulations": int(dharma_simulations),
+            "seed": int(seed),
+        },
+    }
+
+
+def summarise_gazepoint_fixed_effects(
+    model,
+    model_name=_GP3_MODEL_R_UNSET,
+    conf_level=_GP3_MODEL_R_UNSET,
+    exponentiate=_GP3_MODEL_R_UNSET,
+    drop_intercept=_GP3_MODEL_R_UNSET,
+    **kwargs,
+):
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected argument(s): {unknown}")
+    r_mode = _gp3_model_r_requested(model_name, conf_level, exponentiate, drop_intercept)
+    if not r_mode:
+        return _gp3_model_legacy_summary(model)
+    model_name = None if model_name is _GP3_MODEL_R_UNSET else model_name
+    conf_level = 0.95 if conf_level is _GP3_MODEL_R_UNSET else float(conf_level)
+    exponentiate = (
+        False
+        if exponentiate is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(exponentiate, "exponentiate")
+    )
+    drop_intercept = (
+        False
+        if drop_intercept is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(drop_intercept, "drop_intercept")
+    )
+    if not np.isfinite(conf_level) or not 0 < conf_level < 1:
+        raise ValueError("conf_level must be a finite numeric scalar between 0 and 1")
+    fitted, resolved_name = _gp3_model_for_diagnostics(model, model_name)
+    return _gp3_model_fixed_effects_r(
+        fitted, resolved_name, conf_level, exponentiate, drop_intercept
+    )
 
 
 def summarise_gazepoint_emmeans(
@@ -530,18 +1102,312 @@ def check_gazepoint_model_overdispersion(
     )
 
 
-def diagnose_gazepoint_glmm(model) -> dict[str, pd.DataFrame]:
+def diagnose_gazepoint_glmm(
+    model,
+    model_name=_GP3_MODEL_R_UNSET,
+    check_convergence=_GP3_MODEL_R_UNSET,
+    check_singularity=_GP3_MODEL_R_UNSET,
+    check_overdispersion=_GP3_MODEL_R_UNSET,
+    use_dharma=_GP3_MODEL_R_UNSET,
+    dharma_simulations=_GP3_MODEL_R_UNSET,
+    seed=_GP3_MODEL_R_UNSET,
+):
+    r_mode = _gp3_model_r_requested(
+        model_name,
+        check_convergence,
+        check_singularity,
+        check_overdispersion,
+        use_dharma,
+        dharma_simulations,
+        seed,
+    )
+    if not r_mode:
+        return {
+            "convergence": check_gazepoint_model_convergence(model),
+            "overdispersion": check_gazepoint_model_overdispersion(model),
+            "coefficients": _gp3_model_legacy_summary(model),
+        }
+    model_name = None if model_name is _GP3_MODEL_R_UNSET else model_name
+    check_convergence = (
+        True
+        if check_convergence is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(check_convergence, "check_convergence")
+    )
+    check_singularity = (
+        True
+        if check_singularity is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(check_singularity, "check_singularity")
+    )
+    check_overdispersion = (
+        True
+        if check_overdispersion is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(check_overdispersion, "check_overdispersion")
+    )
+    use_dharma = (
+        True
+        if use_dharma is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(use_dharma, "use_dharma")
+    )
+    dharma_simulations = (
+        250
+        if dharma_simulations is _GP3_MODEL_R_UNSET
+        else int(_gp3_model_validate_positive(dharma_simulations, "dharma_simulations"))
+    )
+    seed = 123 if seed is _GP3_MODEL_R_UNSET else _gp3_model_validate_seed(seed)
+    collection = _gp3_model_collection(model)
+    if collection is not None:
+        parts = []
+        for i, (name, fitted) in enumerate(collection):
+            resolved = name if model_name is None else f"{model_name}_{name or i + 1}"
+            parts.append(
+                diagnose_gazepoint_glmm(
+                    fitted,
+                    model_name=resolved,
+                    check_convergence=check_convergence,
+                    check_singularity=check_singularity,
+                    check_overdispersion=check_overdispersion,
+                    use_dharma=use_dharma,
+                    dharma_simulations=dharma_simulations,
+                    seed=seed,
+                )
+            )
+        return {
+            key: pd.concat([p[key] for p in parts], ignore_index=True)
+            for key in ["overview", "convergence", "singularity", "overdispersion", "dharma"]
+        } | {
+            "settings": {
+                "check_convergence": check_convergence,
+                "check_singularity": check_singularity,
+                "check_overdispersion": check_overdispersion,
+                "use_dharma": use_dharma,
+                "dharma_simulations": dharma_simulations,
+                "seed": seed,
+                "n_models": len(parts),
+            }
+        }
+    fitted, resolved_name = _gp3_model_for_diagnostics(model, model_name)
+    model_class = _gp3_model_class(fitted)
+    convergence = (
+        check_gazepoint_model_convergence(fitted, resolved_name)
+        if check_convergence
+        else _gp3_model_skipped_row(
+            resolved_name,
+            model_class,
+            "convergence",
+            "skipped_disabled",
+            "Convergence diagnostics were disabled.",
+        )
+    )
+    singularity = (
+        check_gazepoint_model_singularity(fitted, model_name=resolved_name)
+        if check_singularity
+        else _gp3_model_skipped_row(
+            resolved_name,
+            model_class,
+            "singularity",
+            "skipped_disabled",
+            "Singularity diagnostics were disabled.",
+        )
+    )
+    overdispersion = (
+        check_gazepoint_model_overdispersion(fitted, model_name=resolved_name)
+        if check_overdispersion
+        else _gp3_model_skipped_row(
+            resolved_name,
+            model_class,
+            "overdispersion",
+            "skipped_disabled",
+            "Overdispersion diagnostics were disabled.",
+        )
+    )
+    dharma = _gp3_model_dharma_row(resolved_name, model_class, use_dharma, dharma_simulations, seed)
+    statuses = [
+        convergence.iloc[0].get("diagnostic_status"),
+        singularity.iloc[0].get("diagnostic_status"),
+        overdispersion.iloc[0].get("diagnostic_status"),
+        dharma.iloc[0].get("diagnostic_status"),
+    ]
+    overview = pd.DataFrame(
+        {
+            "model_name": [resolved_name],
+            "model_class": [model_class],
+            "diagnostic_status": [_gp3_model_status(statuses)],
+            "converged": [convergence.iloc[0].get("converged", pd.NA)],
+            "singular_fit": [singularity.iloc[0].get("singular_fit", pd.NA)],
+            "overdispersed": [overdispersion.iloc[0].get("overdispersed", pd.NA)],
+            "dharma_status": [dharma.iloc[0].get("dharma_status", pd.NA)],
+            "message": [_gp3_model_messages(convergence, singularity, overdispersion, dharma)],
+        }
+    )
     return {
-        "convergence": check_gazepoint_model_convergence(model),
-        "overdispersion": check_gazepoint_model_overdispersion(model),
-        "coefficients": tidy_gazepoint_model_summary(model),
+        "overview": overview,
+        "convergence": convergence,
+        "singularity": singularity,
+        "overdispersion": overdispersion,
+        "dharma": dharma,
+        "settings": {
+            "check_convergence": check_convergence,
+            "check_singularity": check_singularity,
+            "check_overdispersion": check_overdispersion,
+            "use_dharma": use_dharma,
+            "dharma_simulations": dharma_simulations,
+            "seed": seed,
+            "n_models": 1,
+        },
     }
 
 
-def diagnose_gazepoint_gamm(model) -> dict[str, pd.DataFrame]:
+def diagnose_gazepoint_gamm(
+    model,
+    model_name=_GP3_MODEL_R_UNSET,
+    check_convergence=_GP3_MODEL_R_UNSET,
+    check_basis=_GP3_MODEL_R_UNSET,
+    check_overdispersion=_GP3_MODEL_R_UNSET,
+    use_dharma=_GP3_MODEL_R_UNSET,
+    dharma_simulations=_GP3_MODEL_R_UNSET,
+    seed=_GP3_MODEL_R_UNSET,
+):
+    r_mode = _gp3_model_r_requested(
+        model_name,
+        check_convergence,
+        check_basis,
+        check_overdispersion,
+        use_dharma,
+        dharma_simulations,
+        seed,
+    )
+    if not r_mode:
+        return {
+            "convergence": check_gazepoint_model_convergence(model),
+            "coefficients": _gp3_model_legacy_summary(model),
+        }
+    model_name = None if model_name is _GP3_MODEL_R_UNSET else model_name
+    check_convergence = (
+        True
+        if check_convergence is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(check_convergence, "check_convergence")
+    )
+    check_basis = (
+        True
+        if check_basis is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(check_basis, "check_basis")
+    )
+    check_overdispersion = (
+        True
+        if check_overdispersion is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(check_overdispersion, "check_overdispersion")
+    )
+    use_dharma = (
+        False
+        if use_dharma is _GP3_MODEL_R_UNSET
+        else _gp3_model_validate_bool(use_dharma, "use_dharma")
+    )
+    dharma_simulations = (
+        250
+        if dharma_simulations is _GP3_MODEL_R_UNSET
+        else int(_gp3_model_validate_positive(dharma_simulations, "dharma_simulations"))
+    )
+    seed = 123 if seed is _GP3_MODEL_R_UNSET else _gp3_model_validate_seed(seed)
+    collection = _gp3_model_collection(model)
+    if collection is not None:
+        parts = []
+        for i, (name, fitted) in enumerate(collection):
+            resolved = name if model_name is None else f"{model_name}_{name or i + 1}"
+            parts.append(
+                diagnose_gazepoint_gamm(
+                    fitted,
+                    model_name=resolved,
+                    check_convergence=check_convergence,
+                    check_basis=check_basis,
+                    check_overdispersion=check_overdispersion,
+                    use_dharma=use_dharma,
+                    dharma_simulations=dharma_simulations,
+                    seed=seed,
+                )
+            )
+        return {
+            key: pd.concat([p[key] for p in parts], ignore_index=True)
+            for key in ["overview", "convergence", "basis", "overdispersion", "dharma"]
+        } | {
+            "settings": {
+                "check_convergence": check_convergence,
+                "check_basis": check_basis,
+                "check_overdispersion": check_overdispersion,
+                "use_dharma": use_dharma,
+                "dharma_simulations": dharma_simulations,
+                "seed": seed,
+                "n_models": len(parts),
+            }
+        }
+    fitted, resolved_name = _gp3_model_for_diagnostics(model, model_name)
+    model_class = _gp3_model_class(fitted)
+    convergence = (
+        check_gazepoint_model_convergence(fitted, resolved_name)
+        if check_convergence
+        else _gp3_model_skipped_row(
+            resolved_name,
+            model_class,
+            "convergence",
+            "skipped_disabled",
+            "Convergence diagnostics were disabled.",
+        )
+    )
+    basis = _gp3_model_basis_table(fitted, resolved_name, check_basis)
+    overdispersion = (
+        check_gazepoint_model_overdispersion(fitted, model_name=resolved_name)
+        if check_overdispersion
+        else _gp3_model_skipped_row(
+            resolved_name,
+            model_class,
+            "overdispersion",
+            "skipped_disabled",
+            "Overdispersion diagnostics were disabled.",
+        )
+    )
+    dharma = _gp3_model_dharma_row(resolved_name, model_class, use_dharma, dharma_simulations, seed)
+    basis_statuses = basis["basis_status"].dropna().astype(str).tolist()
+    basis_status = (
+        "basis_warning"
+        if "basis_warning" in basis_statuses
+        else (
+            "ok"
+            if "ok" in basis_statuses
+            else (basis_statuses[0] if basis_statuses else "not_available")
+        )
+    )
+    statuses = [
+        convergence.iloc[0].get("diagnostic_status"),
+        basis_status,
+        overdispersion.iloc[0].get("diagnostic_status"),
+        dharma.iloc[0].get("diagnostic_status"),
+    ]
+    overview = pd.DataFrame(
+        {
+            "model_name": [resolved_name],
+            "model_class": [model_class],
+            "diagnostic_status": [_gp3_model_status(statuses)],
+            "converged": [convergence.iloc[0].get("converged", pd.NA)],
+            "basis_status": [basis_status],
+            "overdispersed": [overdispersion.iloc[0].get("overdispersed", pd.NA)],
+            "dharma_status": [dharma.iloc[0].get("dharma_status", pd.NA)],
+            "message": [_gp3_model_messages(convergence, basis, overdispersion, dharma)],
+        }
+    )
     return {
-        "convergence": check_gazepoint_model_convergence(model),
-        "coefficients": tidy_gazepoint_model_summary(model),
+        "overview": overview,
+        "convergence": convergence,
+        "basis": basis,
+        "overdispersion": overdispersion,
+        "dharma": dharma,
+        "settings": {
+            "check_convergence": check_convergence,
+            "check_basis": check_basis,
+            "check_overdispersion": check_overdispersion,
+            "use_dharma": use_dharma,
+            "dharma_simulations": dharma_simulations,
+            "seed": seed,
+            "n_models": 1,
+        },
     }
 
 
