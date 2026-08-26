@@ -1925,14 +1925,71 @@ def interpolate_gazepoint_pupil_pchip(
     return result
 
 
-def interpolate_gazepoint_blinks(data, pupil_col=None, blink_col="blink", **kwargs) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    pupil_col = infer_column(df, "pupil", pupil_col, required=True)
-    if blink_col not in df:
-        df = detect_gazepoint_blinks(df, pupil_col=pupil_col, output_col=blink_col)
-    working = df.copy()
-    working.loc[working[blink_col].astype(bool), pupil_col] = np.nan
-    return interpolate_gazepoint_pupil(working, pupil_col=pupil_col, **kwargs)
+def interpolate_gazepoint_blinks(
+    data=None,
+    pupil_col=None,
+    blink_col="blink",
+    *,
+    master_df=None,
+    blink_df=None,
+    pupil_cols=None,
+    id_col="USER_ID",
+    group_cols=None,
+    ts_col="TIME",
+    start_col="start_time",
+    end_col="end_time",
+    method="linear",
+    max_gap_ms=500,
+    suffix="_blink_interp",
+    keep_mask=True,
+    time_unit="auto",
+    **kwargs,
+):
+    if blink_df is None:
+        # Historical Python sample-level blink-mask route.
+        source = data if data is not None else master_df
+        df = ensure_dataframe(source)
+        pupil_col = infer_column(df, "pupil", pupil_col, required=True)
+        if blink_col not in df:
+            df = detect_gazepoint_blinks(
+                df,
+                pupil_col=pupil_col,
+                output_col=blink_col,
+            )
+        working = df.copy()
+        working.loc[
+            working[blink_col].astype(bool),
+            pupil_col,
+        ] = np.nan
+        return interpolate_gazepoint_pupil(
+            working,
+            pupil_col=pupil_col,
+            **kwargs,
+        )
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    source = master_df if master_df is not None else data
+
+    from ._behavioral_r2 import interpolate_blinks
+
+    return interpolate_blinks(
+        source,
+        blink_df,
+        pupil_cols=pupil_cols,
+        id_col=id_col,
+        group_cols=group_cols,
+        ts_col=ts_col,
+        start_col=start_col,
+        end_col=end_col,
+        method=method,
+        max_gap_ms=max_gap_ms,
+        suffix=suffix,
+        keep_mask=keep_mask,
+        time_unit=time_unit,
+    )
 
 
 def smooth_gazepoint_pupil(
@@ -8241,21 +8298,39 @@ def create_gazepoint_preprocessing_registry(
     )
 
 
-def create_gazepoint_preprocessing_multiverse(**grids) -> pd.DataFrame:
-    import itertools
+def create_gazepoint_preprocessing_multiverse(
+    pupil_max_gap_ms=(75, 150, 300),
+    pupil_smoothing_window_samples=(3, 5),
+    pupil_baseline_windows=((-200, 0),),
+    pupil_artifact_padding_ms=(0, 50),
+    aoi_denominators=("valid", "all"),
+    aoi_min_denominator_samples=(1, 5),
+    include_pupil=True,
+    include_aoi=True,
+    label_prefix="gp3",
+    **grids,
+):
+    if grids:
+        # Historical arbitrary Cartesian-product Python route.
+        import itertools
 
-    if not grids:
-        grids = {
-            "interpolation_method": ["linear", "pchip"],
-            "smoothing_window": [3, 5, 9],
-            "baseline_mode": ["subtract", "percent"],
-        }
-    keys = list(grids)
-    return pd.DataFrame(
-        [
-            dict(zip(keys, vals, strict=False))
-            for vals in itertools.product(*[grids[k] for k in keys])
+        rows = [
+            dict(zip(grids, values, strict=False)) for values in itertools.product(*grids.values())
         ]
+        return pd.DataFrame(rows)
+
+    from ._behavioral_r2 import create_preprocessing_multiverse
+
+    return create_preprocessing_multiverse(
+        pupil_max_gap_ms=pupil_max_gap_ms,
+        pupil_smoothing_window_samples=pupil_smoothing_window_samples,
+        pupil_baseline_windows=pupil_baseline_windows,
+        pupil_artifact_padding_ms=pupil_artifact_padding_ms,
+        aoi_denominators=aoi_denominators,
+        aoi_min_denominator_samples=aoi_min_denominator_samples,
+        include_pupil=include_pupil,
+        include_aoi=include_aoi,
+        label_prefix=label_prefix,
     )
 
 

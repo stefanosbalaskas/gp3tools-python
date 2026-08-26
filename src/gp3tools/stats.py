@@ -286,18 +286,66 @@ def prepare_gazepoint_hmm_data(data, **kwargs):
 
 
 def prepare_gazepoint_fixation_aligned_data(
-    data, fixation_time_col=None, sample_time_col=None, window=(-0.5, 1.5), **kwargs
+    data,
+    fixation_time_col=None,
+    sample_time_col=None,
+    window=(-0.5, 1.5),
+    *,
+    time_col=None,
+    participant_col=None,
+    trial_col=None,
+    aoi_col=None,
+    target_aoi=None,
+    fixation_col=None,
+    saccade_col=None,
+    event_col=None,
+    event_value=None,
+    alignment_event="first_target_entry",
+    baseline_window=None,
+    analysis_window=None,
+    keep_unaligned=False,
+    name="gazepoint_fixation_aligned_data",
+    **kwargs,
 ):
-    df = ensure_dataframe(data)
-    tc = sample_time_col or infer_column(df, "time")
-    if not tc:
-        raise ValueError("sample time column required")
-    out = df.copy()
-    ref = 0.0
-    if fixation_time_col and fixation_time_col in out:
-        ref = pd.to_numeric(out[fixation_time_col], errors="coerce")
-    out["fixation_aligned_time"] = time_to_seconds(out[tc]) - ref
-    return out[out["fixation_aligned_time"].between(window[0], window[1])].copy()
+    if time_col is None:
+        # Historical Python row-alignment route.
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+        df = ensure_dataframe(data)
+        tc = sample_time_col or infer_column(df, "time")
+        if not tc:
+            raise ValueError("sample time column required")
+        out = df.copy()
+        ref = 0.0
+        if fixation_time_col and fixation_time_col in out:
+            ref = pd.to_numeric(out[fixation_time_col], errors="coerce")
+        out["fixation_aligned_time"] = time_to_seconds(out[tc]) - ref
+        return out[out["fixation_aligned_time"].between(window[0], window[1])].copy()
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    from ._behavioral_r2 import prepare_fixation_aligned_data
+
+    return prepare_fixation_aligned_data(
+        data,
+        time_col=time_col,
+        participant_col=participant_col,
+        trial_col=trial_col,
+        aoi_col=aoi_col,
+        target_aoi=target_aoi,
+        fixation_col=fixation_col,
+        saccade_col=saccade_col,
+        event_col=event_col,
+        event_value=event_value,
+        alignment_event=alignment_event,
+        baseline_window=baseline_window,
+        analysis_window=analysis_window,
+        keep_unaligned=keep_unaligned,
+        name=name,
+    )
 
 
 def _fit_formula(data, formula=None, family="gaussian", group_col=None):
@@ -2608,22 +2656,43 @@ def diagnose_gazepoint_cluster_design(
 
 
 def audit_gazepoint_timecourse_grid(
-    data, time_col="time_bin", subject_col="subject", condition_col="condition", **kwargs
-) -> pd.DataFrame:
-    df = ensure_dataframe(data)
-    keys = [c for c in [subject_col, condition_col] if c in df]
-    expected = df[time_col].nunique() if time_col in df else 0
-    if not keys:
-        return pd.DataFrame(
-            {
-                "expected_bins": [expected],
-                "observed_bins": [df[time_col].nunique() if time_col in df else 0],
-            }
-        )
-    out = df.groupby(keys)[time_col].nunique().rename("observed_bins").reset_index()
-    out["expected_bins"] = expected
-    out["complete"] = out["observed_bins"].eq(expected)
-    return out
+    data,
+    time_col="time_bin",
+    subject_col="subject",
+    condition_col="condition",
+    outcome_col=None,
+    **kwargs,
+):
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    if outcome_col is None:
+        # Historical Python completeness table.
+        df = ensure_dataframe(data)
+        keys = [c for c in [subject_col, condition_col] if c in df]
+        expected = df[time_col].nunique() if time_col in df else 0
+        if not keys:
+            return pd.DataFrame(
+                {
+                    "expected_bins": [expected],
+                    "observed_bins": [df[time_col].nunique() if time_col in df else 0],
+                }
+            )
+        out = df.groupby(keys)[time_col].nunique().rename("observed_bins").reset_index()
+        out["expected_bins"] = expected
+        out["complete"] = out["observed_bins"].eq(expected)
+        return out
+
+    from ._behavioral_r2 import audit_timecourse_grid
+
+    return audit_timecourse_grid(
+        data,
+        subject_col=subject_col,
+        condition_col=condition_col,
+        time_col=time_col,
+        outcome_col=outcome_col,
+    )
 
 
 def run_gazepoint_model_leave_one_out(

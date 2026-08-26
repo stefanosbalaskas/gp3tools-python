@@ -2449,10 +2449,35 @@ def summarise_gazepoint_workflow(result) -> pd.DataFrame:
 
 
 def create_gazepoint_cross_package_report(
-    result, output_file="cross_package_report.html", **kwargs
+    result=None,
+    output_file=None,
+    *,
+    x=None,
+    **kwargs,
 ):
+    source = x if x is not None else result
+
+    if isinstance(source, dict) and {
+        "audit",
+        "report_text",
+    } <= set(source):
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+        from ._behavioral_r2 import create_cross_package_report
+
+        return create_cross_package_report(
+            source,
+            output_file=output_file,
+        )
+
+    # Historical Python report route.
+    chosen = "cross_package_report.html" if output_file is None else output_file
     return create_gazepoint_report(
-        result, output_file, title="gp3tools cross-package report", **kwargs
+        source,
+        output_file=chosen,
+        **kwargs,
     )
 
 

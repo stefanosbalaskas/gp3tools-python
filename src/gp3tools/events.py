@@ -1419,16 +1419,64 @@ def audit_gazepoint_fixation_reliability(
     return pd.DataFrame(reliability_rows)
 
 
-def compare_gazepoint_event_detectors(data, **kwargs) -> pd.DataFrame:
-    a = detect_gazepoint_fixations_velocity(data, **kwargs)
-    b = classify_gazepoint_events_hmm(
-        data, **{k: v for k, v in kwargs.items() if k in {"x_col", "y_col", "time_col"}}
+def compare_gazepoint_event_detectors(
+    data,
+    id_col="USER_ID",
+    trial_col=None,
+    group_cols=None,
+    x_col="FPOGX",
+    y_col="FPOGY",
+    time_col="TIME",
+    methods=None,
+    velocity_thresholds=(5, 10, 20),
+    min_duration=50,
+    hmm_states=3,
+    eyetools_method="vti",
+    run_optional_eyetools=False,
+    min_overlap=0.5,
+    velocity_args=None,
+    hmm_args=None,
+    eyetools_args=None,
+    **kwargs,
+):
+    if methods is None:
+        # Historical Python sample-wise detector agreement.
+        a = detect_gazepoint_fixations_velocity(data, **kwargs)
+        b = classify_gazepoint_events_hmm(
+            data,
+            **{k: v for k, v in kwargs.items() if k in {"x_col", "y_col", "time_col"}},
+        )
+        out = pd.DataFrame(index=a.index)
+        out["velocity_detector"] = np.where(a["fixation"], "fixation", "saccade")
+        out["state_detector"] = b["event_state"].to_numpy()
+        out["agreement"] = out["velocity_detector"].eq(out["state_detector"])
+        return out.reset_index(drop=True)
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    from ._behavioral_r2 import compare_event_detectors
+
+    return compare_event_detectors(
+        data,
+        id_col=id_col,
+        trial_col=trial_col,
+        group_cols=group_cols,
+        x_col=x_col,
+        y_col=y_col,
+        time_col=time_col,
+        methods=methods,
+        velocity_thresholds=velocity_thresholds,
+        min_duration=min_duration,
+        hmm_states=hmm_states,
+        eyetools_method=eyetools_method,
+        run_optional_eyetools=run_optional_eyetools,
+        min_overlap=min_overlap,
+        velocity_args=velocity_args,
+        hmm_args=hmm_args,
+        eyetools_args=eyetools_args,
     )
-    out = pd.DataFrame(index=a.index)
-    out["velocity_detector"] = np.where(a["fixation"], "fixation", "saccade")
-    out["state_detector"] = b["event_state"].to_numpy()
-    out["agreement"] = out["velocity_detector"].eq(out["state_detector"])
-    return out.reset_index(drop=True)
 
 
 def summarise_gazepoint_event_detector_agreement(data, **kwargs) -> pd.DataFrame:

@@ -41,23 +41,86 @@ def recalibrate_gazepoint_gaze(
     method="offset",
     output_x="x_recalibrated",
     output_y="y_recalibrated",
+    *,
+    target_x_col=None,
+    target_y_col=None,
+    time_col=None,
+    grouping_cols=None,
+    calibration_col=None,
+    calibration_value=None,
+    min_valid_points=3,
+    max_shift=None,
+    output_x_col="gaze_x_recalibrated",
+    output_y_col="gaze_y_recalibrated",
+    dx_col="gaze_recalibration_dx",
+    dy_col="gaze_recalibration_dy",
+    shift_col="gaze_recalibration_shift",
+    error_before_col="gaze_error_before_recalibration",
+    error_after_col="gaze_error_after_recalibration",
+    status_col="gaze_recalibration_status",
+    overwrite=False,
+    name="gazepoint_gaze_recalibration",
     **kwargs,
 ):
-    df = ensure_dataframe(data)
-    x = x_col or infer_column(df, "x")
-    y = y_col or infer_column(df, "y")
-    out = df.copy()
-    xv = pd.to_numeric(out[x], errors="coerce")
-    yv = pd.to_numeric(out[y], errors="coerce")
-    if method == "offset":
-        out[output_x] = xv + (target_x - xv.mean())
-        out[output_y] = yv + (target_y - yv.mean())
-    elif method == "scale":
-        out[output_x] = target_x + (xv - xv.mean())
-        out[output_y] = target_y + (yv - yv.mean())
-    else:
-        raise ValueError("method must be 'offset' or 'scale'")
-    return out
+    if target_x_col is None or target_y_col is None:
+        # Historical Python global offset/scale route.
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+        df = ensure_dataframe(data)
+        x = x_col or infer_column(df, "x")
+        y = y_col or infer_column(df, "y")
+        out = df.copy()
+        xv = pd.to_numeric(out[x], errors="coerce")
+        yv = pd.to_numeric(out[y], errors="coerce")
+
+        if method == "offset":
+            out[output_x] = xv + (target_x - xv.mean())
+            out[output_y] = yv + (target_y - yv.mean())
+        elif method == "scale":
+            out[output_x] = target_x + (xv - xv.mean())
+            out[output_y] = target_y + (yv - yv.mean())
+        else:
+            raise ValueError("method must be 'offset' or 'scale'")
+
+        return out
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    r_method = method
+
+    if r_method == "offset":
+        r_method = "median_shift"
+
+    from ._behavioral_r2 import recalibrate_gaze
+
+    return recalibrate_gaze(
+        data,
+        x_col=x_col,
+        y_col=y_col,
+        target_x_col=target_x_col,
+        target_y_col=target_y_col,
+        time_col=time_col,
+        grouping_cols=grouping_cols,
+        calibration_col=calibration_col,
+        calibration_value=calibration_value,
+        method=r_method,
+        min_valid_points=min_valid_points,
+        max_shift=max_shift,
+        output_x_col=output_x_col,
+        output_y_col=output_y_col,
+        dx_col=dx_col,
+        dy_col=dy_col,
+        shift_col=shift_col,
+        error_before_col=error_before_col,
+        error_after_col=error_after_col,
+        status_col=status_col,
+        overwrite=overwrite,
+        name=name,
+    )
 
 
 def filter_gazepoint_cnn_uncertainty(

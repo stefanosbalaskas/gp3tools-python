@@ -1178,11 +1178,65 @@ def summarise_gazepoint_missingness(
 summarize_gazepoint_missingness = summarise_gazepoint_missingness
 
 
-def audit_gazepoint_gaze_signal_quality(data, **kwargs) -> dict[str, pd.DataFrame]:
-    return {
-        "tracking": summarise_tracking_quality(data, **kwargs),
-        "missingness": summarise_gazepoint_missingness(data),
-    }
+def audit_gazepoint_gaze_signal_quality(
+    data,
+    subject_col=None,
+    condition_col=None,
+    group_cols=None,
+    x_col=None,
+    y_col=None,
+    validity_cols=None,
+    pupil_col=None,
+    screen_x_range=(0, 1),
+    screen_y_range=(0, 1),
+    min_gaze_valid_prop=0.70,
+    max_missing_gaze_prop=0.30,
+    max_offscreen_prop=0.20,
+    min_pupil_valid_prop=0.70,
+    **kwargs,
+):
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    explicit_r_mode = any(
+        value is not None
+        for value in (
+            subject_col,
+            condition_col,
+            group_cols,
+            x_col,
+            y_col,
+            validity_cols,
+            pupil_col,
+        )
+    )
+
+    if not explicit_r_mode:
+        # Historical Python contract.
+        return {
+            "tracking": summarise_tracking_quality(data),
+            "missingness": summarise_gazepoint_missingness(data),
+        }
+
+    from ._behavioral_r2 import audit_gaze_signal_quality
+
+    return audit_gaze_signal_quality(
+        data,
+        subject_col=subject_col,
+        condition_col=condition_col,
+        group_cols=group_cols,
+        x_col=x_col,
+        y_col=y_col,
+        validity_cols=validity_cols,
+        pupil_col=pupil_col,
+        screen_x_range=screen_x_range,
+        screen_y_range=screen_y_range,
+        min_gaze_valid_prop=min_gaze_valid_prop,
+        max_missing_gaze_prop=max_missing_gaze_prop,
+        max_offscreen_prop=max_offscreen_prop,
+        min_pupil_valid_prop=min_pupil_valid_prop,
+    )
 
 
 def audit_gazepoint_screen_bounds(
@@ -1831,10 +1885,50 @@ def audit_gazepoint_design_balance(
     }
 
 
-def audit_gazepoint_condition_quality_imbalance(data, condition_col=None, **kwargs) -> pd.DataFrame:
-    df = ensure_dataframe(data, copy=False)
-    condition_col = infer_column(df, "condition", condition_col, required=True)
-    return summarise_tracking_quality(df, group_cols=[condition_col], **kwargs)
+def audit_gazepoint_condition_quality_imbalance(
+    data,
+    condition_col="condition",
+    quality_cols=None,
+    subject_col=None,
+    min_units_per_condition=1,
+    max_mean_difference=0.1,
+    max_condition_ratio=2,
+    lower_is_better=(
+        "missing_gaze_prop",
+        "offscreen_prop",
+        "excluded_prop",
+        "failure_prop",
+        "artifact_prop",
+    ),
+    **kwargs,
+):
+    if kwargs:
+        # Preserve the historical Python tracking-summary convenience route.
+        legacy_keys = {
+            "validity_col",
+            "x_col",
+            "y_col",
+            "group_cols",
+        }
+        if set(kwargs) <= legacy_keys:
+            df = ensure_dataframe(data, copy=False)
+            resolved = infer_column(df, "condition", condition_col, required=True)
+            return summarise_tracking_quality(df, group_cols=[resolved], **kwargs)
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    from ._behavioral_r2 import audit_condition_quality_imbalance
+
+    return audit_condition_quality_imbalance(
+        data,
+        condition_col=condition_col,
+        quality_cols=quality_cols,
+        subject_col=subject_col,
+        min_units_per_condition=min_units_per_condition,
+        max_mean_difference=max_mean_difference,
+        max_condition_ratio=max_condition_ratio,
+        lower_is_better=lower_is_better,
+    )
 
 
 def audit_gazepoint_post_exclusion_balance(

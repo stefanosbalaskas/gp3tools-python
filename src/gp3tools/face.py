@@ -737,17 +737,61 @@ def sync_gazepoint_face_data(
     return out
 
 
-def audit_gazepoint_face_sync(gaze, face=None, **kwargs) -> pd.DataFrame:
-    synced = (
-        sync_gazepoint_face_data(gaze, face, **kwargs)
-        if face is not None
-        else ensure_dataframe(gaze)
-    )
+def audit_gazepoint_face_sync(
+    gaze=None,
+    face=None,
+    *,
+    data=None,
+    group_cols=None,
+    min_matched_percent=70,
+    warning_matched_percent=85,
+    max_abs_diff_sec=None,
+    **kwargs,
+):
+    if data is None and face is not None:
+        # Historical Python two-table synchronization route.
+        synced = sync_gazepoint_face_data(gaze, face, **kwargs)
+        face_cols = [c for c in synced.columns if c.endswith("_face")]
+        matched = (
+            ~synced[face_cols].isna().all(axis=1)
+            if face_cols
+            else pd.Series(True, index=synced.index)
+        )
+        return pd.DataFrame(
+            {
+                "n_gaze": [len(synced)],
+                "n_matched": [int(matched.sum())],
+                "match_rate": [float(matched.mean())],
+            }
+        )
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    source = data if data is not None else gaze
+
+    # An already synchronized table follows the frozen R audit.
+    if isinstance(source, pd.DataFrame) and {
+        "face_sync_method",
+        "face_sync_status",
+        "face_sync_within_tolerance",
+    } <= set(source.columns):
+        from ._behavioral_r2 import audit_face_sync
+
+        return audit_face_sync(
+            source,
+            group_cols=group_cols,
+            min_matched_percent=min_matched_percent,
+            warning_matched_percent=warning_matched_percent,
+            max_abs_diff_sec=max_abs_diff_sec,
+        )
+
+    # Otherwise preserve the old one-table summary.
+    synced = ensure_dataframe(source)
     face_cols = [c for c in synced.columns if c.endswith("_face")]
     matched = (
-        (~synced[face_cols].isna().all(axis=1))
-        if face_cols
-        else pd.Series(True, index=synced.index)
+        ~synced[face_cols].isna().all(axis=1) if face_cols else pd.Series(True, index=synced.index)
     )
     return pd.DataFrame(
         {
@@ -758,8 +802,46 @@ def audit_gazepoint_face_sync(gaze, face=None, **kwargs) -> pd.DataFrame:
     )
 
 
-def audit_gazepoint_event_sync(gaze, events=None, **kwargs):
-    return audit_gazepoint_face_sync(gaze, events, **kwargs)
+def audit_gazepoint_event_sync(
+    gaze=None,
+    events=None,
+    *,
+    data=None,
+    time_col="time",
+    event_col=None,
+    group_cols=("subject", "media_id", "trial_global"),
+    condition_col=None,
+    expected_event_labels=None,
+    onset_event_label=None,
+    response_event_label=None,
+    min_samples_per_unit=1,
+    max_time_gap_ms=None,
+    **kwargs,
+):
+    if data is None and events is not None:
+        # Historical Python cross-table synchronization route.
+        return audit_gazepoint_face_sync(gaze, events, **kwargs)
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    source = data if data is not None else gaze
+
+    from ._behavioral_r2 import audit_event_sync
+
+    return audit_event_sync(
+        source,
+        time_col=time_col,
+        event_col=event_col,
+        group_cols=group_cols,
+        condition_col=condition_col,
+        expected_event_labels=expected_event_labels,
+        onset_event_label=onset_event_label,
+        response_event_label=response_event_label,
+        min_samples_per_unit=min_samples_per_unit,
+        max_time_gap_ms=max_time_gap_ms,
+    )
 
 
 def _face_numeric_cols(df):
@@ -798,11 +880,55 @@ def summarise_gazepoint_face_reactivity(data, **kwargs):
     return summarize_gazepoint_face_reactivity(data, **kwargs)
 
 
-def prepare_gazepoint_multimodal_data(gaze, face=None, **kwargs):
-    return (
-        sync_gazepoint_face_data(gaze, face, **kwargs)
-        if face is not None
-        else ensure_dataframe(gaze)
+def prepare_gazepoint_multimodal_data(
+    gaze=None,
+    face=None,
+    *,
+    face_windows=None,
+    gaze_data=None,
+    response_data=None,
+    by=None,
+    gaze_by=None,
+    response_by=None,
+    predictor_cols=None,
+    outcome_cols=None,
+    covariate_cols=None,
+    scale_predictors=True,
+    scaled_suffix="_z",
+    drop_missing_outcomes=False,
+    keep_all=True,
+    **kwargs,
+):
+    if face_windows is None:
+        # Historical Python route.
+        if kwargs:
+            return (
+                sync_gazepoint_face_data(gaze, face, **kwargs)
+                if face is not None
+                else ensure_dataframe(gaze)
+            )
+        return sync_gazepoint_face_data(gaze, face) if face is not None else ensure_dataframe(gaze)
+
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+    from ._behavioral_r2 import prepare_multimodal_data
+
+    return prepare_multimodal_data(
+        face_windows,
+        gaze_data=gaze_data,
+        response_data=response_data,
+        by=by,
+        gaze_by=gaze_by,
+        response_by=response_by,
+        predictor_cols=predictor_cols,
+        outcome_cols=outcome_cols,
+        covariate_cols=covariate_cols,
+        scale_predictors=scale_predictors,
+        scaled_suffix=scaled_suffix,
+        drop_missing_outcomes=drop_missing_outcomes,
+        keep_all=keep_all,
     )
 
 
