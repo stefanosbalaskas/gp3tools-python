@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import pandas as pd
 from scipy import interpolate, ndimage, signal, stats
@@ -5022,41 +5020,630 @@ def regress_gazepoint_pupils(
     return output
 
 
-def fit_gazepoint_binocular_calibration(data, left_col=None, right_col=None) -> dict[str, Any]:
-    return {
-        "right_from_left": regress_gazepoint_pupils(data, left_col, right_col, "right_from_left"),
-        "left_from_right": regress_gazepoint_pupils(data, left_col, right_col, "left_from_right"),
-    }
-
-
-def diagnose_gazepoint_binocular_pupil(
-    data, left_col=None, right_col=None, group_cols=None
-) -> pd.DataFrame:
+def fit_gazepoint_binocular_calibration(
+    data,
+    left_col=None,
+    right_col=None,
+    *,
+    group_cols=None,
+    fallback_group_cols=None,
+    valid_min=None,
+    valid_max=None,
+    min_pairs=30,
+    min_unique=5,
+    min_r2=None,
+    allow_negative_slope=False,
+    max_abs_slope=None,
+):
+    """Fit legacy regressions or an audited R-style binocular calibration."""
     df = ensure_dataframe(data, copy=False)
     left_col = infer_column(df, "left_pupil", left_col, required=True)
     right_col = infer_column(df, "right_pupil", right_col, required=True)
-    groups = normalize_group_cols(df, group_cols)
+    r_mode = (
+        group_cols is not None
+        or fallback_group_cols is not None
+        or valid_min is not None
+        or valid_max is not None
+        or min_pairs != 30
+        or min_unique != 5
+        or min_r2 is not None
+        or allow_negative_slope is not False
+        or max_abs_slope is not None
+    )
+    if not r_mode:
+        return {
+            "right_from_left": regress_gazepoint_pupils(
+                data, left_col, right_col, "right_from_left"
+            ),
+            "left_from_right": regress_gazepoint_pupils(
+                data, left_col, right_col, "left_from_right"
+            ),
+        }
+    return _gp3_binoc_r_calibration(
+        df,
+        left_col,
+        right_col,
+        group_cols,
+        fallback_group_cols,
+        valid_min,
+        valid_max,
+        min_pairs,
+        min_unique,
+        min_r2,
+        allow_negative_slope,
+        max_abs_slope,
+    )
+
+
+_GP3_BINOC_R_UNSET = object()
+
+
+def _gp3_binoc_r_cols(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    return [x for x in dict.fromkeys(value) if x is not None and str(x) != ""]
+
+
+def _gp3_binoc_r_check_cols(data, cols, label="columns"):
+    missing = [c for c in _gp3_binoc_r_cols(cols) if c not in data.columns]
+    if missing:
+        raise KeyError(f"Missing {label}: {', '.join(missing)}")
+
+
+def _gp3_binoc_r_bounds(valid_min, valid_max):
+    for value, label in ((valid_min, "valid_min"), (valid_max, "valid_max")):
+        if value is not None and (not np.isfinite(value)):
+            raise ValueError(f"{label} must be finite")
+    if valid_min is not None and valid_max is not None and valid_min >= valid_max:
+        raise ValueError("valid_min must be smaller than valid_max")
+
+
+def _gp3_binoc_r_observed(values, valid_min=None, valid_max=None):
+    out = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float, copy=True)
+    out[~np.isfinite(out)] = np.nan
+    if valid_min is not None:
+        out[out < float(valid_min)] = np.nan
+    if valid_max is not None:
+        out[out > float(valid_max)] = np.nan
+    return out
+
+
+def _gp3_binoc_r_group_key(data, cols):
+    cols = _gp3_binoc_r_cols(cols)
+    if not cols:
+        return np.full(len(data), "__pooled__", dtype=object)
+    parts = []
+    for col in cols:
+        vals = data[col].astype(object).to_numpy(copy=False)
+        parts.append([f"{col}={'<NA>' if pd.isna(v) else v}" for v in vals])
+    return np.asarray(["||".join(z) for z in zip(*parts, strict=True)], dtype=object)
+
+
+def _gp3_binoc_r_groups(data, cols):
+    keys = _gp3_binoc_r_group_key(data, cols)
+    return [(key, np.flatnonzero(keys == key)) for key in sorted(set(keys.tolist()))]
+
+
+def _gp3_binoc_r_time_scale_ms(values, unit):
+    if unit == "milliseconds":
+        return 1.0
+    if unit == "seconds":
+        return 1000.0
+    finite = np.sort(np.unique(values[np.isfinite(values)]))
+    if len(finite) < 2:
+        return 1.0
+    delta = float(np.median(np.diff(finite)))
+    return 1000.0 if np.isfinite(delta) and delta < 2 else 1.0
+
+
+def _gp3_binoc_r_gaps(data, missing, group_cols, time_col=None, time_unit="auto"):
+    n = len(data)
+    gap_id = np.full(n, np.nan)
+    gap_ms = np.full(n, np.nan)
+    edge_gap = np.zeros(n, dtype=bool)
     rows = []
-    iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
-    for key, frame in iterator:
-        left_values = finite_numeric(frame[left_col])
-        right_values = finite_numeric(frame[right_col])
-        both = left_values.notna() & right_values.notna()
-        diff = left_values - right_values
-        corr = float(left_values[both].corr(right_values[both])) if both.sum() > 1 else np.nan
-        rmse = float(np.sqrt(np.nanmean(diff[both] ** 2))) if both.any() else np.nan
-        row = {c: v for c, v in zip(groups, key, strict=False)} if groups else {}
-        row.update(
-            n=len(frame),
-            left_missing_prop=float(left_values.isna().mean()),
-            right_missing_prop=float(right_values.isna().mean()),
-            both_valid_prop=float(both.mean()),
-            correlation=corr,
-            rmse=rmse,
-            mae=float(np.nanmean(abs(diff[both]))) if both.any() else np.nan,
+    next_id = 0
+    for key, idx in _gp3_binoc_r_groups(data, group_cols):
+        if time_col is None:
+            ordered = idx
+            raw_time = np.full(len(idx), np.nan)
+            dt = np.nan
+            scale = np.nan
+        else:
+            t = pd.to_numeric(data.iloc[idx][time_col], errors="coerce").to_numpy(float)
+            order = np.argsort(np.where(np.isfinite(t), t, np.inf), kind="stable")
+            ordered = idx[order]
+            raw_time = t[order]
+            scale = _gp3_binoc_r_time_scale_ms(raw_time, time_unit)
+            finite = np.sort(np.unique(raw_time[np.isfinite(raw_time)]))
+            dt = float(np.median(np.diff(finite)) * scale) if len(finite) >= 2 else np.nan
+            if not np.isfinite(dt) or dt <= 0:
+                dt = np.nan
+        m = np.asarray(missing, dtype=bool)[ordered]
+        starts = np.flatnonzero(m & ~np.r_[False, m[:-1]])
+        ends = np.flatnonzero(m & ~np.r_[m[1:], False])
+        for start, end in zip(starts, ends, strict=True):
+            next_id += 1
+            pos = np.arange(start, end + 1)
+            positions = ordered[pos]
+            edge = start == 0 or end == len(ordered) - 1
+            if time_col is None:
+                duration = np.nan
+            else:
+                tr = raw_time[pos]
+                if np.isfinite(tr).all():
+                    duration = (
+                        dt
+                        if len(tr) == 1
+                        else (
+                            float(np.max(tr) - np.min(tr)) * scale + (0.0 if np.isnan(dt) else dt)
+                        )
+                    )
+                else:
+                    duration = np.nan
+            gap_id[positions] = next_id
+            gap_ms[positions] = duration
+            edge_gap[positions] = edge
+            rows.append(
+                {
+                    "gap_id": next_id,
+                    "group_key": key,
+                    "n_samples": len(positions),
+                    "gap_ms": duration,
+                    "edge_gap": edge,
+                    "start_row": int(positions.min() + 1),
+                    "end_row": int(positions.max() + 1),
+                }
+            )
+    return {"gap_id": gap_id, "gap_ms": gap_ms, "edge_gap": edge_gap, "gaps": pd.DataFrame(rows)}
+
+
+def _gp3_binoc_r_mad(values, scale=1.0):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return np.nan
+    med = float(np.median(values))
+    return float(np.median(np.abs(values - med)) * scale)
+
+
+def _gp3_binoc_r_fit_one(x, y, min_pairs, min_unique, min_r2, allow_negative_slope, max_abs_slope):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x = x[ok]
+    y = y[ok]
+    n = len(x)
+    out = {
+        "n_pairs": n,
+        "intercept": np.nan,
+        "slope": np.nan,
+        "r_squared": np.nan,
+        "adjusted_r_squared": np.nan,
+        "rmse": np.nan,
+        "mae": np.nan,
+        "residual_sd": np.nan,
+        "residual_median": np.nan,
+        "residual_mad": np.nan,
+        "predictor_min": float(np.min(x)) if n else np.nan,
+        "predictor_max": float(np.max(x)) if n else np.nan,
+        "outcome_min": float(np.min(y)) if n else np.nan,
+        "outcome_max": float(np.max(y)) if n else np.nan,
+        "eligible": False,
+        "status": "ineligible",
+        "reason": "insufficient_paired_samples",
+    }
+    if n < int(min_pairs):
+        return out
+    if len(np.unique(x)) < int(min_unique) or len(np.unique(y)) < int(min_unique):
+        out["reason"] = "insufficient_unique_values"
+        return out
+    if not np.isfinite(np.var(x, ddof=1)) or np.var(x, ddof=1) <= np.finfo(float).eps:
+        out["reason"] = "zero_predictor_variance"
+        return out
+    if not np.isfinite(np.var(y, ddof=1)) or np.var(y, ddof=1) <= np.finfo(float).eps:
+        out["reason"] = "zero_outcome_variance"
+        return out
+    X = np.column_stack([np.ones(n), x])
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    if len(coef) != 2 or not np.isfinite(coef).all():
+        out["reason"] = "unstable_linear_fit"
+        return out
+    pred = X @ coef
+    resid = y - pred
+    sse = float(np.sum(resid**2))
+    sst = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1 - sse / sst if sst > 0 else np.nan
+    out.update(
+        intercept=float(coef[0]),
+        slope=float(coef[1]),
+        r_squared=r2,
+        adjusted_r_squared=(1 - (1 - r2) * (n - 1) / (n - 2))
+        if np.isfinite(r2) and n > 2
+        else np.nan,
+        rmse=float(np.sqrt(np.mean(resid**2))),
+        mae=float(np.mean(np.abs(resid))),
+        residual_sd=float(np.std(resid, ddof=1)) if n > 1 else np.nan,
+        residual_median=float(np.median(resid)),
+        residual_mad=_gp3_binoc_r_mad(resid),
+        predictor_min=float(x.min()),
+        predictor_max=float(x.max()),
+        outcome_min=float(y.min()),
+        outcome_max=float(y.max()),
+    )
+    if not allow_negative_slope and out["slope"] <= 0:
+        out["reason"] = "non_positive_slope"
+        return out
+    if max_abs_slope is not None and abs(out["slope"]) > float(max_abs_slope):
+        out["reason"] = "slope_outside_limit"
+        return out
+    if min_r2 is not None and (not np.isfinite(r2) or r2 < float(min_r2)):
+        out["reason"] = "r_squared_below_threshold"
+        return out
+    out.update(eligible=True, status="eligible", reason=None)
+    return out
+
+
+def _gp3_binoc_r_level_specs(group_cols, fallback_group_cols):
+    primary = _gp3_binoc_r_cols(group_cols)
+    if fallback_group_cols is None:
+        fallbacks = [[]] if primary else []
+    elif fallback_group_cols == []:
+        fallbacks = []
+    elif all(isinstance(x, str) for x in fallback_group_cols):
+        fallbacks = [_gp3_binoc_r_cols(fallback_group_cols)]
+    else:
+        fallbacks = [_gp3_binoc_r_cols(x) for x in fallback_group_cols]
+    specs = [primary] + fallbacks
+    unique = []
+    for spec in specs:
+        if spec not in unique:
+            unique.append(spec)
+    return unique
+
+
+def _gp3_binoc_r_calibration(
+    data,
+    left_col,
+    right_col,
+    group_cols=None,
+    fallback_group_cols=None,
+    valid_min=None,
+    valid_max=None,
+    min_pairs=30,
+    min_unique=5,
+    min_r2=None,
+    allow_negative_slope=False,
+    max_abs_slope=None,
+):
+    df = ensure_dataframe(data, copy=False)
+    groups = _gp3_binoc_r_cols(group_cols)
+    _gp3_binoc_r_check_cols(df, [left_col, right_col, *groups])
+    _gp3_binoc_r_bounds(valid_min, valid_max)
+    if min_pairs < 2 or min_unique < 2:
+        raise ValueError("min_pairs and min_unique must be at least 2")
+    if min_r2 is not None and not (0 <= min_r2 <= 1):
+        raise ValueError("min_r2 must be between 0 and 1")
+    if max_abs_slope is not None and (not np.isfinite(max_abs_slope) or max_abs_slope < 0):
+        raise ValueError("max_abs_slope must be non-negative")
+    left = _gp3_binoc_r_observed(df[left_col], valid_min, valid_max)
+    right = _gp3_binoc_r_observed(df[right_col], valid_min, valid_max)
+    specs = _gp3_binoc_r_level_specs(groups, fallback_group_cols)
+    levels = []
+    rows = []
+    counter = 0
+    for spec in specs:
+        _gp3_binoc_r_check_cols(df, spec, "calibration grouping columns")
+        level_rows = []
+        for key, idx in _gp3_binoc_r_groups(df, spec):
+            for direction, x, y in (
+                ("left_from_right", right[idx], left[idx]),
+                ("right_from_left", left[idx], right[idx]),
+            ):
+                counter += 1
+                fit = _gp3_binoc_r_fit_one(
+                    x,
+                    y,
+                    int(min_pairs),
+                    int(min_unique),
+                    min_r2,
+                    bool(allow_negative_slope),
+                    max_abs_slope,
+                )
+                row = {
+                    "model_id": f"binoc_{counter:03d}_{direction}",
+                    "direction": direction,
+                    "calibration_level": "pooled" if not spec else "+".join(spec),
+                    "group_key": key,
+                }
+                for col in spec:
+                    row[col] = df.iloc[idx[0]][col]
+                row.update(fit)
+                level_rows.append(row)
+                rows.append(row.copy())
+        levels.append(
+            {
+                "group_cols": spec,
+                "calibration_level": "pooled" if not spec else "+".join(spec),
+                "models": pd.DataFrame(level_rows),
+            }
         )
+    models = pd.DataFrame(rows)
+    if len(models):
+        models["model_index"] = np.arange(1, len(models) + 1)
+    return {
+        "models": models,
+        "levels": levels,
+        "settings": {
+            "left_col": left_col,
+            "right_col": right_col,
+            "group_cols": groups,
+            "fallback_group_cols": specs[1:],
+            "valid_min": valid_min,
+            "valid_max": valid_max,
+            "min_pairs": int(min_pairs),
+            "min_unique": int(min_unique),
+            "min_r2": min_r2,
+            "allow_negative_slope": bool(allow_negative_slope),
+            "max_abs_slope": max_abs_slope,
+        },
+        "_gp3_class": "gp3_binocular_calibration",
+    }
+
+
+def _gp3_binoc_r_assign_models(data, calibration, direction):
+    selected = np.full(len(data), -1, dtype=int)
+    models = calibration["models"]
+    if models.empty:
+        return selected
+    for level in calibration["levels"]:
+        unresolved = np.flatnonzero(selected < 0)
+        if not len(unresolved):
+            break
+        lm = level["models"]
+        if lm.empty:
+            continue
+        lm = lm[(lm["direction"] == direction) & lm["eligible"].astype(bool)]
+        if lm.empty:
+            continue
+        lookup = dict(zip(lm["group_key"], lm["model_id"], strict=False))
+        keys = _gp3_binoc_r_group_key(data.iloc[unresolved], level["group_cols"])
+        global_lookup = {mid: int(i) for i, mid in enumerate(models["model_id"])}
+        for pos, key in zip(unresolved, keys, strict=True):
+            mid = lookup.get(key)
+            if mid in global_lookup:
+                selected[pos] = global_lookup[mid]
+    return selected
+
+
+def _gp3_binoc_r_burden(data, prefix, by):
+    status_col = f"{prefix}_status"
+    rec_col = f"{prefix}_reconstructed"
+    _gp3_binoc_r_check_cols(data, [status_col, rec_col, *by])
+    rows = []
+    for key, idx in _gp3_binoc_r_groups(data, by):
+        st = data.iloc[idx][status_col].astype("string").fillna("<NA>").to_numpy()
+        rec = data.iloc[idx][rec_col].fillna(False).astype(bool).to_numpy()
+        bilateral = st == "bilateral_observed"
+        mono = np.isin(st, ["left_only_observed", "right_only_observed"])
+        blocked = np.asarray(
+            [
+                str(x).startswith("reconstruction_blocked")
+                or str(x).startswith("reconstruction_ineligible")
+                for x in st
+            ]
+        )
+        row = {
+            "group_key": key,
+            "n": len(idx),
+            "n_bilateral_observed": int(bilateral.sum()),
+            "n_reconstructed": int(rec.sum()),
+            "n_monocular_unreconstructed": int((mono & ~rec).sum()),
+            "n_unavailable": int((st == "both_unavailable").sum()),
+            "n_blocked": int(blocked.sum()),
+            "bilateral_observed_fraction": float(bilateral.mean()),
+            "reconstruction_fraction": float(rec.mean()),
+            "monocular_unreconstructed_fraction": float((mono & ~rec).mean()),
+            "unavailable_fraction": float((st == "both_unavailable").mean()),
+        }
+        for col in by:
+            row[col] = data.iloc[idx[0]][col]
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def diagnose_gazepoint_binocular_pupil(
+    data,
+    left_col=None,
+    right_col=None,
+    group_cols=None,
+    *,
+    time_col=None,
+    time_unit="auto",
+    valid_min=None,
+    valid_max=None,
+    min_pairs=30,
+    min_unique=5,
+    disagreement_mad_k=6,
+):
+    """Diagnose binocular pupil data with legacy or R v2.3.0 semantics."""
+    df = ensure_dataframe(data, copy=False)
+    left_col = infer_column(df, "left_pupil", left_col, required=True)
+    right_col = infer_column(df, "right_pupil", right_col, required=True)
+    r_mode = (
+        time_col is not None
+        or time_unit != "auto"
+        or valid_min is not None
+        or valid_max is not None
+        or min_pairs != 30
+        or min_unique != 5
+        or disagreement_mad_k != 6
+    )
+    if not r_mode:
+        groups = normalize_group_cols(df, group_cols)
+        rows = []
+        iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
+        for key, frame in iterator:
+            left_values = finite_numeric(frame[left_col])
+            right_values = finite_numeric(frame[right_col])
+            both = left_values.notna() & right_values.notna()
+            diff = left_values - right_values
+            corr = float(left_values[both].corr(right_values[both])) if both.sum() > 1 else np.nan
+            rmse = float(np.sqrt(np.nanmean(diff[both] ** 2))) if both.any() else np.nan
+            row = {c: v for c, v in zip(groups, key, strict=False)} if groups else {}
+            row.update(
+                n=len(frame),
+                left_missing_prop=float(left_values.isna().mean()),
+                right_missing_prop=float(right_values.isna().mean()),
+                both_valid_prop=float(both.mean()),
+                correlation=corr,
+                rmse=rmse,
+                mae=float(np.nanmean(abs(diff[both]))) if both.any() else np.nan,
+            )
+            rows.append(row)
+        return pd.DataFrame(rows)
+    if time_unit not in {"auto", "milliseconds", "seconds"}:
+        raise ValueError("time_unit must be auto, milliseconds, or seconds")
+    groups = _gp3_binoc_r_cols(group_cols)
+    _gp3_binoc_r_check_cols(df, [left_col, right_col, time_col, *groups])
+    _gp3_binoc_r_bounds(valid_min, valid_max)
+    if min_pairs < 2 or min_unique < 2 or disagreement_mad_k < 0:
+        raise ValueError("invalid binocular diagnostic threshold")
+    left = _gp3_binoc_r_observed(df[left_col], valid_min, valid_max)
+    right = _gp3_binoc_r_observed(df[right_col], valid_min, valid_max)
+    lok = np.isfinite(left)
+    rok = np.isfinite(right)
+    lg = _gp3_binoc_r_gaps(df, ~lok, groups, time_col, time_unit)
+    rg = _gp3_binoc_r_gaps(df, ~rok, groups, time_col, time_unit)
+    gaps = []
+    for eye, g in (("left", lg), ("right", rg)):
+        z = g["gaps"].copy()
+        if len(z):
+            z["eye"] = eye
+            gaps.append(z)
+    rows = []
+    for key, idx in _gp3_binoc_r_groups(df, groups):
+        left_values = left[idx]
+        right_values = right[idx]
+        both = np.isfinite(left_values) & np.isfinite(right_values)
+        lb = left_values[both]
+        rb = right_values[both]
+        diff = lb - rb
+        ad = np.abs(diff)
+        nb = len(lb)
+        thresh = frac = np.nan
+        if nb:
+            thresh = float(np.median(ad) + float(disagreement_mad_k) * _gp3_binoc_r_mad(ad, 1.4826))
+            frac = float(np.mean(ad > thresh))
+        intercept = slope = np.nan
+        if nb >= 2 and np.var(rb, ddof=1) > np.finfo(float).eps:
+            coef, *_ = np.linalg.lstsq(np.column_stack([np.ones(nb), rb]), lb, rcond=None)
+            intercept = float(coef[0])
+            slope = float(coef[1])
+        if time_col is not None:
+            tt = pd.to_numeric(df.iloc[idx][time_col], errors="coerce").to_numpy(float)
+            ft = tt[np.isfinite(tt)]
+            duplicate = int(len(ft) - len(np.unique(ft)))
+            unsorted = bool(np.any(np.diff(ft) < 0)) if len(ft) > 1 else False
+        else:
+            duplicate = np.nan
+            unsorted = np.nan
+        eligible = (
+            nb >= int(min_pairs)
+            and len(np.unique(lb)) >= int(min_unique)
+            and len(np.unique(rb)) >= int(min_unique)
+            and nb > 1
+            and np.var(lb, ddof=1) > np.finfo(float).eps
+            and np.var(rb, ddof=1) > np.finfo(float).eps
+        )
+        row = {
+            "group_key": key,
+            "n": len(idx),
+            "n_left": int(np.isfinite(left_values).sum()),
+            "n_right": int(np.isfinite(right_values).sum()),
+            "n_bilateral": nb,
+            "n_left_only": int((np.isfinite(left_values) & ~np.isfinite(right_values)).sum()),
+            "n_right_only": int((~np.isfinite(left_values) & np.isfinite(right_values)).sum()),
+            "n_both_missing": int((~np.isfinite(left_values) & ~np.isfinite(right_values)).sum()),
+            "prop_bilateral": float(np.mean(np.isfinite(left_values) & np.isfinite(right_values))),
+            "prop_left_only": float(np.mean(np.isfinite(left_values) & ~np.isfinite(right_values))),
+            "prop_right_only": float(
+                np.mean(~np.isfinite(left_values) & np.isfinite(right_values))
+            ),
+            "prop_both_missing": float(
+                np.mean(~np.isfinite(left_values) & ~np.isfinite(right_values))
+            ),
+            "left_mean": float(np.nanmean(left_values))
+            if np.isfinite(left_values).any()
+            else np.nan,
+            "right_mean": float(np.nanmean(right_values))
+            if np.isfinite(right_values).any()
+            else np.nan,
+            "left_sd": float(np.nanstd(left_values, ddof=1))
+            if np.isfinite(left_values).sum() > 1
+            else np.nan,
+            "right_sd": float(np.nanstd(right_values, ddof=1))
+            if np.isfinite(right_values).sum() > 1
+            else np.nan,
+            "left_median": float(np.nanmedian(left_values))
+            if np.isfinite(left_values).any()
+            else np.nan,
+            "right_median": float(np.nanmedian(right_values))
+            if np.isfinite(right_values).any()
+            else np.nan,
+            "left_mad": _gp3_binoc_r_mad(left_values),
+            "right_mad": _gp3_binoc_r_mad(right_values),
+            "mean_difference": float(np.mean(diff)) if nb else np.nan,
+            "median_difference": float(np.median(diff)) if nb else np.nan,
+            "correlation": float(np.corrcoef(lb, rb)[0, 1])
+            if nb > 2 and np.std(lb, ddof=1) > 0 and np.std(rb, ddof=1) > 0
+            else np.nan,
+            "rank_correlation": float(stats.spearmanr(lb, rb).statistic) if nb > 2 else np.nan,
+            "rmse_between_eyes": float(np.sqrt(np.mean(diff**2))) if nb else np.nan,
+            "mae_between_eyes": float(np.mean(ad)) if nb else np.nan,
+            "disagreement_threshold": thresh,
+            "disagreement_fraction": frac,
+            "agreement_lower": float(np.mean(diff) - 1.96 * np.std(diff, ddof=1))
+            if nb > 1
+            else np.nan,
+            "agreement_upper": float(np.mean(diff) + 1.96 * np.std(diff, ddof=1))
+            if nb > 1
+            else np.nan,
+            "left_from_right_intercept": intercept,
+            "left_from_right_slope": slope,
+            "longest_left_gap_ms": float(np.nanmax(lg["gap_ms"][idx]))
+            if np.isfinite(lg["gap_ms"][idx]).any()
+            else np.nan,
+            "longest_right_gap_ms": float(np.nanmax(rg["gap_ms"][idx]))
+            if np.isfinite(rg["gap_ms"][idx]).any()
+            else np.nan,
+            "duplicate_time_count": duplicate,
+            "time_unsorted": unsorted,
+            "calibration_eligible": bool(eligible),
+            "status": "eligible" if eligible else "review",
+        }
+        for col in groups:
+            row[col] = df.iloc[idx[0]][col]
+        rows.append(row)
+    return {
+        "summary": pd.DataFrame(rows),
+        "gaps": pd.concat(gaps, ignore_index=True, sort=False) if gaps else pd.DataFrame(),
+        "settings": {
+            "left_col": left_col,
+            "right_col": right_col,
+            "time_col": time_col,
+            "group_cols": groups,
+            "time_unit": time_unit,
+            "valid_min": valid_min,
+            "valid_max": valid_max,
+            "min_pairs": int(min_pairs),
+            "min_unique": int(min_unique),
+            "disagreement_mad_k": disagreement_mad_k,
+        },
+        "_gp3_class": "gp3_binocular_diagnostics",
+    }
 
 
 def reconstruct_gazepoint_binocular_pupil(
@@ -5067,42 +5654,273 @@ def reconstruct_gazepoint_binocular_pupil(
     output_left="left_pupil_reconstructed",
     output_right="right_pupil_reconstructed",
     combined_col="pupil_combined",
-) -> pd.DataFrame:
+    *,
+    time_col=None,
+    group_cols=None,
+    gap_group_cols=None,
+    calibration=None,
+    fallback_group_cols=None,
+    min_pairs=30,
+    min_unique=5,
+    min_r2=None,
+    time_unit="auto",
+    max_gap_ms=np.inf,
+    allow_edge_gaps=True,
+    allow_extrapolation=False,
+    valid_min=None,
+    valid_max=None,
+    exclude_flag_cols=None,
+    prefix="gp3_binocular",
+    overwrite=False,
+):
+    """Reconstruct binocular pupil channels with legacy or audited semantics."""
     df = ensure_dataframe(data)
     left_col = infer_column(df, "left_pupil", left_col, required=True)
     right_col = infer_column(df, "right_pupil", right_col, required=True)
-    left_values = finite_numeric(df[left_col])
-    right_values = finite_numeric(df[right_col])
-    left_reconstructed = left_values.copy()
-    right_reconstructed = right_values.copy()
-    src = pd.Series("observed", index=df.index, dtype="string")
-    if method in {"linear_regression", "regression"}:
-        models = fit_gazepoint_binocular_calibration(df, left_col, right_col)
-        a = models["right_from_left"]
-        b = models["left_from_right"]
-        miss_r = right_values.isna() & left_values.notna()
-        miss_l = left_values.isna() & right_values.notna()
-        right_reconstructed.loc[miss_r] = a["intercept"] + a["slope"] * left_values.loc[miss_r]
-        left_reconstructed.loc[miss_l] = b["intercept"] + b["slope"] * right_values.loc[miss_l]
-        src.loc[miss_r] = "right_reconstructed"
-        src.loc[miss_l] = "left_reconstructed"
-    elif method == "available_eye":
-        miss_r = right_values.isna() & left_values.notna()
-        miss_l = left_values.isna() & right_values.notna()
-        right_reconstructed.loc[miss_r] = left_values.loc[miss_r]
-        left_reconstructed.loc[miss_l] = right_values.loc[miss_l]
-        src.loc[miss_r] = "right_from_left"
-        src.loc[miss_l] = "left_from_right"
-    elif method == "none":
-        pass
-    else:
-        raise ValueError(f"Unknown reconstruction method {method!r}")
-    df[output_left] = left_reconstructed
-    df[output_right] = right_reconstructed
-    df[combined_col] = pd.concat([left_reconstructed, right_reconstructed], axis=1).mean(
-        axis=1, skipna=True
+    r_mode = (
+        any(
+            v is not None
+            for v in (
+                time_col,
+                group_cols,
+                gap_group_cols,
+                calibration,
+                fallback_group_cols,
+                valid_min,
+                valid_max,
+                exclude_flag_cols,
+            )
+        )
+        or min_pairs != 30
+        or min_unique != 5
+        or min_r2 is not None
+        or time_unit != "auto"
+        or not np.isinf(max_gap_ms)
+        or allow_edge_gaps is not True
+        or allow_extrapolation is not False
+        or prefix != "gp3_binocular"
+        or overwrite is not False
     )
-    df["pupil_reconstruction_source"] = src
+    if not r_mode:
+        left_values = finite_numeric(df[left_col])
+        right_values = finite_numeric(df[right_col])
+        left_reconstructed = left_values.copy()
+        right_reconstructed = right_values.copy()
+        src = pd.Series("observed", index=df.index, dtype="string")
+        if method in {"linear_regression", "regression"}:
+            models = fit_gazepoint_binocular_calibration(df, left_col, right_col)
+            a = models["right_from_left"]
+            b = models["left_from_right"]
+            miss_r = right_values.isna() & left_values.notna()
+            miss_l = left_values.isna() & right_values.notna()
+            right_reconstructed.loc[miss_r] = a["intercept"] + a["slope"] * left_values.loc[miss_r]
+            left_reconstructed.loc[miss_l] = b["intercept"] + b["slope"] * right_values.loc[miss_l]
+            src.loc[miss_r] = "right_reconstructed"
+            src.loc[miss_l] = "left_reconstructed"
+        elif method == "available_eye":
+            miss_r = right_values.isna() & left_values.notna()
+            miss_l = left_values.isna() & right_values.notna()
+            right_reconstructed.loc[miss_r] = left_values.loc[miss_r]
+            left_reconstructed.loc[miss_l] = right_values.loc[miss_l]
+            src.loc[miss_r] = "right_from_left"
+            src.loc[miss_l] = "left_from_right"
+        elif method != "none":
+            raise ValueError(f"Unknown reconstruction method {method!r}")
+        df[output_left] = left_reconstructed
+        df[output_right] = right_reconstructed
+        df[combined_col] = pd.concat([left_reconstructed, right_reconstructed], axis=1).mean(
+            axis=1, skipna=True
+        )
+        df["pupil_reconstruction_source"] = src
+        return df
+    if method not in {"linear_regression", "available_eye", "none"}:
+        raise ValueError("Unknown reconstruction method")
+    if time_unit not in {"auto", "milliseconds", "seconds"}:
+        raise ValueError("invalid time_unit")
+    if max_gap_ms < 0 or np.isnan(max_gap_ms):
+        raise ValueError("max_gap_ms must be non-negative")
+    if np.isfinite(max_gap_ms) and time_col is None:
+        raise ValueError("time_col is required when max_gap_ms is finite")
+    groups = _gp3_binoc_r_cols(
+        group_cols
+        if group_cols is not None
+        else (
+            calibration.get("settings", {}).get("group_cols")
+            if isinstance(calibration, dict)
+            and calibration.get("_gp3_class") == "gp3_binocular_calibration"
+            else None
+        )
+    )
+    gap_groups = _gp3_binoc_r_cols(groups if gap_group_cols is None else gap_group_cols)
+    exclude_cols = _gp3_binoc_r_cols(exclude_flag_cols)
+    _gp3_binoc_r_check_cols(
+        df, [left_col, right_col, time_col, *groups, *gap_groups, *exclude_cols]
+    )
+    _gp3_binoc_r_bounds(valid_min, valid_max)
+    out_names = [
+        f"{prefix}{s}"
+        for s in (
+            "_left_observed",
+            "_right_observed",
+            "_left_final",
+            "_right_final",
+            "_left_reconstructed",
+            "_right_reconstructed",
+            "_reconstructed",
+            "_direction",
+            "_model_id",
+            "_calibration_level",
+            "_r_squared",
+            "_extrapolated",
+            "_gap_ms",
+            "_status",
+        )
+    ]
+    conflicts = [c for c in out_names if c in df.columns]
+    if conflicts and not overwrite:
+        raise ValueError("Output columns already exist: " + ", ".join(conflicts))
+    left = _gp3_binoc_r_observed(df[left_col], valid_min, valid_max)
+    right = _gp3_binoc_r_observed(df[right_col], valid_min, valid_max)
+    lok = np.isfinite(left)
+    rok = np.isfinite(right)
+    excluded = np.zeros(len(df), dtype=bool)
+    for col in exclude_cols:
+        s = df[col]
+        if not (pd.api.types.is_bool_dtype(s) or pd.api.types.is_numeric_dtype(s)):
+            raise TypeError(f"Exclusion flag {col!r} must be logical or numeric")
+        excluded |= s.fillna(False).astype(bool).to_numpy()
+    lg = _gp3_binoc_r_gaps(df, ~lok, gap_groups, time_col, time_unit)
+    rg = _gp3_binoc_r_gaps(df, ~rok, gap_groups, time_col, time_unit)
+    lf = left.copy()
+    rf = right.copy()
+    lr = np.zeros(len(df), bool)
+    rr = np.zeros(len(df), bool)
+    direction = np.full(len(df), None, object)
+    model_id = np.full(len(df), None, object)
+    level = np.full(len(df), None, object)
+    r2 = np.full(len(df), np.nan)
+    extra = np.zeros(len(df), bool)
+    used_gap = np.full(len(df), np.nan)
+    status = np.full(len(df), "both_unavailable", object)
+    status[lok & rok] = "bilateral_observed"
+    status[lok & ~rok] = "left_only_observed"
+    status[~lok & rok] = "right_only_observed"
+    if method == "linear_regression":
+        if calibration is None:
+            calibration = _gp3_binoc_r_calibration(
+                df,
+                left_col,
+                right_col,
+                groups,
+                fallback_group_cols,
+                valid_min,
+                valid_max,
+                min_pairs,
+                min_unique,
+                min_r2,
+                False,
+                None,
+            )
+        if (
+            not isinstance(calibration, dict)
+            or calibration.get("_gp3_class") != "gp3_binocular_calibration"
+        ):
+            raise TypeError("calibration must be created by fit_gazepoint_binocular_calibration")
+        if (
+            calibration["settings"]["left_col"] != left_col
+            or calibration["settings"]["right_col"] != right_col
+        ):
+            raise ValueError("calibration was fitted to different pupil columns")
+        models = calibration["models"]
+        li = _gp3_binoc_r_assign_models(df, calibration, "left_from_right")
+        ri = _gp3_binoc_r_assign_models(df, calibration, "right_from_left")
+        for target, candidate, predictor, selected, gap in (
+            ("left", ~lok & rok, right, li, lg),
+            ("right", lok & ~rok, left, ri, rg),
+        ):
+            for i in np.flatnonzero(candidate):
+                used_gap[i] = gap["gap_ms"][i]
+                direction[i] = f"{target}_from_{'right' if target == 'left' else 'left'}"
+                if excluded[i]:
+                    status[i] = "reconstruction_blocked_exclusion"
+                    continue
+                if np.isfinite(max_gap_ms) and (
+                    not np.isfinite(gap["gap_ms"][i]) or gap["gap_ms"][i] > max_gap_ms
+                ):
+                    status[i] = "reconstruction_blocked_gap"
+                    continue
+                if not allow_edge_gaps and gap["edge_gap"][i]:
+                    status[i] = "reconstruction_blocked_edge"
+                    continue
+                mi = int(selected[i])
+                if mi < 0 or mi >= len(models):
+                    status[i] = "reconstruction_ineligible"
+                    continue
+                m = models.iloc[mi]
+                x = float(predictor[i])
+                is_extra = np.isfinite(x) and (
+                    x < float(m["predictor_min"]) or x > float(m["predictor_max"])
+                )
+                extra[i] = is_extra
+                model_id[i] = m["model_id"]
+                level[i] = m["calibration_level"]
+                r2[i] = m["r_squared"]
+                if is_extra and not allow_extrapolation:
+                    status[i] = "reconstruction_blocked_extrapolation"
+                    continue
+                pred = float(m["intercept"] + m["slope"] * x)
+                if (
+                    not np.isfinite(pred)
+                    or (valid_min is not None and pred < valid_min)
+                    or (valid_max is not None and pred > valid_max)
+                ):
+                    status[i] = "reconstruction_blocked_bounds"
+                    continue
+                if target == "left":
+                    lf[i] = pred
+                    lr[i] = True
+                    status[i] = "left_reconstructed"
+                else:
+                    rf[i] = pred
+                    rr[i] = True
+                    status[i] = "right_reconstructed"
+    else:
+        calibration = None
+    values = [
+        left,
+        right,
+        lf,
+        rf,
+        lr,
+        rr,
+        lr | rr,
+        direction,
+        model_id,
+        level,
+        r2,
+        extra,
+        used_gap,
+        status,
+    ]
+    for col, val in zip(out_names, values, strict=True):
+        df[col] = val
+    df.attrs["gp3_binocular_reconstruction"] = {
+        "method": method,
+        "left_col": left_col,
+        "right_col": right_col,
+        "time_col": time_col,
+        "group_cols": groups,
+        "gap_group_cols": gap_groups,
+        "time_unit": time_unit,
+        "max_gap_ms": max_gap_ms,
+        "allow_edge_gaps": bool(allow_edge_gaps),
+        "allow_extrapolation": bool(allow_extrapolation),
+        "valid_min": valid_min,
+        "valid_max": valid_max,
+        "exclude_flag_cols": exclude_cols,
+        "prefix": prefix,
+        "calibration": calibration,
+    }
     return df
 
 
@@ -5112,81 +5930,467 @@ def audit_gazepoint_binocular_reconstruction(
     observed_right=None,
     reconstructed_left="left_pupil_reconstructed",
     reconstructed_right="right_pupil_reconstructed",
-) -> pd.DataFrame:
+    *,
+    by=None,
+    prefix="gp3_binocular",
+    max_reconstruction_prop=None,
+    max_group_rate_difference=None,
+):
+    """Audit reconstruction burden with legacy or R v2.3.0 semantics."""
     df = ensure_dataframe(data, copy=False)
-    observed_left = infer_column(df, "left_pupil", observed_left, required=True)
-    observed_right = infer_column(df, "right_pupil", observed_right, required=True)
-    rows = []
-    for eye, obs, recon in (
-        ("left", observed_left, reconstructed_left),
-        ("right", observed_right, reconstructed_right),
+    r_mode = (
+        "gp3_binocular_reconstruction" in df.attrs
+        or by is not None
+        or prefix != "gp3_binocular"
+        or max_reconstruction_prop is not None
+        or max_group_rate_difference is not None
+    )
+    if not r_mode:
+        observed_left = infer_column(df, "left_pupil", observed_left, required=True)
+        observed_right = infer_column(df, "right_pupil", observed_right, required=True)
+        rows = []
+        for eye, obs, recon in (
+            ("left", observed_left, reconstructed_left),
+            ("right", observed_right, reconstructed_right),
+        ):
+            if recon not in df:
+                continue
+            o = finite_numeric(df[obs])
+            r = finite_numeric(df[recon])
+            replaced = o.isna() & r.notna()
+            rows.append(
+                {
+                    "eye": eye,
+                    "n": len(df),
+                    "n_reconstructed": int(replaced.sum()),
+                    "reconstructed_prop": float(replaced.mean()),
+                }
+            )
+        return pd.DataFrame(rows)
+    meta = df.attrs.get("gp3_binocular_reconstruction")
+    if not isinstance(meta, dict):
+        raise ValueError("data does not contain binocular reconstruction metadata")
+    by_cols = _gp3_binoc_r_cols(by)
+    _gp3_binoc_r_check_cols(df, by_cols)
+    for x, label in (
+        (max_reconstruction_prop, "max_reconstruction_prop"),
+        (max_group_rate_difference, "max_group_rate_difference"),
     ):
-        if recon not in df:
-            continue
-        o = finite_numeric(df[obs])
-        r = finite_numeric(df[recon])
-        replaced = o.isna() & r.notna()
-        rows.append(
-            {
-                "eye": eye,
-                "n": len(df),
-                "n_reconstructed": int(replaced.sum()),
-                "reconstructed_prop": float(replaced.mean()),
-            }
+        if x is not None and not (0 <= x <= 1):
+            raise ValueError(f"{label} must be between 0 and 1")
+    required = [
+        f"{prefix}_{x}"
+        for x in (
+            "status",
+            "reconstructed",
+            "left_observed",
+            "right_observed",
+            "left_final",
+            "right_final",
         )
-    return pd.DataFrame(rows)
+    ]
+    _gp3_binoc_r_check_cols(df, required)
+    overall = _gp3_binoc_r_burden(df, prefix, [])
+    grouped = _gp3_binoc_r_burden(df, prefix, by_cols) if by_cols else pd.DataFrame()
+    st = df[f"{prefix}_status"].astype("string").fillna("<NA>")
+    counts = st.value_counts(dropna=False).rename_axis("status").reset_index(name="n")
+    counts["proportion"] = counts["n"] / len(df)
+    lo = pd.to_numeric(df[f"{prefix}_left_observed"], errors="coerce").to_numpy(float)
+    ro = pd.to_numeric(df[f"{prefix}_right_observed"], errors="coerce").to_numpy(float)
+    lf = pd.to_numeric(df[f"{prefix}_left_final"], errors="coerce").to_numpy(float)
+    rf = pd.to_numeric(df[f"{prefix}_right_final"], errors="coerce").to_numpy(float)
+
+    def rowmean(a, b):
+        out = np.full(len(a), np.nan)
+        both = np.isfinite(a) & np.isfinite(b)
+        onlya = np.isfinite(a) & ~np.isfinite(b)
+        onlyb = ~np.isfinite(a) & np.isfinite(b)
+        out[both] = (a[both] + b[both]) / 2
+        out[onlya] = a[onlya]
+        out[onlyb] = b[onlyb]
+        return out
+
+    obs = rowmean(lo, ro)
+    fin = rowmean(lf, rf)
+    rec = df[f"{prefix}_reconstructed"].fillna(False).astype(bool).to_numpy()
+    shift = (fin - obs)[rec]
+    shift = shift[np.isfinite(shift)]
+    shift_df = pd.DataFrame(
+        [
+            {
+                "n_reconstructed_rows_with_shift": len(shift),
+                "mean_reconstruction_shift": float(np.mean(shift)) if len(shift) else np.nan,
+                "median_reconstruction_shift": float(np.median(shift)) if len(shift) else np.nan,
+                "mean_absolute_reconstruction_shift": float(np.mean(np.abs(shift)))
+                if len(shift)
+                else np.nan,
+                "max_absolute_reconstruction_shift": float(np.max(np.abs(shift)))
+                if len(shift)
+                else np.nan,
+            }
+        ]
+    )
+    rate = float(overall.iloc[0]["reconstruction_fraction"])
+    diff = (
+        float(grouped["reconstruction_fraction"].max() - grouped["reconstruction_fraction"].min())
+        if len(grouped) > 1
+        else np.nan
+    )
+    burden = bool(
+        max_reconstruction_prop is not None and np.isfinite(rate) and rate > max_reconstruction_prop
+    )
+    imbalance = bool(
+        max_group_rate_difference is not None
+        and np.isfinite(diff)
+        and diff > max_group_rate_difference
+    )
+    declared = max_reconstruction_prop is not None or max_group_rate_difference is not None
+    audit_status = "descriptive" if not declared else "review" if burden or imbalance else "ok"
+    calibration = meta.get("calibration")
+    models = (
+        calibration.get("models", pd.DataFrame())
+        if isinstance(calibration, dict)
+        else pd.DataFrame()
+    )
+    return {
+        "overall": overall,
+        "by_group": grouped,
+        "status_counts": counts,
+        "reconstruction_shift": shift_df,
+        "models": models,
+        "imbalance": pd.DataFrame(
+            [
+                {
+                    "max_group_rate_difference": diff,
+                    "threshold": np.nan
+                    if max_group_rate_difference is None
+                    else max_group_rate_difference,
+                    "flagged": imbalance,
+                }
+            ]
+        ),
+        "audit": pd.DataFrame(
+            [
+                {
+                    "status": audit_status,
+                    "reconstruction_fraction": rate,
+                    "reconstruction_threshold": np.nan
+                    if max_reconstruction_prop is None
+                    else max_reconstruction_prop,
+                    "burden_flag": burden,
+                    "imbalance_flag": imbalance,
+                }
+            ]
+        ),
+        "settings": {"by": by_cols, "prefix": prefix},
+        "_gp3_class": "gp3_binocular_audit",
+    }
 
 
 def validate_gazepoint_binocular_reconstruction(
     data,
     left_col=None,
     right_col=None,
-    fraction: float = 0.1,
-    random_state: int = 123,
+    fraction=0.1,
+    random_state=123,
     method="linear_regression",
-) -> pd.DataFrame:
+    *,
+    time_col=None,
+    group_cols=None,
+    gap_group_cols=None,
+    fallback_group_cols=None,
+    direction="both",
+    mask_prop=0.20,
+    mask_mode="random",
+    block_size=6,
+    repeats=5,
+    seed=1,
+    min_pairs=30,
+    min_unique=5,
+    min_r2=None,
+    time_unit="auto",
+    max_gap_ms=np.inf,
+    allow_edge_gaps=True,
+    allow_extrapolation=False,
+    valid_min=None,
+    valid_max=None,
+):
+    """Validate reconstruction with legacy holdout or R-style artificial loss."""
     df = ensure_dataframe(data)
     left_col = infer_column(df, "left_pupil", left_col, required=True)
     right_col = infer_column(df, "right_pupil", right_col, required=True)
-    rng = np.random.default_rng(random_state)
-    rows = []
-    for direction, target, other in (("left", left_col, right_col), ("right", right_col, left_col)):
-        valid = df[target].notna() & df[other].notna()
-        ids = np.flatnonzero(valid.to_numpy())
-        n = max(1, int(round(len(ids) * fraction))) if len(ids) else 0
-        hold = (
-            rng.choice(ids, size=min(n, len(ids)), replace=False) if n else np.array([], dtype=int)
-        )
-        tmp = df.copy()
-        truth = finite_numeric(tmp[target]).iloc[hold].to_numpy(float)
-        tmp.iloc[hold, tmp.columns.get_loc(target)] = np.nan
-        rec = reconstruct_gazepoint_binocular_pupil(tmp, left_col, right_col, method=method)
-        pred = (
-            finite_numeric(
-                rec[
-                    "left_pupil_reconstructed"
-                    if direction == "left"
-                    else "right_pupil_reconstructed"
-                ]
+    r_mode = (
+        any(
+            v is not None
+            for v in (
+                time_col,
+                group_cols,
+                gap_group_cols,
+                fallback_group_cols,
+                valid_min,
+                valid_max,
             )
-            .iloc[hold]
-            .to_numpy(float)
         )
-        ok = np.isfinite(truth) & np.isfinite(pred)
-        err = pred[ok] - truth[ok]
-        rows.append(
-            {
-                "direction": direction,
-                "n_holdout": int(ok.sum()),
-                "rmse": float(np.sqrt(np.mean(err**2))) if ok.any() else np.nan,
-                "mae": float(np.mean(abs(err))) if ok.any() else np.nan,
-                "bias": float(np.mean(err)) if ok.any() else np.nan,
-                "correlation": float(np.corrcoef(truth[ok], pred[ok])[0, 1])
-                if ok.sum() > 1
-                else np.nan,
-            }
+        or direction != "both"
+        or mask_prop != 0.20
+        or mask_mode != "random"
+        or block_size != 6
+        or repeats != 5
+        or seed != 1
+        or min_pairs != 30
+        or min_unique != 5
+        or min_r2 is not None
+        or time_unit != "auto"
+        or not np.isinf(max_gap_ms)
+        or allow_edge_gaps is not True
+        or allow_extrapolation is not False
+    )
+    if not r_mode:
+        rng = np.random.default_rng(random_state)
+        rows = []
+        for d, target, other in (("left", left_col, right_col), ("right", right_col, left_col)):
+            valid = df[target].notna() & df[other].notna()
+            ids = np.flatnonzero(valid.to_numpy())
+            n = max(1, int(round(len(ids) * fraction))) if len(ids) else 0
+            hold = (
+                rng.choice(ids, size=min(n, len(ids)), replace=False)
+                if n
+                else np.array([], dtype=int)
+            )
+            tmp = df.copy()
+            truth = finite_numeric(tmp[target]).iloc[hold].to_numpy(float)
+            tmp.iloc[hold, tmp.columns.get_loc(target)] = np.nan
+            rec = reconstruct_gazepoint_binocular_pupil(tmp, left_col, right_col, method=method)
+            pred = (
+                finite_numeric(
+                    rec["left_pupil_reconstructed" if d == "left" else "right_pupil_reconstructed"]
+                )
+                .iloc[hold]
+                .to_numpy(float)
+            )
+            ok = np.isfinite(truth) & np.isfinite(pred)
+            err = pred[ok] - truth[ok]
+            rows.append(
+                {
+                    "direction": d,
+                    "n_holdout": int(ok.sum()),
+                    "rmse": float(np.sqrt(np.mean(err**2))) if ok.any() else np.nan,
+                    "mae": float(np.mean(abs(err))) if ok.any() else np.nan,
+                    "bias": float(np.mean(err)) if ok.any() else np.nan,
+                    "correlation": float(np.corrcoef(truth[ok], pred[ok])[0, 1])
+                    if ok.sum() > 1
+                    else np.nan,
+                }
+            )
+        return pd.DataFrame(rows)
+    if direction not in {"both", "left_from_right", "right_from_left"} or mask_mode not in {
+        "random",
+        "contiguous",
+    }:
+        raise ValueError("invalid validation mode")
+    if not (0 < mask_prop < 1) or block_size < 1 or repeats < 1:
+        raise ValueError("invalid validation settings")
+    groups = _gp3_binoc_r_cols(group_cols)
+    gap_groups = _gp3_binoc_r_cols(groups if gap_group_cols is None else gap_group_cols)
+    _gp3_binoc_r_check_cols(df, [left_col, right_col, time_col, *groups, *gap_groups])
+    _gp3_binoc_r_bounds(valid_min, valid_max)
+    lref = _gp3_binoc_r_observed(df[left_col], valid_min, valid_max)
+    rref = _gp3_binoc_r_observed(df[right_col], valid_min, valid_max)
+    bilateral = np.isfinite(lref) & np.isfinite(rref)
+    if bilateral.sum() < 2:
+        raise ValueError("At least two bilateral observations are required")
+    rng = np.random.default_rng(int(seed))
+    metric_rows = []
+    pred_rows = []
+    for rep in range(1, int(repeats) + 1):
+        selected = []
+        for _, idx0 in _gp3_binoc_r_groups(df, gap_groups):
+            idx = idx0[bilateral[idx0]]
+            if not len(idx):
+                continue
+            if time_col is not None:
+                tt = pd.to_numeric(df.iloc[idx][time_col], errors="coerce").to_numpy(float)
+                idx = idx[np.argsort(np.where(np.isfinite(tt), tt, np.inf), kind="stable")]
+            target = max(1, min(len(idx), int(round(len(idx) * mask_prop))))
+            if mask_mode == "random":
+                chosen = rng.choice(idx, size=target, replace=False)
+            else:
+                chosen = []
+                while len(chosen) < target:
+                    start = int(rng.integers(0, len(idx)))
+                    chosen.extend(
+                        [
+                            int(x)
+                            for x in idx[start : min(len(idx), start + int(block_size))]
+                            if int(x) not in chosen
+                        ]
+                    )
+                    if len(set(chosen)) == len(idx):
+                        break
+                chosen = np.asarray(chosen[:target], dtype=int)
+            selected.extend(np.asarray(chosen, dtype=int).tolist())
+        mask_idx = np.asarray(sorted(set(selected)), dtype=int)
+        if not len(mask_idx):
+            continue
+        if direction == "both":
+            if mask_mode == "contiguous":
+                eyes = np.asarray(
+                    ["left" if i % 2 == 0 else "right" for i in range(len(mask_idx))], dtype=object
+                )
+            else:
+                eyes = rng.choice(
+                    np.asarray(["left", "right"], dtype=object), size=len(mask_idx), replace=True
+                )
+            if len(mask_idx) >= 2 and len(set(eyes.tolist())) == 1:
+                eyes[0] = "right" if eyes[0] == "left" else "left"
+        else:
+            eyes = np.full(
+                len(mask_idx), "left" if direction == "left_from_right" else "right", dtype=object
+            )
+        masked = df.copy()
+        lmask = mask_idx[eyes == "left"]
+        rmask = mask_idx[eyes == "right"]
+        if len(lmask):
+            masked.iloc[lmask, masked.columns.get_loc(left_col)] = np.nan
+        if len(rmask):
+            masked.iloc[rmask, masked.columns.get_loc(right_col)] = np.nan
+        cal = _gp3_binoc_r_calibration(
+            masked,
+            left_col,
+            right_col,
+            groups,
+            fallback_group_cols,
+            valid_min,
+            valid_max,
+            min_pairs,
+            min_unique,
+            min_r2,
+            False,
+            None,
         )
-    return pd.DataFrame(rows)
+        rec = reconstruct_gazepoint_binocular_pupil(
+            masked,
+            left_col,
+            right_col,
+            method="linear_regression",
+            time_col=time_col,
+            group_cols=groups,
+            gap_group_cols=gap_groups,
+            calibration=cal,
+            time_unit=time_unit,
+            max_gap_ms=max_gap_ms,
+            allow_edge_gaps=allow_edge_gaps,
+            allow_extrapolation=allow_extrapolation,
+            valid_min=valid_min,
+            valid_max=valid_max,
+        )
+        for eye in ("left", "right"):
+            idx = mask_idx[eyes == eye]
+            if not len(idx):
+                continue
+            d = "left_from_right" if eye == "left" else "right_from_left"
+            obs = lref[idx] if eye == "left" else rref[idx]
+            pred = pd.to_numeric(
+                rec.iloc[idx][f"gp3_binocular_{eye}_final"], errors="coerce"
+            ).to_numpy(float)
+            ok = np.isfinite(obs) & np.isfinite(pred)
+            err = pred[ok] - obs[ok]
+            metric_rows.append(
+                {
+                    "repeat_id": rep,
+                    "direction": d,
+                    "n_requested": len(idx),
+                    "n_predicted": int(ok.sum()),
+                    "prediction_rate": float(ok.sum() / len(idx)),
+                    "rmse": float(np.sqrt(np.mean(err**2))) if ok.any() else np.nan,
+                    "mae": float(np.mean(np.abs(err))) if ok.any() else np.nan,
+                    "bias": float(np.mean(err)) if ok.any() else np.nan,
+                    "median_error": float(np.median(err)) if ok.any() else np.nan,
+                    "error_mad": _gp3_binoc_r_mad(err),
+                    "correlation": float(np.corrcoef(obs[ok], pred[ok])[0, 1])
+                    if ok.sum() > 2 and np.std(obs[ok], ddof=1) > 0 and np.std(pred[ok], ddof=1) > 0
+                    else np.nan,
+                }
+            )
+            for pos, o, p in zip(idx, obs, pred, strict=True):
+                row = {
+                    "repeat_id": rep,
+                    "row_id": int(pos + 1),
+                    "direction": d,
+                    "observed": o,
+                    "predicted": p,
+                    "error": p - o,
+                    "status": rec.iloc[pos]["gp3_binocular_status"],
+                    "model_id": rec.iloc[pos]["gp3_binocular_model_id"],
+                    "calibration_level": rec.iloc[pos]["gp3_binocular_calibration_level"],
+                    "r_squared": rec.iloc[pos]["gp3_binocular_r_squared"],
+                    "extrapolated": rec.iloc[pos]["gp3_binocular_extrapolated"],
+                    "gap_ms": rec.iloc[pos]["gp3_binocular_gap_ms"],
+                }
+                for col in groups:
+                    row[col] = df.iloc[pos][col]
+                if time_col is not None:
+                    row[time_col] = df.iloc[pos][time_col]
+                pred_rows.append(row)
+    metrics = pd.DataFrame(metric_rows)
+    predictions = pd.DataFrame(pred_rows)
+    summary = []
+    if len(metrics):
+        for d in metrics["direction"].drop_duplicates():
+            m = metrics[metrics["direction"] == d]
+            p = predictions[predictions["direction"] == d]
+            ok = np.isfinite(pd.to_numeric(p["observed"], errors="coerce")) & np.isfinite(
+                pd.to_numeric(p["predicted"], errors="coerce")
+            )
+            obs = pd.to_numeric(p.loc[ok, "observed"]).to_numpy(float)
+            pred = pd.to_numeric(p.loc[ok, "predicted"]).to_numpy(float)
+            err = pred - obs
+            requested = int(m["n_requested"].sum())
+            n = len(err)
+            summary.append(
+                {
+                    "direction": d,
+                    "repeats": len(m),
+                    "total_requested": requested,
+                    "total_predicted": n,
+                    "prediction_rate": n / requested if requested else np.nan,
+                    "rmse": float(np.sqrt(np.mean(err**2))) if n else np.nan,
+                    "mae": float(np.mean(np.abs(err))) if n else np.nan,
+                    "bias": float(np.mean(err)) if n else np.nan,
+                    "median_error": float(np.median(err)) if n else np.nan,
+                    "error_mad": _gp3_binoc_r_mad(err),
+                    "correlation": float(np.corrcoef(obs, pred)[0, 1])
+                    if n > 2 and np.std(obs, ddof=1) > 0 and np.std(pred, ddof=1) > 0
+                    else np.nan,
+                }
+            )
+    return {
+        "summary": pd.DataFrame(summary),
+        "metrics": metrics,
+        "predictions": predictions,
+        "settings": {
+            "left_col": left_col,
+            "right_col": right_col,
+            "time_col": time_col,
+            "group_cols": groups,
+            "gap_group_cols": gap_groups,
+            "direction": direction,
+            "mask_prop": mask_prop,
+            "mask_mode": mask_mode,
+            "block_size": int(block_size),
+            "repeats": int(repeats),
+            "seed": int(seed),
+            "min_pairs": int(min_pairs),
+            "min_unique": int(min_unique),
+            "min_r2": min_r2,
+            "max_gap_ms": max_gap_ms,
+            "allow_edge_gaps": bool(allow_edge_gaps),
+            "allow_extrapolation": bool(allow_extrapolation),
+            "valid_min": valid_min,
+            "valid_max": valid_max,
+        },
+        "_gp3_class": "gp3_binocular_validation",
+    }
 
 
 def stress_test_gazepoint_binocular_reconstruction(
