@@ -80,22 +80,582 @@ def save_gazepoint_plots(plots, output_dir, prefix="plot", dpi=150, **kwargs):
     return out
 
 
-def create_gazepoint_reporting_checklist(data=None) -> pd.DataFrame:
-    items = [
-        "hardware and sampling rate",
-        "calibration procedure",
-        "tracking-quality criteria",
-        "missing-data handling",
-        "pupil preprocessing",
-        "AOI definitions",
-        "event detector",
-        "exclusion criteria",
-        "statistical model",
-        "software/version",
-        "sensitivity analyses",
-        "open materials/data",
-    ]
-    return pd.DataFrame({"item": items, "reported": [False] * len(items)})
+_GP3_REPORTING_R_UNSET = object()
+
+
+def _gp3_reporting_r_object_summary(objects):
+    if objects is None:
+        return pd.DataFrame(
+            columns=["object_label", "class", "object_name", "status", "message", "n_rows_overview"]
+        )
+    if isinstance(objects, pd.DataFrame):
+        objects = {"object_1": objects}
+    elif isinstance(objects, (list, tuple)):
+        objects = {f"object_{i + 1}": obj for i, obj in enumerate(objects)}
+    elif not isinstance(objects, dict):
+        raise TypeError("objects must be None, a data frame, list, tuple, or dict")
+    rows = []
+    for label, obj in objects.items():
+        overview = (
+            obj.get("overview")
+            if isinstance(obj, dict)
+            else (obj if isinstance(obj, pd.DataFrame) else None)
+        )
+        object_name = str(label)
+        status = "info"
+        message = ""
+        if isinstance(overview, pd.DataFrame) and len(overview):
+            row = overview.iloc[0]
+            if "object_name" in overview.columns and pd.notna(row["object_name"]):
+                object_name = str(row["object_name"])
+            status_candidates = [
+                c
+                for c in overview.columns
+                if any(k in c.lower() for k in ("status", "decision", "ready", "complete", "valid"))
+            ]
+            if status_candidates:
+                text = str(row[status_candidates[0]]).lower()
+                if any(k in text for k in ("fail", "false", "not ready")):
+                    status = "fail"
+                elif any(k in text for k in ("warn", "review")):
+                    status = "warn"
+                elif any(k in text for k in ("pass", "true", "ready", "ok")):
+                    status = "pass"
+            message_candidates = [
+                c for c in overview.columns if "message" in c.lower() or c.lower() == "text"
+            ]
+            if message_candidates and pd.notna(row[message_candidates[0]]):
+                message = str(row[message_candidates[0]])
+        rows.append(
+            {
+                "object_label": str(label),
+                "class": obj.get("gp3_class", "dict")
+                if isinstance(obj, dict)
+                else type(obj).__name__,
+                "object_name": object_name,
+                "status": status,
+                "message": message,
+                "n_rows_overview": 0 if overview is None else len(overview),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _gp3_reporting_r_match(object_summary, patterns, missing_status="warn"):
+    if object_summary.empty:
+        return missing_status, None
+    hay = (
+        object_summary[["object_label", "class", "object_name", "message"]]
+        .fillna("")
+        .astype(str)
+        .agg(" ".join, axis=1)
+        .str.lower()
+    )
+    mask = pd.Series(False, index=object_summary.index)
+    for pattern in patterns:
+        mask |= hay.str.contains(str(pattern).lower(), regex=False)
+    if not mask.any():
+        return missing_status, None
+    statuses = object_summary.loc[mask, "status"].astype(str).str.lower()
+    if statuses.eq("fail").any():
+        status = "fail"
+    elif statuses.eq("warn").any():
+        status = "warn"
+    elif statuses.eq("pass").any():
+        status = "pass"
+    else:
+        status = "info"
+    evidence = "; ".join(
+        f"{row.object_label} [{row['class']}: {row.status}]"
+        for _, row in object_summary.loc[mask].iterrows()
+    )
+    return status, evidence
+
+
+def create_gazepoint_reporting_checklist(
+    data=None,
+    *,
+    objects=_GP3_REPORTING_R_UNSET,
+    analysis_type=_GP3_REPORTING_R_UNSET,
+    study_title=_GP3_REPORTING_R_UNSET,
+    required_sections=_GP3_REPORTING_R_UNSET,
+    include_optional=_GP3_REPORTING_R_UNSET,
+    name=_GP3_REPORTING_R_UNSET,
+):
+    """Create the legacy checklist or the structured R v2.3.0 checklist."""
+    r_mode = any(
+        value is not _GP3_REPORTING_R_UNSET
+        for value in (
+            objects,
+            analysis_type,
+            study_title,
+            required_sections,
+            include_optional,
+            name,
+        )
+    )
+    if not r_mode:
+        items = [
+            "hardware and sampling rate",
+            "calibration procedure",
+            "tracking-quality criteria",
+            "missing-data handling",
+            "pupil preprocessing",
+            "AOI definitions",
+            "event detector",
+            "exclusion criteria",
+            "statistical model",
+            "software/version",
+            "sensitivity analyses",
+            "open materials/data",
+        ]
+        return pd.DataFrame({"item": items, "reported": [False] * len(items)})
+
+    objects = None if objects is _GP3_REPORTING_R_UNSET else objects
+    analysis_type = "general" if analysis_type is _GP3_REPORTING_R_UNSET else analysis_type
+    study_title = None if study_title is _GP3_REPORTING_R_UNSET else study_title
+    required_sections = (
+        []
+        if required_sections is _GP3_REPORTING_R_UNSET or required_sections is None
+        else (
+            [required_sections] if isinstance(required_sections, str) else list(required_sections)
+        )
+    )
+    include_optional = (
+        True if include_optional is _GP3_REPORTING_R_UNSET else bool(include_optional)
+    )
+    name = "gazepoint_reporting_checklist" if name is _GP3_REPORTING_R_UNSET else name
+    if analysis_type not in {"general", "pupil", "aoi", "combined"}:
+        raise ValueError("analysis_type must be general, pupil, aoi, or combined")
+    if data is not None and not isinstance(data, pd.DataFrame):
+        raise TypeError("data must be None or a data frame")
+
+    object_summary = _gp3_reporting_r_object_summary(objects)
+    items = []
+
+    def add(area, item_id, item, status, evidence, recommendation, required):
+        items.append(
+            {
+                "reporting_area": area,
+                "item_id": item_id,
+                "item": item,
+                "status": status,
+                "evidence": evidence,
+                "recommendation": recommendation,
+                "required": bool(required),
+            }
+        )
+
+    def matched(
+        area,
+        item_id,
+        item,
+        patterns,
+        missing_status,
+        missing_evidence,
+        recommendation,
+        required=True,
+    ):
+        status, evidence = _gp3_reporting_r_match(object_summary, patterns, missing_status)
+        add(area, item_id, item, status, evidence or missing_evidence, recommendation, required)
+
+    add(
+        "study_identification",
+        "study_title",
+        "Study title or short study label is available.",
+        "pass" if study_title else "warn",
+        str(study_title) if study_title else "No study title supplied.",
+        "Report the study title/label consistently across outputs."
+        if study_title
+        else "Supply study_title or report a clear study label in the manuscript/report.",
+        True,
+    )
+    add(
+        "study_identification",
+        "analysis_type",
+        "Analysis type is declared.",
+        "pass",
+        analysis_type,
+        f"Report this as a {analysis_type} Gazepoint/gp3tools analysis.",
+        True,
+    )
+    add(
+        "data_structure",
+        "dataset_available",
+        "Dataset/data frame was supplied to the checklist.",
+        "pass" if data is not None else "warn",
+        f"{len(data)} rows and {data.shape[1]} columns."
+        if data is not None
+        else "No data frame supplied.",
+        "Report the analytic row count and key data columns."
+        if data is not None
+        else "Supply the final analysis data frame to document row/column structure.",
+        True,
+    )
+    if data is not None:
+        pcol = next(
+            (
+                c
+                for c in ["subject", "participant", "participant_id", "pID", "USER_FILE"]
+                if c in data
+            ),
+            None,
+        )
+        tcol = next(
+            (c for c in ["trial_global", "trial", "trial_id", "MEDIA_ID", "media_id"] if c in data),
+            None,
+        )
+        if pcol and tcol:
+            n_p = int(data[pcol].dropna().nunique())
+            n_t = int(data[[pcol, tcol]].astype("string").agg("||".join, axis=1).nunique())
+            pt_status = "pass"
+            pt_evidence = f"{n_p} participants; {n_t} participant-trial units."
+        else:
+            pt_status = "warn"
+            pt_evidence = "Participant/trial columns were not both detected."
+    else:
+        pt_status = "warn"
+        pt_evidence = "No data frame supplied."
+    add(
+        "data_structure",
+        "participant_trial_structure",
+        "Participant and trial structure can be reported.",
+        pt_status,
+        pt_evidence,
+        "Report participant count, trial count, and participant-trial units.",
+        True,
+    )
+
+    matched(
+        "readiness_gate",
+        "real_data_readiness_gate",
+        "Explicit real-data readiness gate is available.",
+        ["gp3_real_data_readiness_gate", "real_data_readiness"],
+        "warn",
+        "No gp3_real_data_readiness_gate object supplied.",
+        "Use check_gazepoint_real_data_readiness() before final confirmatory analysis.",
+    )
+    matched(
+        "workflow_and_import",
+        "workflow_or_file_pair_check",
+        "Import/workflow/file-pair checks are documented.",
+        ["gp3_workflow", "file_pair", "master_audit", "master_validation"],
+        "warn",
+        "No workflow, file-pair, master-audit, or master-validation object supplied.",
+        "Report source files, import workflow, master-table construction, and validation checks.",
+    )
+    matched(
+        "sampling_and_tracking",
+        "sampling_rate_reported",
+        "Sampling-rate checks are available or should be reported.",
+        ["sampling", "check_sampling_rate"],
+        "warn",
+        "No sampling-rate object detected.",
+        "Report expected and observed sampling rate, dropped samples, and timing irregularities.",
+    )
+    matched(
+        "sampling_and_tracking",
+        "tracking_quality_reported",
+        "Tracking/gaze-signal quality checks are available or should be reported.",
+        ["tracking_quality", "gaze_signal_quality", "condition_quality_imbalance"],
+        "warn",
+        "No tracking-quality or gaze-signal-quality object detected.",
+        "Report missing gaze, valid tracking, exclusions, and condition-level quality imbalance.",
+    )
+    matched(
+        "design_and_exclusions",
+        "design_balance_reported",
+        "Design balance or post-exclusion balance is documented.",
+        ["design_balance", "post_exclusion_balance", "condition_imbalance"],
+        "warn",
+        "No design-balance or post-exclusion-balance object detected.",
+        "Report condition/sample balance before and after exclusions.",
+    )
+    matched(
+        "design_and_exclusions",
+        "exclusion_flow_reported",
+        "Exclusion flow is documented.",
+        ["exclusion_flow"],
+        "warn",
+        "No exclusion-flow object detected.",
+        "Report row, trial, participant, and condition losses due to exclusions.",
+    )
+
+    if analysis_type in {"aoi", "combined"}:
+        matched(
+            "aoi_reporting",
+            "aoi_definition_and_geometry",
+            "AOI definitions, geometry, overlap, or verification are documented.",
+            ["aoi_geometry", "aoi_overlap", "aoi_coding", "aoi_verification", "aoi_margin"],
+            "warn",
+            "No AOI geometry/coding/verification object detected.",
+            "Report AOI definitions, coordinates, overlap checks, and verification procedure.",
+        )
+        matched(
+            "aoi_reporting",
+            "aoi_outcomes_reported",
+            "AOI outcome summaries or AOI model objects are available.",
+            ["aoi_trial_features", "aoi_windows", "aoi_glmm", "aoi_gamm", "aoi_transition"],
+            "warn",
+            "No AOI outcome/model object detected.",
+            "Report AOI metrics, denominators, model family, link function, and random effects.",
+        )
+
+    if analysis_type in {"pupil", "combined"}:
+        matched(
+            "pupil_reporting",
+            "pupil_preprocessing_reported",
+            "Pupil preprocessing decisions are documented.",
+            [
+                "pupil_preprocessing",
+                "preprocessing_registry",
+                "pupil_artifacts",
+                "interpolate_gazepoint_pupil",
+                "smooth_gazepoint_pupil",
+                "baseline_correct",
+            ],
+            "warn",
+            "No pupil preprocessing/audit object detected.",
+            "Report artifact rules, interpolation method, baseline correction, smoothing, and retained samples.",
+        )
+        matched(
+            "pupil_reporting",
+            "pupil_quality_audits_reported",
+            "Pupil quality audits are documented.",
+            [
+                "pupil_gaps",
+                "pupil_baseline",
+                "pupil_imbalance",
+                "pupil_drift",
+                "pupil_overlap",
+                "pupil_reliability",
+            ],
+            "warn",
+            "No pupil quality-audit object detected.",
+            "Report gap structure, baseline quality, drift, imbalance, overlap risk, and reliability if relevant.",
+        )
+        matched(
+            "pupil_reporting",
+            "stimulus_luminance_reported",
+            "Stimulus luminance/brightness audit is available or discussed.",
+            ["stimulus_luminance", "luminance"],
+            "warn",
+            "No stimulus luminance audit detected.",
+            "Report luminance/brightness control or acknowledge it as a limitation for pupil outcomes.",
+        )
+
+    matched(
+        "models_and_diagnostics",
+        "model_results_reported",
+        "Model summaries or fixed-effect tables are available.",
+        ["model", "fixed_effects", "emmeans", "glmm", "gamm", "gca", "lmm"],
+        "warn",
+        "No model summary/fixed-effect object detected.",
+        "Report model formula, family/link, fixed effects, random effects, diagnostics, and inference criterion.",
+    )
+    matched(
+        "models_and_diagnostics",
+        "model_diagnostics_reported",
+        "Model diagnostics are available or should be reported.",
+        ["diagnose", "convergence", "singularity", "overdispersion", "model_diagnostic"],
+        "warn",
+        "No model diagnostic object detected.",
+        "Report convergence, singularity, overdispersion, residual, and sensitivity diagnostics where relevant.",
+    )
+    matched(
+        "sensitivity_and_robustness",
+        "sensitivity_analyses_reported",
+        "Sensitivity, multiverse, or optional external cross-checks are available.",
+        [
+            "sensitivity",
+            "multiverse",
+            "crosscheck",
+            "pchip",
+            "gazer",
+            "eyetools",
+            "transition_count_nb",
+            "time_varying_transition",
+        ],
+        "info",
+        "No optional sensitivity/external-cross-check object detected.",
+        "Report optional sensitivity checks when used; otherwise state that they were not part of the planned analysis.",
+        False,
+    )
+    add(
+        "reproducibility",
+        "package_workflow_reported",
+        "Package workflow and software environment can be reported.",
+        "pass",
+        f"Checklist generated by gp3tools object `{name}`.",
+        "Report gp3tools version, Python version, key optional packages, and analysis script availability.",
+        True,
+    )
+    if include_optional:
+        matched(
+            "advanced_optional_methods",
+            "advanced_sequence_or_transition_methods",
+            "Advanced sequence or transition-method reporting is available if used.",
+            ["markovchain", "semimarkov", "hmm", "transition_matrix", "time_varying_transition"],
+            "info",
+            "No advanced sequence/transition object detected.",
+            "If sequence models are used, report state definitions, transition denominators, and model assumptions.",
+            False,
+        )
+        matched(
+            "advanced_optional_methods",
+            "external_detector_or_adapter_reporting",
+            "External detector/package-adapter reporting is available if used.",
+            ["adapter", "eyetrackingr", "pupillometryr", "gazer", "eyetools", "external"],
+            "info",
+            "No external detector/adapter object detected.",
+            "If external packages are used, report package names, versions, input mapping, and any skipped/partial branches.",
+            False,
+        )
+
+    checklist = pd.DataFrame(items)
+    if required_sections:
+        checklist.loc[checklist["item_id"].isin(required_sections), "required"] = True
+    order = pd.Categorical(checklist["status"], ["fail", "warn", "pass", "info"], ordered=True)
+    checklist = (
+        checklist.assign(_order=order)
+        .sort_values(["_order", "reporting_area", "item_id"])
+        .drop(columns="_order")
+        .reset_index(drop=True)
+    )
+    counts = checklist["status"].value_counts()
+    n_fail = int(counts.get("fail", 0))
+    n_warn = int(counts.get("warn", 0))
+    n_pass = int(counts.get("pass", 0))
+    n_info = int(counts.get("info", 0))
+    checklist_status = "fail" if n_fail else ("warn" if n_warn else "pass")
+    section_rows = []
+    for area, frame in checklist.groupby("reporting_area", sort=True):
+        section_rows.append(
+            {
+                "reporting_area": area,
+                "n_items": len(frame),
+                "n_required": int(frame["required"].sum()),
+                "n_fail": int(frame["status"].eq("fail").sum()),
+                "n_warn": int(frame["status"].eq("warn").sum()),
+                "n_pass": int(frame["status"].eq("pass").sum()),
+                "n_info": int(frame["status"].eq("info").sum()),
+                "area_status": "fail"
+                if frame["status"].eq("fail").any()
+                else ("warn" if frame["status"].eq("warn").any() else "pass"),
+            }
+        )
+    section_summary = pd.DataFrame(section_rows)
+    title_text = study_title or "Untitled Gazepoint study"
+    decision = (
+        f"Reporting checklist is incomplete: {n_fail} blocking reporting item(s) require attention."
+        if checklist_status == "fail"
+        else (
+            f"Reporting checklist is conditionally complete: no blocking reporting failures, but {n_warn} warning-level item(s) should be reviewed."
+            if checklist_status == "warn"
+            else "Reporting checklist is complete: no blocking or warning-level reporting items were detected."
+        )
+    )
+    text_summary = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "study_title": title_text,
+                "analysis_type": analysis_type,
+                "checklist_status": checklist_status,
+                "text": f"{title_text} was checked as a {analysis_type} Gazepoint/gp3tools analysis. {decision} Item counts: {n_pass} pass, {n_warn} warn, {n_fail} fail, {n_info} info.",
+            }
+        ]
+    )
+    if data is None:
+        data_summary = pd.DataFrame(
+            [
+                {
+                    "object_name": name,
+                    "analysis_type": analysis_type,
+                    "n_rows": np.nan,
+                    "n_columns": np.nan,
+                    "n_participants": np.nan,
+                    "n_trial_units": np.nan,
+                }
+            ]
+        )
+    else:
+        pcol = next(
+            (
+                c
+                for c in ["subject", "participant", "participant_id", "pID", "USER_FILE"]
+                if c in data
+            ),
+            None,
+        )
+        tcol = next(
+            (c for c in ["trial_global", "trial", "trial_id", "MEDIA_ID", "media_id"] if c in data),
+            None,
+        )
+        n_p = int(data[pcol].dropna().nunique()) if pcol else np.nan
+        n_t = (
+            int(data[[pcol, tcol]].astype("string").agg("||".join, axis=1).nunique())
+            if pcol and tcol
+            else np.nan
+        )
+        data_summary = pd.DataFrame(
+            [
+                {
+                    "object_name": name,
+                    "analysis_type": analysis_type,
+                    "n_rows": len(data),
+                    "n_columns": data.shape[1],
+                    "n_participants": n_p,
+                    "n_trial_units": n_t,
+                }
+            ]
+        )
+    overview = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "study_title": study_title if study_title else pd.NA,
+                "analysis_type": analysis_type,
+                "checklist_status": checklist_status,
+                "ready_for_reporting": n_fail == 0,
+                "n_items": len(checklist),
+                "n_required_items": int(checklist["required"].sum()),
+                "n_fail": n_fail,
+                "n_warn": n_warn,
+                "n_pass": n_pass,
+                "n_info": n_info,
+                "n_objects_supplied": len(object_summary),
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "analysis_type",
+                "study_title",
+                "required_sections",
+                "include_optional",
+                "name",
+            ],
+            "value": [
+                analysis_type,
+                study_title if study_title else pd.NA,
+                ", ".join(required_sections) if required_sections else pd.NA,
+                str(include_optional),
+                name,
+            ],
+        }
+    )
+    return {
+        "overview": overview,
+        "checklist": checklist,
+        "section_summary": section_summary,
+        "object_summary": object_summary,
+        "data_summary": data_summary,
+        "text_summary": text_summary,
+        "settings": settings,
+        "gp3_class": "gp3_reporting_checklist",
+    }
 
 
 def create_gazepoint_analysis_decision_audit(**decisions) -> pd.DataFrame:

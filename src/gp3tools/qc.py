@@ -21,28 +21,344 @@ from ._utils import (
     time_to_seconds,
 )
 
+_GP3_QC_R_UNSET = object()
 
-def as_gazepoint_master(data, copy: bool = True) -> pd.DataFrame:
-    """Coerce sample-level data to a standard Gazepoint master table."""
-    df = ensure_dataframe(data, copy=copy)
-    mapping = {}
-    roles = {
-        "subject": "subject",
-        "trial": "trial_global",
-        "time": "time",
-        "x": "x",
-        "y": "y",
-        "pupil": "pupil",
-        "aoi": "aoi_current",
-        "condition": "condition",
-        "media": "MEDIA_ID",
-    }
-    for role, canonical in roles.items():
-        col = infer_column(df, role)
-        if col is not None and canonical not in df.columns:
-            mapping[col] = canonical
-    df = df.rename(columns=mapping)
-    return attach_attrs(df, gp3_class="gazepoint_master")
+
+def _gp3_qc_r_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def _gp3_qc_r_as_bool_series(values, index):
+    series = pd.Series(values, index=index)
+    if pd.api.types.is_bool_dtype(series.dtype):
+        return series.astype("boolean")
+    if pd.api.types.is_numeric_dtype(series.dtype):
+        numeric = pd.to_numeric(series, errors="coerce")
+        out = pd.Series(pd.NA, index=index, dtype="boolean")
+        out.loc[numeric.notna()] = numeric.loc[numeric.notna()].ne(0).to_numpy()
+        return out
+    text = series.astype("string").str.strip().str.lower()
+    true_values = {"true", "t", "yes", "y", "1", "valid", "ok"}
+    false_values = {"false", "f", "no", "n", "0", "invalid", "bad"}
+    out = pd.Series(pd.NA, index=index, dtype="boolean")
+    out.loc[text.isin(true_values)] = True
+    out.loc[text.isin(false_values)] = False
+    return out
+
+
+def as_gazepoint_master(
+    data,
+    copy: bool = True,
+    *,
+    screen_width_px=_GP3_QC_R_UNSET,
+    screen_height_px=_GP3_QC_R_UNSET,
+    source_col=_GP3_QC_R_UNSET,
+    media_col=_GP3_QC_R_UNSET,
+    media_name_col=_GP3_QC_R_UNSET,
+    time_col=_GP3_QC_R_UNSET,
+    coordinate_unit=_GP3_QC_R_UNSET,
+    event_latency_offset_ms=_GP3_QC_R_UNSET,
+) -> pd.DataFrame:
+    """Coerce data to a legacy Python or R v2.3.0 Gazepoint master table."""
+    r_mode = any(
+        value is not _GP3_QC_R_UNSET
+        for value in (
+            screen_width_px,
+            screen_height_px,
+            source_col,
+            media_col,
+            media_name_col,
+            time_col,
+            coordinate_unit,
+            event_latency_offset_ms,
+        )
+    )
+
+    if not r_mode:
+        df = ensure_dataframe(data, copy=copy)
+        mapping = {}
+        roles = {
+            "subject": "subject",
+            "trial": "trial_global",
+            "time": "time",
+            "x": "x",
+            "y": "y",
+            "pupil": "pupil",
+            "aoi": "aoi_current",
+            "condition": "condition",
+            "media": "MEDIA_ID",
+        }
+        for role, canonical in roles.items():
+            col = infer_column(df, role)
+            if col is not None and canonical not in df.columns:
+                mapping[col] = canonical
+        df = df.rename(columns=mapping)
+        return attach_attrs(df, gp3_class="gazepoint_master")
+
+    from .io import standardise_gazepoint_names
+
+    screen_width_px = None if screen_width_px is _GP3_QC_R_UNSET else screen_width_px
+    screen_height_px = None if screen_height_px is _GP3_QC_R_UNSET else screen_height_px
+    source_col = "USER_FILE" if source_col is _GP3_QC_R_UNSET else source_col
+    media_col = "MEDIA_ID" if media_col is _GP3_QC_R_UNSET else media_col
+    media_name_col = "MEDIA_NAME" if media_name_col is _GP3_QC_R_UNSET else media_name_col
+    time_col = "TIME" if time_col is _GP3_QC_R_UNSET else time_col
+    coordinate_unit = "auto" if coordinate_unit is _GP3_QC_R_UNSET else coordinate_unit
+    event_latency_offset_ms = (
+        0.0 if event_latency_offset_ms is _GP3_QC_R_UNSET else event_latency_offset_ms
+    )
+
+    if coordinate_unit not in {"auto", "normalised", "pixels"}:
+        raise ValueError("coordinate_unit must be 'auto', 'normalised', or 'pixels'")
+    for value, label in (
+        (screen_width_px, "screen_width_px"),
+        (screen_height_px, "screen_height_px"),
+    ):
+        if value is not None and (not np.isscalar(value) or not np.isfinite(float(value))):
+            raise ValueError(f"{label} must be None or a single finite numeric value")
+    if not np.isscalar(event_latency_offset_ms) or not np.isfinite(float(event_latency_offset_ms)):
+        raise ValueError("event_latency_offset_ms must be a single finite numeric value")
+
+    raw = ensure_dataframe(data, copy=True)
+    df = standardise_gazepoint_names(raw).reset_index(drop=True)
+    if time_col not in df.columns:
+        raise KeyError(f"Missing required column: {time_col}")
+    n = len(df)
+
+    def numeric(candidates, default=np.nan):
+        candidates = [candidates] if isinstance(candidates, str) else list(candidates)
+        hit = next((col for col in candidates if col in df.columns), None)
+        if hit is None:
+            return pd.Series(np.full(n, default), dtype=float)
+        return pd.to_numeric(df[hit], errors="coerce").reset_index(drop=True)
+
+    def character(candidates):
+        candidates = [candidates] if isinstance(candidates, str) else list(candidates)
+        hit = next((col for col in candidates if col in df.columns), None)
+        if hit is None:
+            return pd.Series(pd.array([pd.NA] * n, dtype="string"))
+        return df[hit].astype("string").reset_index(drop=True)
+
+    def first_existing(candidates):
+        return next((col for col in candidates if col in df.columns), None)
+
+    source_file = character(source_col)
+    media_id = character(media_col)
+    media_name = character(media_name_col)
+    subject = source_file.str.replace(r"_all_gaze\.csv$", "", regex=True)
+    subject = subject.str.replace(r"\.csv$", "", regex=True)
+    subject = subject.mask(source_file.isna() | source_file.eq(""))
+    trial_global = pd.Series(pd.array([pd.NA] * n, dtype="string"))
+    trial_mask = subject.notna() & media_id.notna()
+    trial_global.loc[trial_mask] = (
+        subject.loc[trial_mask].astype("string")
+        + "_MEDIA_"
+        + media_id.loc[trial_mask].astype("string")
+    )
+
+    raw_time_sec = numeric(time_col)
+    time_ms = raw_time_sec * 1000.0 + float(event_latency_offset_ms)
+
+    best_x_raw = numeric(["BPOGX", "FPOGX"])
+    best_y_raw = numeric(["BPOGY", "FPOGY"])
+    left_x_raw = numeric(["LPOGX"])
+    left_y_raw = numeric(["LPOGY"])
+    right_x_raw = numeric(["RPOGX"])
+    right_y_raw = numeric(["RPOGY"])
+
+    coordinate_values = pd.concat(
+        [best_x_raw, best_y_raw, left_x_raw, left_y_raw, right_x_raw, right_y_raw],
+        ignore_index=True,
+    ).to_numpy(float)
+    coordinate_values = coordinate_values[np.isfinite(coordinate_values)]
+    detected_coordinate_unit = coordinate_unit
+    if coordinate_unit == "auto":
+        prop_central = (
+            float(np.mean((coordinate_values >= -0.25) & (coordinate_values <= 1.25)))
+            if coordinate_values.size
+            else 0.0
+        )
+        detected_coordinate_unit = (
+            "normalised" if coordinate_values.size and prop_central >= 0.80 else "pixels"
+        )
+
+    def scale_x(values):
+        if detected_coordinate_unit == "normalised" and screen_width_px is not None:
+            return values * float(screen_width_px)
+        return values.copy()
+
+    def scale_y(values):
+        if detected_coordinate_unit == "normalised" and screen_height_px is not None:
+            return values * float(screen_height_px)
+        return values.copy()
+
+    x = scale_x(best_x_raw)
+    y = scale_y(best_y_raw)
+    left_x = scale_x(left_x_raw)
+    left_y = scale_y(left_y_raw)
+    right_x = scale_x(right_x_raw)
+    right_y = scale_y(right_y_raw)
+
+    best_valid = numeric(["BPOGV", "FPOGV"], default=1.0)
+    left_gaze_valid_raw = numeric(["LPOGV"])
+    right_gaze_valid_raw = numeric(["RPOGV"])
+    left_pupil_source = first_existing(["LPMM", "LPUPILD", "LPD"])
+    right_pupil_source = first_existing(["RPMM", "RPUPILD", "RPD"])
+    left_pupil = numeric(["LPMM", "LPUPILD", "LPD"])
+    right_pupil = numeric(["RPMM", "RPUPILD", "RPD"])
+    left_pupil_valid_raw = numeric(["LPMMV", "LPUPILV", "LPV"])
+    right_pupil_valid_raw = numeric(["RPMMV", "RPUPILV", "RPV"])
+    left_pupil = left_pupil.mask(left_pupil_valid_raw.notna() & left_pupil_valid_raw.eq(0))
+    right_pupil = right_pupil.mask(right_pupil_valid_raw.notna() & right_pupil_valid_raw.eq(0))
+    mean_pupil = pd.concat([left_pupil, right_pupil], axis=1).mean(axis=1, skipna=True)
+
+    if left_pupil_source == "LPMM" or right_pupil_source == "RPMM":
+        pupil_unit = "diameter_mm"
+    elif left_pupil_source == "LPUPILD" or right_pupil_source == "RPUPILD":
+        pupil_unit = "diameter_meters"
+    elif left_pupil_source == "LPD" or right_pupil_source == "RPD":
+        pupil_unit = "tracker_units"
+    else:
+        pupil_unit = pd.NA
+
+    gaze_unit = (
+        "pixels"
+        if detected_coordinate_unit == "normalised"
+        and screen_width_px is not None
+        and screen_height_px is not None
+        else detected_coordinate_unit
+    )
+    valid_sample = best_valid.notna() & best_valid.eq(1)
+    missing_gaze = (~valid_sample) | x.isna() | y.isna()
+    missing_pupil = left_pupil.isna() & right_pupil.isna()
+    gaze_offscreen = pd.Series(pd.array([pd.NA] * n, dtype="boolean"))
+    if screen_width_px is not None and screen_height_px is not None:
+        off = (
+            (~missing_gaze)
+            & x.notna()
+            & y.notna()
+            & (x.lt(0) | x.gt(float(screen_width_px)) | y.lt(0) | y.gt(float(screen_height_px)))
+        )
+        gaze_offscreen = off.astype("boolean")
+
+    blink_id = numeric(["BKID"])
+    blink_duration = numeric(["BKDUR"])
+    has_blink_columns = blink_id.notna().any() or blink_duration.notna().any()
+    blink = (
+        ((blink_id.notna() & blink_id.gt(0)) | (blink_duration.notna() & blink_duration.gt(0)))
+        if has_blink_columns
+        else (missing_gaze & missing_pupil)
+    )
+    trackloss = missing_gaze.copy()
+    message = character(["USER", "USER_DATA", "MESSAGE"])
+    event_type = pd.Series(pd.array([pd.NA] * n, dtype="string"))
+    has_message = message.notna() & message.ne("")
+    for token, label in (
+        ("TRIAL_START", "trial_start"),
+        ("STIMULUS_ONSET", "stimulus_onset"),
+        ("TARGET_ONSET", "target_onset"),
+        ("TRIAL_END", "trial_end"),
+    ):
+        event_type.loc[has_message & message.str.contains(token, regex=False, na=False)] = label
+
+    aoi = character(["AOI"])
+    aoi_current = aoi.mask(aoi.isna() | aoi.eq(""))
+    aoi_current = aoi_current.mask(gaze_offscreen.fillna(False), "offscreen")
+    aoi_current = aoi_current.mask(missing_gaze, "missing")
+    artifact_flag = missing_gaze | missing_pupil
+    artifact_reason = pd.Series(pd.array([pd.NA] * n, dtype="string"))
+    artifact_reason.loc[missing_gaze & missing_pupil] = "missing_gaze_and_pupil"
+    artifact_reason.loc[missing_gaze & ~missing_pupil] = "missing_gaze"
+    artifact_reason.loc[~missing_gaze & missing_pupil] = "missing_pupil"
+
+    fixation_x_raw = numeric(["FPOGX"])
+    fixation_y_raw = numeric(["FPOGY"])
+    out = pd.DataFrame(
+        {
+            "source_file": source_file,
+            "subject": subject,
+            "pID": subject,
+            "media_id": media_id,
+            "media_name": media_name,
+            "trial_global": trial_global,
+            "time": time_ms,
+            "time_ms": time_ms,
+            "time_orig_sec": raw_time_sec,
+            "time_orig_ms": raw_time_sec * 1000.0,
+            "sample_index": numeric(["CNT"]),
+            "time_bin_25ms": np.floor(time_ms / 25.0) * 25.0,
+            "time_bin_50ms": np.floor(time_ms / 50.0) * 50.0,
+            "time_bin_100ms": np.floor(time_ms / 100.0) * 100.0,
+            "x": x,
+            "y": y,
+            "raw_x": best_x_raw,
+            "raw_y": best_y_raw,
+            "left_x": left_x,
+            "left_y": left_y,
+            "right_x": right_x,
+            "right_y": right_y,
+            "left_pupil": left_pupil,
+            "right_pupil": right_pupil,
+            "mean_pupil": mean_pupil,
+            "pupil": mean_pupil,
+            "pupil_unit": pd.Series([pupil_unit] * n, dtype="string"),
+            "pupil_source_left": pd.Series([left_pupil_source] * n, dtype="string"),
+            "pupil_source_right": pd.Series([right_pupil_source] * n, dtype="string"),
+            "gaze_unit": pd.Series([gaze_unit] * n, dtype="string"),
+            "coordinate_unit_detected": pd.Series([detected_coordinate_unit] * n, dtype="string"),
+            "screen_width_px": np.nan if screen_width_px is None else float(screen_width_px),
+            "screen_height_px": np.nan if screen_height_px is None else float(screen_height_px),
+            "valid_sample": valid_sample.to_numpy(bool),
+            "missing_gaze": missing_gaze.to_numpy(bool),
+            "missing_pupil": missing_pupil.to_numpy(bool),
+            "gaze_offscreen": gaze_offscreen,
+            "trackloss": trackloss.to_numpy(bool),
+            "Trackloss": trackloss.to_numpy(bool),
+            "blink": blink.to_numpy(bool),
+            "left_gaze_valid": _gp3_qc_r_as_bool_series(
+                left_gaze_valid_raw.eq(1).where(left_gaze_valid_raw.notna()), df.index
+            ),
+            "right_gaze_valid": _gp3_qc_r_as_bool_series(
+                right_gaze_valid_raw.eq(1).where(right_gaze_valid_raw.notna()), df.index
+            ),
+            "left_pupil_valid": _gp3_qc_r_as_bool_series(
+                left_pupil_valid_raw.eq(1).where(left_pupil_valid_raw.notna()), df.index
+            ),
+            "right_pupil_valid": _gp3_qc_r_as_bool_series(
+                right_pupil_valid_raw.eq(1).where(right_pupil_valid_raw.notna()), df.index
+            ),
+            "aoi": aoi,
+            "AOI": aoi,
+            "aoi_current": aoi_current,
+            "aoi_count": (~aoi_current.isna() & ~aoi_current.isin(["missing", "offscreen"])).astype(
+                int
+            ),
+            "message": message,
+            "event_type": event_type,
+            "event_label": message,
+            "event_latency_offset_ms": float(event_latency_offset_ms),
+            "fixation_x": scale_x(fixation_x_raw),
+            "fixation_y": scale_y(fixation_y_raw),
+            "fixation_start_sec": numeric(["FPOGS"]),
+            "fixation_duration_sec": numeric(["FPOGD"]),
+            "fixation_id": numeric(["FPOGID"]),
+            "fixation_event": numeric(["FPOGV"]).eq(1).to_numpy(bool),
+            "artifact_flag": artifact_flag.to_numpy(bool),
+            "artifact_reason": artifact_reason,
+            "tracker_model": "Gazepoint",
+            "tracker_sampling_rate": np.nan,
+        }
+    )
+    return attach_attrs(
+        out,
+        gp3_class="gazepoint_master",
+        r_class="gazepoint_master",
+        coordinate_unit_detected=detected_coordinate_unit,
+    )
 
 
 def create_gazepoint_master(data, **kwargs) -> pd.DataFrame:
@@ -67,42 +383,415 @@ def create_gazepoint_master(data, **kwargs) -> pd.DataFrame:
 
 
 def validate_gazepoint_master(
-    data, required: tuple[str, ...] = ("subject", "time")
+    data,
+    required=_GP3_QC_R_UNSET,
+    *,
+    min_valid_sample_pct=_GP3_QC_R_UNSET,
+    max_missing_gaze_pct=_GP3_QC_R_UNSET,
+    max_missing_pupil_pct=_GP3_QC_R_UNSET,
+    max_offscreen_gaze_pct=_GP3_QC_R_UNSET,
+    require_pupil=_GP3_QC_R_UNSET,
+    require_aoi=_GP3_QC_R_UNSET,
+    fail_on_error=_GP3_QC_R_UNSET,
 ) -> dict[str, Any]:
-    """Validate a master table and return an explicit pass/fail gate."""
+    """Validate a Gazepoint master table using legacy or R v2.3.0 checks."""
+    r_mode = any(
+        value is not _GP3_QC_R_UNSET
+        for value in (
+            min_valid_sample_pct,
+            max_missing_gaze_pct,
+            max_missing_pupil_pct,
+            max_offscreen_gaze_pct,
+            require_pupil,
+            require_aoi,
+            fail_on_error,
+        )
+    )
+
+    if not r_mode:
+        df = ensure_dataframe(data, copy=False)
+        required_cols = ("subject", "time") if required is _GP3_QC_R_UNSET else tuple(required)
+        checks = []
+        for col in required_cols:
+            checks.append(
+                {
+                    "check": f"required:{col}",
+                    "passed": col in df.columns,
+                    "detail": "present" if col in df.columns else "missing",
+                }
+            )
+        checks.extend(
+            [
+                {"check": "nonempty", "passed": len(df) > 0, "detail": f"n={len(df)}"},
+                {
+                    "check": "unique_columns",
+                    "passed": not df.columns.duplicated().any(),
+                    "detail": (
+                        "no duplicate names"
+                        if not df.columns.duplicated().any()
+                        else "duplicates present"
+                    ),
+                },
+            ]
+        )
+        table = pd.DataFrame(checks)
+        return {
+            "valid": bool(table["passed"].all()),
+            "summary": result_table(
+                n_rows=len(df),
+                n_columns=df.shape[1],
+                n_checks=len(table),
+                n_failed=int((~table["passed"]).sum()),
+            ),
+            "checks": table,
+        }
+
     df = ensure_dataframe(data, copy=False)
+    min_valid_sample_pct = (
+        75.0 if min_valid_sample_pct is _GP3_QC_R_UNSET else float(min_valid_sample_pct)
+    )
+    max_missing_gaze_pct = (
+        25.0 if max_missing_gaze_pct is _GP3_QC_R_UNSET else float(max_missing_gaze_pct)
+    )
+    max_missing_pupil_pct = (
+        50.0 if max_missing_pupil_pct is _GP3_QC_R_UNSET else float(max_missing_pupil_pct)
+    )
+    max_offscreen_gaze_pct = (
+        25.0 if max_offscreen_gaze_pct is _GP3_QC_R_UNSET else float(max_offscreen_gaze_pct)
+    )
+    require_pupil = False if require_pupil is _GP3_QC_R_UNSET else bool(require_pupil)
+    require_aoi = False if require_aoi is _GP3_QC_R_UNSET else bool(require_aoi)
+    fail_on_error = False if fail_on_error is _GP3_QC_R_UNSET else bool(fail_on_error)
+
+    def detect(candidates):
+        return next((col for col in candidates if col in df.columns), None)
+
+    roles = {
+        "subject": detect(["subject", "pID", "participant"]),
+        "media_id": detect(["media_id", "MEDIA_ID"]),
+        "time": detect(["time_ms", "time", "time_orig"]),
+        "x": detect(["x", "gaze_x"]),
+        "y": detect(["y", "gaze_y"]),
+        "valid_sample": detect(["valid_sample"]),
+        "missing_gaze": detect(["missing_gaze"]),
+        "missing_pupil": detect(["missing_pupil"]),
+        "gaze_offscreen": detect(["gaze_offscreen"]),
+        "pupil": detect(["mean_pupil", "pupil", "pupil_raw"]),
+        "aoi_current": detect(["aoi_current", "AOI"]),
+        "aoi_count": detect(["aoi_count"]),
+        "screen_width_px": detect(["screen_width_px"]),
+        "screen_height_px": detect(["screen_height_px"]),
+    }
+    column_map = pd.DataFrame({"role": list(roles), "column": [roles[r] for r in roles]})
+
+    def get(role):
+        col = roles[role]
+        return None if col is None else df[col]
+
+    def prop_true_pct(values):
+        if values is None or len(values) == 0:
+            return np.nan
+        logical = _gp3_qc_r_as_bool_series(values, df.index)
+        if logical.isna().all():
+            return np.nan
+        return float(logical.mean(skipna=True) * 100.0)
+
+    def safe_minmax(values, which):
+        if values is None:
+            return np.nan
+        arr = pd.to_numeric(values, errors="coerce").to_numpy(float)
+        arr = arr[np.isfinite(arr)]
+        if not arr.size:
+            return np.nan
+        return float(np.min(arr) if which == "min" else np.max(arr))
+
+    def n_distinct(values):
+        if values is None:
+            return np.nan
+        return int(pd.Series(values).dropna().nunique())
+
+    def real_aoi(values):
+        if values is None:
+            return pd.Series(False, index=df.index)
+        text = values.astype("string")
+        return (
+            text.notna()
+            & text.ne("")
+            & ~text.isin(["missing", "offscreen", "non_aoi", "unclassified"])
+        )
+
+    subject = get("subject")
+    media = get("media_id")
+    time_values = get("time")
+    x = get("x")
+    y = get("y")
+    valid_sample = get("valid_sample")
+    missing_gaze = get("missing_gaze")
+    missing_pupil = get("missing_pupil")
+    gaze_offscreen = get("gaze_offscreen")
+    pupil = get("pupil")
+    aoi_current = get("aoi_current")
+    aoi_count = get("aoi_count")
+    screen_width = get("screen_width_px")
+    screen_height = get("screen_height_px")
+
+    n_rows = len(df)
+    n_subjects = n_distinct(subject)
+    n_media = n_distinct(media)
+    valid_sample_pct = prop_true_pct(valid_sample)
+    missing_gaze_pct = prop_true_pct(missing_gaze)
+    missing_pupil_pct = prop_true_pct(missing_pupil)
+    offscreen_gaze_pct = prop_true_pct(gaze_offscreen)
+    has_pupil = bool(pupil is not None and pd.to_numeric(pupil, errors="coerce").notna().any())
+    real_aoi_flag = real_aoi(aoi_current)
+    has_aoi = bool(real_aoi_flag.any())
+    time_min = safe_minmax(time_values, "min")
+    time_max = safe_minmax(time_values, "max")
+
+    required_roles = [
+        "subject",
+        "media_id",
+        "time",
+        "x",
+        "y",
+        "valid_sample",
+        "missing_gaze",
+        "missing_pupil",
+        "gaze_offscreen",
+        "aoi_current",
+        "aoi_count",
+    ]
+    missing_required_roles = [role for role in required_roles if roles[role] is None]
+
     checks = []
-    for col in required:
+
+    def add(check_id, check_name, passed, severity, value, threshold, message, warning=False):
+        status = "pass" if bool(passed) else ("warning" if warning else "fail")
         checks.append(
             {
-                "check": f"required:{col}",
-                "passed": col in df.columns,
-                "detail": "present" if col in df.columns else "missing",
+                "check_id": check_id,
+                "check_name": check_name,
+                "status": status,
+                "severity": severity,
+                "value": str(value),
+                "threshold": str(threshold),
+                "message": message,
             }
         )
-    checks.extend(
+
+    add(
+        "C001",
+        "Non-empty data frame",
+        n_rows > 0,
+        "error",
+        n_rows,
+        "> 0",
+        "The master table must contain at least one row.",
+    )
+    add(
+        "C002",
+        "Required columns detected",
+        not missing_required_roles,
+        "error",
+        "none missing" if not missing_required_roles else ", ".join(missing_required_roles),
+        "all required roles present",
+        "The master table must contain the required identifier, time, gaze, quality, and AOI columns.",
+    )
+    add(
+        "C003",
+        "Subject identifiers available",
+        np.isfinite(n_subjects) and n_subjects > 0,
+        "error",
+        n_subjects,
+        "> 0",
+        "At least one non-missing subject identifier must be available.",
+    )
+    add(
+        "C004",
+        "Media identifiers available",
+        np.isfinite(n_media) and n_media > 0,
+        "error",
+        n_media,
+        "> 0",
+        "At least one non-missing media/stimulus identifier must be available.",
+    )
+    add(
+        "C005",
+        "Time column is numeric",
+        time_values is not None and pd.api.types.is_numeric_dtype(time_values),
+        "error",
+        "missing" if time_values is None else str(time_values.dtype),
+        "numeric",
+        "The detected time column must be numeric.",
+    )
+    add(
+        "C006",
+        "Time span is positive",
+        np.isfinite(time_min) and np.isfinite(time_max) and time_max > time_min,
+        "error",
+        f"{time_min} to {time_max}",
+        "max > min",
+        "The master table must contain a positive time span.",
+    )
+    add(
+        "C007",
+        "Gaze coordinates are numeric",
+        x is not None
+        and y is not None
+        and pd.api.types.is_numeric_dtype(x)
+        and pd.api.types.is_numeric_dtype(y),
+        "error",
+        f"x={'missing' if x is None else x.dtype}; y={'missing' if y is None else y.dtype}",
+        "numeric x and y",
+        "The gaze coordinate columns must be numeric.",
+    )
+    add(
+        "C008",
+        "Valid-sample percentage acceptable",
+        np.isfinite(valid_sample_pct) and valid_sample_pct >= min_valid_sample_pct,
+        "error",
+        round(valid_sample_pct, 3) if np.isfinite(valid_sample_pct) else np.nan,
+        f">= {min_valid_sample_pct}",
+        "The percentage of valid samples should be above the minimum threshold.",
+    )
+    add(
+        "C009",
+        "Missing-gaze percentage acceptable",
+        np.isfinite(missing_gaze_pct) and missing_gaze_pct <= max_missing_gaze_pct,
+        "error",
+        round(missing_gaze_pct, 3) if np.isfinite(missing_gaze_pct) else np.nan,
+        f"<= {max_missing_gaze_pct}",
+        "The percentage of missing gaze samples should be below the maximum threshold.",
+    )
+    add(
+        "C010",
+        "Pupil data available",
+        has_pupil,
+        "error" if require_pupil else "warning",
+        has_pupil,
+        "required" if require_pupil else "recommended",
+        "Pupil data are required only when pupil preprocessing or pupil modelling will be performed.",
+        warning=(not require_pupil and not has_pupil),
+    )
+    add(
+        "C011",
+        "Missing-pupil percentage acceptable",
+        (not np.isfinite(missing_pupil_pct)) or missing_pupil_pct <= max_missing_pupil_pct,
+        "warning",
+        round(missing_pupil_pct, 3) if np.isfinite(missing_pupil_pct) else np.nan,
+        f"<= {max_missing_pupil_pct}",
+        "High missing-pupil percentages may affect pupil preprocessing and pupil-based modelling.",
+        warning=np.isfinite(missing_pupil_pct) and missing_pupil_pct > max_missing_pupil_pct,
+    )
+    add(
+        "C012",
+        "Off-screen gaze percentage acceptable",
+        (not np.isfinite(offscreen_gaze_pct)) or offscreen_gaze_pct <= max_offscreen_gaze_pct,
+        "warning",
+        round(offscreen_gaze_pct, 3) if np.isfinite(offscreen_gaze_pct) else np.nan,
+        f"<= {max_offscreen_gaze_pct}",
+        "High off-screen gaze percentages may indicate calibration, stimulus, or participant-quality problems.",
+        warning=np.isfinite(offscreen_gaze_pct) and offscreen_gaze_pct > max_offscreen_gaze_pct,
+    )
+    add(
+        "C013",
+        "AOI samples available",
+        has_aoi,
+        "error" if require_aoi else "warning",
+        has_aoi,
+        "required" if require_aoi else "recommended",
+        "Real AOI samples are required only for AOI-based analyses.",
+        warning=(not require_aoi and not has_aoi),
+    )
+
+    if aoi_count is not None and aoi_current is not None:
+        count_numeric = pd.to_numeric(aoi_count, errors="coerce")
+        aoi_mismatch = int(
+            (count_numeric.notna() & count_numeric.ne(real_aoi_flag.astype(int))).sum()
+        )
+    else:
+        aoi_mismatch = np.nan
+    add(
+        "C014",
+        "AOI count matches AOI state",
+        np.isfinite(aoi_mismatch) and aoi_mismatch == 0,
+        "error",
+        aoi_mismatch,
+        "0 mismatches",
+        "`aoi_count` should equal 1 only for real AOI samples and 0 otherwise.",
+    )
+
+    offscreen_mismatch = np.nan
+    if all(
+        v is not None for v in (x, y, missing_gaze, gaze_offscreen, screen_width, screen_height)
+    ):
+        sw = pd.to_numeric(screen_width, errors="coerce").dropna().unique()
+        sh = pd.to_numeric(screen_height, errors="coerce").dropna().unique()
+        if len(sw) == 1 and len(sh) == 1:
+            mg = _gp3_qc_r_as_bool_series(missing_gaze, df.index).fillna(False)
+            go = _gp3_qc_r_as_bool_series(gaze_offscreen, df.index)
+            xn = pd.to_numeric(x, errors="coerce")
+            yn = pd.to_numeric(y, errors="coerce")
+            expected = (
+                (~mg)
+                & xn.notna()
+                & yn.notna()
+                & (xn.lt(0) | xn.gt(sw[0]) | yn.lt(0) | yn.gt(sh[0]))
+            )
+            comparable = go.notna()
+            offscreen_mismatch = int(
+                (go.loc[comparable].astype(bool) != expected.loc[comparable]).sum()
+            )
+    add(
+        "C015",
+        "Off-screen flag matches screen bounds",
+        np.isfinite(offscreen_mismatch) and offscreen_mismatch == 0,
+        "warning",
+        "not checked" if not np.isfinite(offscreen_mismatch) else offscreen_mismatch,
+        "0 mismatches",
+        "When screen dimensions are available, `gaze_offscreen` should match the x/y screen bounds.",
+        warning=not np.isfinite(offscreen_mismatch),
+    )
+
+    checks_df = pd.DataFrame(checks)
+    failed = checks_df.loc[checks_df["status"].eq("fail")].reset_index(drop=True)
+    warnings = checks_df.loc[checks_df["status"].eq("warning")].reset_index(drop=True)
+    summary = pd.DataFrame(
         [
-            {"check": "nonempty", "passed": len(df) > 0, "detail": f"n={len(df)}"},
             {
-                "check": "unique_columns",
-                "passed": not df.columns.duplicated().any(),
-                "detail": "no duplicate names"
-                if not df.columns.duplicated().any()
-                else "duplicates present",
-            },
+                "validation_passed": len(failed) == 0,
+                "n_checks": len(checks_df),
+                "n_passed": int(checks_df["status"].eq("pass").sum()),
+                "n_failed": len(failed),
+                "n_warnings": len(warnings),
+                "n_rows": n_rows,
+                "n_subjects": n_subjects,
+                "n_media": n_media,
+                "time_min": time_min,
+                "time_max": time_max,
+                "time_span": time_max - time_min
+                if np.isfinite(time_min) and np.isfinite(time_max)
+                else np.nan,
+                "valid_sample_pct": valid_sample_pct,
+                "missing_gaze_pct": missing_gaze_pct,
+                "missing_pupil_pct": missing_pupil_pct,
+                "offscreen_gaze_pct": offscreen_gaze_pct,
+                "has_pupil": has_pupil,
+                "has_aoi": has_aoi,
+            }
         ]
     )
-    table = pd.DataFrame(checks)
-    return {
-        "valid": bool(table["passed"].all()),
-        "summary": result_table(
-            n_rows=len(df),
-            n_columns=df.shape[1],
-            n_checks=len(table),
-            n_failed=int((~table["passed"]).sum()),
-        ),
-        "checks": table,
+    result = {
+        "summary": summary,
+        "checks": checks_df,
+        "failed_checks": failed,
+        "warning_checks": warnings,
+        "column_map": column_map,
+        "valid": bool(len(failed) == 0),
     }
+    if fail_on_error and len(failed):
+        raise ValueError(f"master failed validation with {len(failed)} failing check(s)")
+    return result
 
 
 def audit_gazepoint_master(data) -> dict[str, pd.DataFrame]:
@@ -2015,35 +2704,626 @@ def summarise_gazepoint_qc_status(qc) -> pd.DataFrame:
 summarize_gazepoint_qc_status = summarise_gazepoint_qc_status
 
 
-def check_gazepoint_real_data_readiness(data) -> dict[str, Any]:
-    validation = validate_gazepoint_master(as_gazepoint_master(data), required=("subject", "time"))
+def check_gazepoint_real_data_readiness(
+    data,
+    *,
+    analysis_type=_GP3_QC_R_UNSET,
+    participant_col=_GP3_QC_R_UNSET,
+    trial_col=_GP3_QC_R_UNSET,
+    time_col=_GP3_QC_R_UNSET,
+    condition_col=_GP3_QC_R_UNSET,
+    stimulus_col=_GP3_QC_R_UNSET,
+    aoi_col=_GP3_QC_R_UNSET,
+    pupil_col=_GP3_QC_R_UNSET,
+    gaze_x_col=_GP3_QC_R_UNSET,
+    gaze_y_col=_GP3_QC_R_UNSET,
+    tracking_valid_col=_GP3_QC_R_UNSET,
+    required_cols=_GP3_QC_R_UNSET,
+    audit_objects=_GP3_QC_R_UNSET,
+    min_rows=_GP3_QC_R_UNSET,
+    min_participants=_GP3_QC_R_UNSET,
+    min_trials=_GP3_QC_R_UNSET,
+    max_missing_pupil_prop=_GP3_QC_R_UNSET,
+    max_missing_gaze_prop=_GP3_QC_R_UNSET,
+    max_condition_imbalance_ratio=_GP3_QC_R_UNSET,
+    name=_GP3_QC_R_UNSET,
+) -> dict[str, Any]:
+    """Check real-data readiness using legacy or R v2.3.0 gate semantics."""
+    r_mode = any(
+        value is not _GP3_QC_R_UNSET
+        for value in (
+            analysis_type,
+            participant_col,
+            trial_col,
+            time_col,
+            condition_col,
+            stimulus_col,
+            aoi_col,
+            pupil_col,
+            gaze_x_col,
+            gaze_y_col,
+            tracking_valid_col,
+            required_cols,
+            audit_objects,
+            min_rows,
+            min_participants,
+            min_trials,
+            max_missing_pupil_prop,
+            max_missing_gaze_prop,
+            max_condition_imbalance_ratio,
+            name,
+        )
+    )
+    if not r_mode:
+        validation = validate_gazepoint_master(
+            as_gazepoint_master(data), required=("subject", "time")
+        )
+        df = ensure_dataframe(data, copy=False)
+        has_gaze = infer_column(df, "x") is not None and infer_column(df, "y") is not None
+        has_pupil = infer_column(df, "pupil") is not None or (
+            infer_column(df, "left_pupil") and infer_column(df, "right_pupil")
+        )
+        checks = validation["checks"].copy()
+        checks = pd.concat(
+            [
+                checks,
+                pd.DataFrame(
+                    [
+                        {
+                            "check": "gaze_coordinates",
+                            "passed": has_gaze,
+                            "detail": "available" if has_gaze else "missing",
+                        },
+                        {
+                            "check": "pupil_signal",
+                            "passed": bool(has_pupil),
+                            "detail": "available" if has_pupil else "missing",
+                        },
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+        return {"ready": bool(checks["passed"].all()), "checks": checks}
+
     df = ensure_dataframe(data, copy=False)
-    has_gaze = infer_column(df, "x") is not None and infer_column(df, "y") is not None
-    has_pupil = infer_column(df, "pupil") is not None or (
-        infer_column(df, "left_pupil") and infer_column(df, "right_pupil")
+    analysis_type = "general" if analysis_type is _GP3_QC_R_UNSET else analysis_type
+    if analysis_type not in {"general", "pupil", "aoi", "combined"}:
+        raise ValueError("analysis_type must be general, pupil, aoi, or combined")
+    defaults = {
+        "participant_col": None,
+        "trial_col": None,
+        "time_col": None,
+        "condition_col": None,
+        "stimulus_col": None,
+        "aoi_col": None,
+        "pupil_col": None,
+        "gaze_x_col": None,
+        "gaze_y_col": None,
+        "tracking_valid_col": None,
+        "required_cols": [],
+        "audit_objects": None,
+        "min_rows": 1,
+        "min_participants": 1,
+        "min_trials": 1,
+        "max_missing_pupil_prop": 0.40,
+        "max_missing_gaze_prop": 0.40,
+        "max_condition_imbalance_ratio": 3.0,
+        "name": "gazepoint_real_data_readiness_gate",
+    }
+    participant_col = (
+        defaults["participant_col"] if participant_col is _GP3_QC_R_UNSET else participant_col
     )
-    checks = validation["checks"].copy()
-    checks = pd.concat(
+    trial_col = defaults["trial_col"] if trial_col is _GP3_QC_R_UNSET else trial_col
+    time_col = defaults["time_col"] if time_col is _GP3_QC_R_UNSET else time_col
+    condition_col = defaults["condition_col"] if condition_col is _GP3_QC_R_UNSET else condition_col
+    stimulus_col = defaults["stimulus_col"] if stimulus_col is _GP3_QC_R_UNSET else stimulus_col
+    aoi_col = defaults["aoi_col"] if aoi_col is _GP3_QC_R_UNSET else aoi_col
+    pupil_col = defaults["pupil_col"] if pupil_col is _GP3_QC_R_UNSET else pupil_col
+    gaze_x_col = defaults["gaze_x_col"] if gaze_x_col is _GP3_QC_R_UNSET else gaze_x_col
+    gaze_y_col = defaults["gaze_y_col"] if gaze_y_col is _GP3_QC_R_UNSET else gaze_y_col
+    tracking_valid_col = (
+        defaults["tracking_valid_col"]
+        if tracking_valid_col is _GP3_QC_R_UNSET
+        else tracking_valid_col
+    )
+    required_cols = (
+        defaults["required_cols"]
+        if required_cols is _GP3_QC_R_UNSET
+        else _gp3_qc_r_list(required_cols)
+    )
+    audit_objects = defaults["audit_objects"] if audit_objects is _GP3_QC_R_UNSET else audit_objects
+    min_rows = defaults["min_rows"] if min_rows is _GP3_QC_R_UNSET else int(min_rows)
+    min_participants = (
+        defaults["min_participants"]
+        if min_participants is _GP3_QC_R_UNSET
+        else int(min_participants)
+    )
+    min_trials = defaults["min_trials"] if min_trials is _GP3_QC_R_UNSET else int(min_trials)
+    max_missing_pupil_prop = (
+        defaults["max_missing_pupil_prop"]
+        if max_missing_pupil_prop is _GP3_QC_R_UNSET
+        else float(max_missing_pupil_prop)
+    )
+    max_missing_gaze_prop = (
+        defaults["max_missing_gaze_prop"]
+        if max_missing_gaze_prop is _GP3_QC_R_UNSET
+        else float(max_missing_gaze_prop)
+    )
+    max_condition_imbalance_ratio = (
+        defaults["max_condition_imbalance_ratio"]
+        if max_condition_imbalance_ratio is _GP3_QC_R_UNSET
+        else float(max_condition_imbalance_ratio)
+    )
+    name = defaults["name"] if name is _GP3_QC_R_UNSET else name
+
+    names_data = set(df.columns)
+
+    def resolve(current, candidates):
+        if current is not None:
+            if current not in names_data:
+                raise KeyError(f"Missing required column: {current}")
+            return current
+        return next((c for c in candidates if c in names_data), None)
+
+    participant_col = resolve(
+        participant_col,
+        ["subject", "participant", "participant_id", "pID", "USER_FILE", "user", "recording_id"],
+    )
+    trial_col = resolve(
+        trial_col,
+        ["trial_global", "trial", "trial_id", "TRIAL_INDEX", "item_id", "media_id", "MEDIA_ID"],
+    )
+    time_col = resolve(
+        time_col, ["time", "time_ms", "timestamp", "TIMESTAMP", "TIME", "sample_index", "CNT"]
+    )
+    condition_col = resolve(
+        condition_col, ["condition", "CONDITION", "group", "GROUP", "trial_type"]
+    )
+    stimulus_col = resolve(
+        stimulus_col,
         [
-            checks,
-            pd.DataFrame(
-                [
-                    {
-                        "check": "gaze_coordinates",
-                        "passed": has_gaze,
-                        "detail": "available" if has_gaze else "missing",
-                    },
-                    {
-                        "check": "pupil_signal",
-                        "passed": bool(has_pupil),
-                        "detail": "available" if has_pupil else "missing",
-                    },
-                ]
-            ),
+            "stimulus",
+            "stimulus_id",
+            "stimulus_file",
+            "image_file",
+            "image",
+            "media",
+            "media_id",
+            "MEDIA_ID",
         ],
-        ignore_index=True,
     )
-    return {"ready": bool(checks["passed"].all()), "checks": checks}
+    aoi_col = resolve(
+        aoi_col,
+        [
+            "aoi",
+            "AOI",
+            "aoi_label",
+            "AOI_LABEL",
+            "aoi_name",
+            "AOI_NAME",
+            "CURRENT_FIX_INTEREST_AREA_LABEL",
+        ],
+    )
+    pupil_col = resolve(
+        pupil_col,
+        [
+            "pupil_bc_processed",
+            "pupil_smoothed",
+            "pupil_interpolated",
+            "pupil_clean",
+            "pupil_for_preprocessing",
+            "pupil_raw",
+            "mean_pupil",
+            "pupil",
+            "LPD",
+            "RPD",
+        ],
+    )
+    gaze_x_col = resolve(gaze_x_col, ["gaze_x", "x", "X", "FPOGX", "LPOGX", "RPOGX", "POGX"])
+    gaze_y_col = resolve(gaze_y_col, ["gaze_y", "y", "Y", "FPOGY", "LPOGY", "RPOGY", "POGY"])
+    tracking_valid_col = resolve(
+        tracking_valid_col,
+        ["tracking_valid", "valid_gaze", "is_valid", "valid", "FPOGV", "LPOGV", "RPOGV", "POGV"],
+    )
+
+    detected = {
+        "participant_col": participant_col,
+        "trial_col": trial_col,
+        "time_col": time_col,
+        "condition_col": condition_col,
+        "stimulus_col": stimulus_col,
+        "aoi_col": aoi_col,
+        "pupil_col": pupil_col,
+        "gaze_x_col": gaze_x_col,
+        "gaze_y_col": gaze_y_col,
+        "tracking_valid_col": tracking_valid_col,
+    }
+    detected_columns = pd.DataFrame(
+        [
+            {"role": role, "column": col if col is not None else pd.NA, "detected": col is not None}
+            for role, col in detected.items()
+        ]
+    )
+
+    checks = []
+
+    def add(check_id, area, status, severity, message, observed=np.nan, threshold=np.nan):
+        checks.append(
+            {
+                "check_id": check_id,
+                "check_area": area,
+                "status": status,
+                "severity": severity,
+                "message": message,
+                "observed": observed,
+                "threshold": threshold,
+            }
+        )
+
+    add(
+        "data_non_empty",
+        "structure",
+        "pass" if len(df) else "fail",
+        "blocking",
+        "Data contain at least one row." if len(df) else "Data contain no rows.",
+        len(df),
+        1,
+    )
+    add(
+        "minimum_rows",
+        "structure",
+        "pass" if len(df) >= min_rows else "fail",
+        "blocking",
+        f"Rows available: {len(df)}. Minimum required: {min_rows}.",
+        len(df),
+        min_rows,
+    )
+    required_roles = {
+        "general": {
+            "participant_col": True,
+            "trial_col": True,
+            "time_col": False,
+            "aoi_col": False,
+            "pupil_col": False,
+        },
+        "pupil": {
+            "participant_col": True,
+            "trial_col": True,
+            "time_col": True,
+            "aoi_col": False,
+            "pupil_col": True,
+        },
+        "aoi": {
+            "participant_col": True,
+            "trial_col": True,
+            "time_col": False,
+            "aoi_col": True,
+            "pupil_col": False,
+        },
+        "combined": {
+            "participant_col": True,
+            "trial_col": True,
+            "time_col": True,
+            "aoi_col": True,
+            "pupil_col": True,
+        },
+    }[analysis_type]
+    for role, required_role in required_roles.items():
+        col = detected[role]
+        add(
+            f"required_{role}",
+            "required_columns",
+            "pass" if col is not None else ("fail" if required_role else "info"),
+            "blocking" if required_role else "informational",
+            f"Detected required role `{role}` as column `{col}`."
+            if col is not None
+            else (
+                f"Required role `{role}` was not detected."
+                if required_role
+                else f"Optional role `{role}` was not detected."
+            ),
+            1 if col is not None else 0,
+            1 if required_role else 0,
+        )
+    missing_user = [c for c in required_cols if c not in df.columns]
+    add(
+        "user_required_columns",
+        "required_columns",
+        "pass" if not missing_user else "fail",
+        "blocking",
+        "All user-specified required columns are present."
+        if not missing_user
+        else "Missing user-specified required columns: " + ", ".join(missing_user),
+        len(required_cols) - len(missing_user),
+        len(required_cols),
+    )
+
+    n_participants = int(df[participant_col].dropna().nunique()) if participant_col else np.nan
+    if participant_col and trial_col:
+        trial_keys = df[[participant_col, trial_col]].astype("string").agg("||".join, axis=1)
+        n_trials = int(trial_keys.dropna().nunique())
+    else:
+        n_trials = np.nan
+    n_conditions = int(df[condition_col].dropna().nunique()) if condition_col else np.nan
+    n_stimuli = int(df[stimulus_col].dropna().nunique()) if stimulus_col else np.nan
+    add(
+        "minimum_participants",
+        "sample_structure",
+        "pass" if np.isfinite(n_participants) and n_participants >= min_participants else "fail",
+        "blocking",
+        f"Participants available: {n_participants}. Minimum required: {min_participants}.",
+        n_participants,
+        min_participants,
+    )
+    add(
+        "minimum_trials",
+        "sample_structure",
+        "pass" if np.isfinite(n_trials) and n_trials >= min_trials else "fail",
+        "blocking",
+        f"Participant-trial units available: {n_trials}. Minimum required: {min_trials}.",
+        n_trials,
+        min_trials,
+    )
+
+    if time_col:
+        times = pd.to_numeric(df[time_col], errors="coerce")
+        bad_time = float((times.isna() | ~np.isfinite(times)).mean())
+        add(
+            "finite_time_values",
+            "time_structure",
+            "pass" if bad_time == 0 else "fail",
+            "blocking",
+            f"Proportion of missing/non-finite time values: {bad_time:.4f}.",
+            bad_time,
+            0,
+        )
+        if participant_col and trial_col:
+            key = df[[participant_col, trial_col, time_col]].astype("string")
+            duplicate_prop = float(key.duplicated().mean())
+            add(
+                "duplicate_participant_trial_time",
+                "time_structure",
+                "pass" if duplicate_prop == 0 else "warn",
+                "warning",
+                f"Proportion of duplicated participant-trial-time keys: {duplicate_prop:.4f}.",
+                duplicate_prop,
+                0,
+            )
+
+    if pupil_col:
+        pupil_values = pd.to_numeric(df[pupil_col], errors="coerce")
+        prop_missing_pupil = float((pupil_values.isna() | ~np.isfinite(pupil_values)).mean())
+        pupil_required = analysis_type in {"pupil", "combined"}
+        status = (
+            "pass"
+            if prop_missing_pupil <= max_missing_pupil_prop
+            else ("fail" if pupil_required else "warn")
+        )
+        add(
+            "pupil_missingness",
+            "signal_quality",
+            status,
+            "blocking" if pupil_required else "warning",
+            f"Pupil missingness/non-finite proportion: {prop_missing_pupil:.4f}. Threshold: {max_missing_pupil_prop}.",
+            prop_missing_pupil,
+            max_missing_pupil_prop,
+        )
+
+    if gaze_x_col and gaze_y_col:
+        gx = pd.to_numeric(df[gaze_x_col], errors="coerce")
+        gy = pd.to_numeric(df[gaze_y_col], errors="coerce")
+        missing_gaze = float((gx.isna() | gy.isna() | ~np.isfinite(gx) | ~np.isfinite(gy)).mean())
+        add(
+            "gaze_coordinate_missingness",
+            "signal_quality",
+            "pass" if missing_gaze <= max_missing_gaze_prop else "warn",
+            "warning",
+            f"Gaze-coordinate missingness/non-finite proportion: {missing_gaze:.4f}. Threshold: {max_missing_gaze_prop}.",
+            missing_gaze,
+            max_missing_gaze_prop,
+        )
+    elif bool(gaze_x_col) ^ bool(gaze_y_col):
+        add(
+            "paired_gaze_coordinates",
+            "signal_quality",
+            "warn",
+            "warning",
+            "Only one gaze-coordinate column was detected; both x and y are preferable for gaze-quality checks.",
+            1,
+            2,
+        )
+
+    if tracking_valid_col:
+        valid = _gp3_qc_r_as_bool_series(df[tracking_valid_col], df.index)
+        prop_invalid = float((~valid.fillna(False)).mean())
+        add(
+            "tracking_validity",
+            "signal_quality",
+            "pass" if prop_invalid <= max_missing_gaze_prop else "warn",
+            "warning",
+            f"Tracking-invalid proportion: {prop_invalid:.4f}. Threshold: {max_missing_gaze_prop}.",
+            prop_invalid,
+            max_missing_gaze_prop,
+        )
+
+    if condition_col:
+        condition_summary = (
+            df[condition_col]
+            .astype("string")
+            .dropna()
+            .value_counts()
+            .rename_axis("condition")
+            .reset_index(name="n_rows")
+        )
+        condition_summary["proportion"] = (
+            condition_summary["n_rows"] / condition_summary["n_rows"].sum()
+        )
+        if len(condition_summary) <= 1:
+            add(
+                "condition_count",
+                "design_balance",
+                "warn",
+                "warning",
+                "Only one condition/group was detected.",
+                len(condition_summary),
+                2,
+            )
+        else:
+            imbalance = float(condition_summary["n_rows"].max() / condition_summary["n_rows"].min())
+            add(
+                "condition_imbalance",
+                "design_balance",
+                "pass" if imbalance <= max_condition_imbalance_ratio else "warn",
+                "warning",
+                f"Condition row-count imbalance ratio: {imbalance:.4f}. Threshold: {max_condition_imbalance_ratio}.",
+                imbalance,
+                max_condition_imbalance_ratio,
+            )
+    else:
+        condition_summary = pd.DataFrame(columns=["condition", "n_rows", "proportion"])
+        add(
+            "condition_detected",
+            "design_balance",
+            "info",
+            "informational",
+            "No condition/group column was detected.",
+            0,
+            0,
+        )
+
+    if audit_objects is not None:
+        objs = audit_objects if isinstance(audit_objects, (list, tuple)) else [audit_objects]
+        for i, obj in enumerate(objs, 1):
+            overview = (
+                obj.get("overview")
+                if isinstance(obj, dict)
+                else (obj if isinstance(obj, pd.DataFrame) else None)
+            )
+            status = "info"
+            if isinstance(overview, pd.DataFrame) and len(overview):
+                values = " ".join(str(v).lower() for v in overview.iloc[0].tolist())
+                if any(x in values for x in ["fail", "not ready", "false"]):
+                    status = "fail"
+                elif any(x in values for x in ["warn", "review"]):
+                    status = "warn"
+                elif any(x in values for x in ["pass", "ready", "ok", "true"]):
+                    status = "pass"
+            add(
+                f"audit_object_{i}",
+                "upstream_audits",
+                status,
+                "blocking"
+                if status == "fail"
+                else ("warning" if status == "warn" else "informational"),
+                f"Upstream audit object {i} interpreted as status `{status}`.",
+            )
+
+    checks_df = pd.DataFrame(checks)
+    order = pd.Categorical(checks_df["status"], ["fail", "warn", "pass", "info"], ordered=True)
+    checks_df = (
+        checks_df.assign(_order=order)
+        .sort_values(["_order", "check_area", "check_id"])
+        .drop(columns="_order")
+        .reset_index(drop=True)
+    )
+    counts = checks_df["status"].value_counts()
+    n_fail = int(counts.get("fail", 0))
+    n_warn = int(counts.get("warn", 0))
+    n_pass = int(counts.get("pass", 0))
+    n_info = int(counts.get("info", 0))
+    readiness_status = "fail" if n_fail else ("warn" if n_warn else "pass")
+    decision_message = (
+        f"Not ready for real-data analysis: {n_fail} blocking issue(s) must be resolved."
+        if readiness_status == "fail"
+        else f"Conditionally ready: no blocking issues, but {n_warn} warning-level issue(s) should be reviewed."
+        if readiness_status == "warn"
+        else "Ready for real-data analysis: no blocking or warning-level issues detected."
+    )
+    gate = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "analysis_type": analysis_type,
+                "readiness_status": readiness_status,
+                "ready_for_real_data_analysis": n_fail == 0,
+                "n_fail": n_fail,
+                "n_warn": n_warn,
+                "n_pass": n_pass,
+                "n_info": n_info,
+                "decision_message": decision_message,
+            }
+        ]
+    )
+    data_summary = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "n_rows": len(df),
+                "n_columns": df.shape[1],
+                "n_participants": n_participants,
+                "n_trial_units": n_trials,
+                "n_conditions": n_conditions,
+                "n_stimuli": n_stimuli,
+                "analysis_type": analysis_type,
+            }
+        ]
+    )
+    overview = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "analysis_type": analysis_type,
+                "readiness_status": readiness_status,
+                "ready_for_real_data_analysis": n_fail == 0,
+                "n_rows": len(df),
+                "n_participants": n_participants,
+                "n_trial_units": n_trials,
+                "n_fail": n_fail,
+                "n_warn": n_warn,
+                "n_pass": n_pass,
+                "n_info": n_info,
+            }
+        ]
+    )
+    settings_map = {
+        "analysis_type": analysis_type,
+        "participant_col": participant_col,
+        "trial_col": trial_col,
+        "time_col": time_col,
+        "condition_col": condition_col,
+        "stimulus_col": stimulus_col,
+        "aoi_col": aoi_col,
+        "pupil_col": pupil_col,
+        "gaze_x_col": gaze_x_col,
+        "gaze_y_col": gaze_y_col,
+        "tracking_valid_col": tracking_valid_col,
+        "required_cols": ", ".join(required_cols),
+        "min_rows": min_rows,
+        "min_participants": min_participants,
+        "min_trials": min_trials,
+        "max_missing_pupil_prop": max_missing_pupil_prop,
+        "max_missing_gaze_prop": max_missing_gaze_prop,
+        "max_condition_imbalance_ratio": max_condition_imbalance_ratio,
+        "name": name,
+    }
+    settings = pd.DataFrame(
+        {
+            "setting": list(settings_map),
+            "value": [str(v) if v is not None else pd.NA for v in settings_map.values()],
+        }
+    )
+    return {
+        "overview": overview,
+        "gate_decision": gate,
+        "checks": checks_df,
+        "detected_columns": detected_columns,
+        "data_summary": data_summary,
+        "condition_summary": condition_summary,
+        "settings": settings,
+        "ready": bool(n_fail == 0),
+        "gp3_class": "gp3_real_data_readiness_gate",
+    }
 
 
 def recommend_gazepoint_exclusions(
