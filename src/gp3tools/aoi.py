@@ -684,6 +684,86 @@ def add_gazepoint_polygon_aoi(
     return result
 
 
+def _gp3_dynamic_match_time(value, definitions, mode):
+    if not np.isfinite(value) or len(definitions) == 0:
+        return np.nan
+    values = np.asarray(definitions, dtype=float)
+    if mode == "nearest":
+        # R's which.min() resolves exact distance ties to the first sorted time.
+        return float(values[int(np.argmin(np.abs(values - value)))])
+    if mode == "previous":
+        eligible = values[values <= value]
+        return float(np.max(eligible)) if len(eligible) else np.nan
+    eligible = values[values >= value]
+    return float(np.min(eligible)) if len(eligible) else np.nan
+
+
+def _gp3_dynamic_group_keys(frame, cols):
+    if not cols:
+        return pd.Series("__all__", index=frame.index, dtype="string")
+    return frame[list(cols)].astype("string").fillna("<NA>").agg("\x1f".join, axis=1)
+
+
+def _gp3_dynamic_apply_membership(
+    frame,
+    membership,
+    names,
+    *,
+    output,
+    prefix,
+    label_col,
+    outside_label,
+    overlap,
+    include_overlap_count,
+    valid_xy,
+):
+    counts = membership.sum(axis=1).astype(int)
+    if overlap == "error" and np.any(counts > 1):
+        raise ValueError(f"{int(np.sum(counts > 1))} sample(s) fall inside overlapping AOIs")
+    out = frame.copy()
+    if output in {"logical", "both"}:
+        logical_names = [prefix + x for x in _gp3_polygon_r_make_names(names)]
+        for j, col in enumerate(logical_names):
+            out[col] = membership[:, j]
+    if output in {"label", "both"}:
+        labels = np.full(len(out), outside_label, dtype=object)
+        labels[~valid_xy] = pd.NA
+        if overlap == "last":
+            for j, name in enumerate(names):
+                labels[membership[:, j]] = name
+        else:
+            available = valid_xy.copy()
+            for j, name in enumerate(names):
+                hit = membership[:, j] & available
+                labels[hit] = name
+                available[hit] = False
+        out[label_col] = labels
+    if include_overlap_count:
+        out["aoi_overlap_count"] = counts
+    return out
+
+
+def _gp3_margin_resolve_column(frame, explicit, candidates, *, required, arg):
+    if explicit is not None:
+        if not isinstance(explicit, str) or not explicit:
+            raise ValueError(f"{arg} must be a non-empty column name or None")
+        if explicit not in frame:
+            if required:
+                raise KeyError(f"Missing required column: {explicit}")
+            return None
+        return explicit
+    found = next((c for c in candidates if c in frame), None)
+    if required and found is None:
+        raise KeyError(f"Could not resolve {arg}")
+    return found
+
+
+def _gp3_margin_safe_stat(values, func):
+    x = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(float)
+    x = x[np.isfinite(x)]
+    return float(func(x)) if len(x) else np.nan
+
+
 def add_gazepoint_dynamic_aoi(
     data,
     aoi_data,
@@ -693,33 +773,241 @@ def add_gazepoint_dynamic_aoi(
     aoi_time_col=None,
     output_col="aoi_current",
     tolerance=None,
+    *,
+    aoi_name_col=None,
+    shape=None,
+    group_cols=None,
+    match=None,
+    max_time_gap=None,
+    left_col="left",
+    right_col="right",
+    top_col="top",
+    bottom_col="bottom",
+    vertex_x_col="vertex_x",
+    vertex_y_col="vertex_y",
+    vertex_order_col=None,
+    output=None,
+    prefix="aoi_",
+    outside_label="outside",
+    overlap=None,
+    boundary="inside",
+    definition_time_col="aoi_definition_time",
+    time_gap_col="aoi_time_gap",
+    include_overlap_count=None,
 ) -> pd.DataFrame:
-    """Assign time-varying rectangular AOIs using nearest-time geometry rows."""
-    df = ensure_dataframe(data)
-    geom = ensure_dataframe(aoi_data, copy=False)
-    time_col = infer_column(df, "time", time_col, required=True)
-    aoi_time_col = infer_column(geom, "time", aoi_time_col, required=True)
-    x_col = infer_column(df, "x", x_col, required=True)
-    y_col = infer_column(df, "y", y_col, required=True)
-    name_col = next((c for c in ("aoi", "name", "label") if c in geom), None)
-    if name_col is None or not {"xmin", "xmax", "ymin", "ymax"}.issubset(geom):
-        raise ValueError("Dynamic AOI geometry requires aoi/name,xmin,xmax,ymin,ymax")
-    left = df.copy().sort_values(time_col)
-    right = geom.copy().sort_values(aoi_time_col)
-    merged = pd.merge_asof(
-        left,
-        right,
-        left_on=time_col,
-        right_on=aoi_time_col,
-        direction="nearest",
-        tolerance=tolerance,
-        suffixes=("", "_aoi"),
+    """Assign time-varying rectangular or polygon AOIs with R v2.3.0 semantics."""
+    r_mode = any(
+        (
+            aoi_name_col is not None,
+            shape is not None,
+            group_cols is not None,
+            match is not None,
+            max_time_gap is not None,
+            left_col != "left",
+            right_col != "right",
+            top_col != "top",
+            bottom_col != "bottom",
+            vertex_x_col != "vertex_x",
+            vertex_y_col != "vertex_y",
+            vertex_order_col is not None,
+            output is not None,
+            prefix != "aoi_",
+            outside_label != "outside",
+            overlap is not None,
+            boundary != "inside",
+            definition_time_col != "aoi_definition_time",
+            time_gap_col != "aoi_time_gap",
+            include_overlap_count is not None,
+        )
     )
-    x = finite_numeric(merged[x_col])
-    y = finite_numeric(merged[y_col])
-    inside = x.between(merged.xmin, merged.xmax) & y.between(merged.ymin, merged.ymax)
-    merged[output_col] = merged[name_col].where(inside, "outside")
-    return merged.sort_index()
+    if not r_mode:
+        df = ensure_dataframe(data)
+        geom = ensure_dataframe(aoi_data, copy=False)
+        time_col = infer_column(df, "time", time_col, required=True)
+        aoi_time_col = infer_column(geom, "time", aoi_time_col, required=True)
+        x_col = infer_column(df, "x", x_col, required=True)
+        y_col = infer_column(df, "y", y_col, required=True)
+        name_col = next((c for c in ("aoi", "name", "label") if c in geom), None)
+        if name_col is None or not {"xmin", "xmax", "ymin", "ymax"}.issubset(geom):
+            raise ValueError("Dynamic AOI geometry requires aoi/name,xmin,xmax,ymin,ymax")
+        left = df.copy().sort_values(time_col)
+        right = geom.copy().sort_values(aoi_time_col)
+        merged = pd.merge_asof(
+            left,
+            right,
+            left_on=time_col,
+            right_on=aoi_time_col,
+            direction="nearest",
+            tolerance=tolerance,
+            suffixes=("", "_aoi"),
+        )
+        x = finite_numeric(merged[x_col])
+        y = finite_numeric(merged[y_col])
+        inside = x.between(merged.xmin, merged.xmax) & y.between(merged.ymin, merged.ymax)
+        merged[output_col] = merged[name_col].where(inside, "outside")
+        return merged.sort_index()
+
+    frame = ensure_dataframe(data, copy=False)
+    defs = ensure_dataframe(aoi_data, copy=False)
+    time_col = "TIME" if time_col is None else time_col
+    x_col = "FPOGX" if x_col is None else x_col
+    y_col = "FPOGY" if y_col is None else y_col
+    aoi_time_col = "aoi_time" if aoi_time_col is None else aoi_time_col
+    aoi_name_col = "aoi_name" if aoi_name_col is None else aoi_name_col
+    shape = "auto" if shape is None else str(shape)
+    match = "nearest" if match is None else str(match)
+    max_time_gap = np.inf if max_time_gap is None else float(max_time_gap)
+    output = "label" if output is None else str(output)
+    overlap = "first" if overlap is None else str(overlap)
+    include_overlap_count = True if include_overlap_count is None else bool(include_overlap_count)
+    groups = (
+        []
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(dict.fromkeys(group_cols)))
+    )
+    if shape not in {"auto", "rectangle", "polygon"}:
+        raise ValueError("shape must be auto, rectangle, or polygon")
+    if match not in {"nearest", "previous", "next"}:
+        raise ValueError("match must be nearest, previous, or next")
+    if output not in {"label", "logical", "both"}:
+        raise ValueError("output must be label, logical, or both")
+    if overlap not in {"first", "last", "error"}:
+        raise ValueError("overlap must be first, last, or error")
+    if boundary not in {"inside", "outside"}:
+        raise ValueError("boundary must be inside or outside")
+    if not np.isfinite(max_time_gap) and not np.isinf(max_time_gap):
+        raise ValueError("max_time_gap must be non-negative or Inf")
+    if max_time_gap < 0:
+        raise ValueError("max_time_gap must be non-negative or Inf")
+    for col in [x_col, y_col, time_col, *groups]:
+        if col not in frame:
+            raise KeyError(f"Missing required column: {col}")
+    for col in [aoi_time_col, aoi_name_col, *groups]:
+        if col not in defs:
+            raise KeyError(f"Missing required AOI column: {col}")
+    rect_ok = {left_col, right_col, top_col, bottom_col}.issubset(defs.columns)
+    poly_ok = {vertex_x_col, vertex_y_col}.issubset(defs.columns)
+    resolved_shape = shape
+    if shape == "auto":
+        if rect_ok:
+            resolved_shape = "rectangle"
+        elif poly_ok:
+            resolved_shape = "polygon"
+        else:
+            raise ValueError("Could not infer dynamic AOI shape")
+    required_shape = (
+        [left_col, right_col, top_col, bottom_col]
+        if resolved_shape == "rectangle"
+        else [vertex_x_col, vertex_y_col]
+    )
+    if resolved_shape == "polygon" and vertex_order_col is not None:
+        required_shape.append(vertex_order_col)
+    missing = [c for c in required_shape if c not in defs]
+    if missing:
+        raise KeyError("Missing dynamic AOI geometry columns: " + ", ".join(missing))
+    names = defs[aoi_name_col].astype("string")
+    if names.isna().any() or names.str.strip().eq("").any():
+        raise ValueError("Dynamic AOI names must be non-missing and non-empty")
+    all_names = list(dict.fromkeys(names.astype(str).tolist()))
+    membership = np.zeros((len(frame), len(all_names)), dtype=bool)
+    matched_times = np.full(len(frame), np.nan)
+    time_gaps = np.full(len(frame), np.nan)
+    x_all = pd.to_numeric(frame[x_col], errors="coerce").to_numpy(float)
+    y_all = pd.to_numeric(frame[y_col], errors="coerce").to_numpy(float)
+    sample_times = pd.to_numeric(frame[time_col], errors="coerce").to_numpy(float)
+    definition_times = pd.to_numeric(defs[aoi_time_col], errors="coerce").to_numpy(float)
+    sample_keys = _gp3_dynamic_group_keys(frame, groups).to_numpy(dtype=str)
+    definition_keys = _gp3_dynamic_group_keys(defs, groups).to_numpy(dtype=str)
+    name_to_col = {name: i for i, name in enumerate(all_names)}
+    for key in pd.unique(sample_keys):
+        sample_idx = np.flatnonzero(sample_keys == key)
+        def_idx = np.flatnonzero(definition_keys == key)
+        available = np.unique(definition_times[def_idx][np.isfinite(definition_times[def_idx])])
+        if len(def_idx) == 0 or len(available) == 0:
+            continue
+        selected = np.asarray(
+            [_gp3_dynamic_match_time(v, available, match) for v in sample_times[sample_idx]],
+            dtype=float,
+        )
+        gaps = np.abs(sample_times[sample_idx] - selected)
+        valid = (
+            np.isfinite(sample_times[sample_idx])
+            & np.isfinite(selected)
+            & np.isfinite(gaps)
+            & (gaps <= max_time_gap)
+        )
+        selected[~valid] = np.nan
+        gaps[~valid] = np.nan
+        matched_times[sample_idx] = selected
+        time_gaps[sample_idx] = gaps
+        for definition_time in np.unique(selected[np.isfinite(selected)]):
+            local_sample = sample_idx[np.isfinite(selected) & (selected == definition_time)]
+            local_defs = defs.iloc[
+                def_idx[
+                    np.isfinite(definition_times[def_idx])
+                    & (definition_times[def_idx] == definition_time)
+                ]
+            ].copy()
+            if resolved_shape == "rectangle":
+                lx = pd.to_numeric(local_defs[left_col], errors="coerce").to_numpy(float)
+                rx = pd.to_numeric(local_defs[right_col], errors="coerce").to_numpy(float)
+                ty = pd.to_numeric(local_defs[top_col], errors="coerce").to_numpy(float)
+                by = pd.to_numeric(local_defs[bottom_col], errors="coerce").to_numpy(float)
+                if not np.isfinite(np.column_stack([lx, rx, ty, by])).all():
+                    raise ValueError("Dynamic AOI rectangle bounds must be finite")
+                for j, (_, row) in enumerate(local_defs.iterrows()):
+                    hit = (
+                        np.isfinite(x_all[local_sample])
+                        & np.isfinite(y_all[local_sample])
+                        & (x_all[local_sample] >= min(lx[j], rx[j]))
+                        & (x_all[local_sample] <= max(lx[j], rx[j]))
+                        & (y_all[local_sample] >= min(ty[j], by[j]))
+                        & (y_all[local_sample] <= max(ty[j], by[j]))
+                    )
+                    membership[local_sample, name_to_col[str(row[aoi_name_col])]] = hit
+            else:
+                definitions = _gp3_polygon_r_prepare(
+                    local_defs,
+                    aoi_col=aoi_name_col,
+                    vertex_x_col=vertex_x_col,
+                    vertex_y_col=vertex_y_col,
+                    vertex_order_col=vertex_order_col,
+                )
+                local_membership = _gp3_polygon_r_membership(
+                    x_all[local_sample], y_all[local_sample], definitions, boundary=boundary
+                )
+                for name in local_membership.columns:
+                    membership[local_sample, name_to_col[str(name)]] = local_membership[
+                        name
+                    ].to_numpy(bool)
+    out = _gp3_dynamic_apply_membership(
+        frame,
+        membership,
+        all_names,
+        output=output,
+        prefix=prefix,
+        label_col=output_col,
+        outside_label=outside_label,
+        overlap=overlap,
+        include_overlap_count=include_overlap_count,
+        valid_xy=np.isfinite(x_all) & np.isfinite(y_all),
+    )
+    out[definition_time_col] = matched_times
+    out[time_gap_col] = time_gaps
+    if output in {"label", "both"}:
+        out.loc[~np.isfinite(matched_times), output_col] = pd.NA
+    out.attrs.update(frame.attrs)
+    out.attrs["gazepoint_dynamic_aoi_settings"] = {
+        "shape": resolved_shape,
+        "group_cols": groups,
+        "match": match,
+        "max_time_gap": max_time_gap,
+        "aoi_time_col": aoi_time_col,
+        "aoi_name_col": aoi_name_col,
+        "definition_time_col": definition_time_col,
+        "time_gap_col": time_gap_col,
+    }
+    return out
 
 
 def _gp3_aoi_geometry_r_audit(
@@ -2507,25 +2795,348 @@ def audit_gazepoint_aoi_coding_matrix(
 
 
 def audit_gazepoint_aoi_margin_sensitivity(
-    data, aoi_geometry, margins=(-0.02, 0, 0.02), x_col=None, y_col=None
-) -> pd.DataFrame:
-    g = ensure_dataframe(aoi_geometry)
-    rows = []
-    for m in margins:
-        gm = g.copy()
-        gm["xmin"] -= m
-        gm["xmax"] += m
-        gm["ymin"] -= m
-        gm["ymax"] += m
-        assigned = add_gazepoint_aoi(data, x_col=x_col, y_col=y_col, aoi_geometry=gm)
-        rows.append(
+    data,
+    aoi_geometry,
+    margins=(-0.02, 0, 0.02),
+    x_col=None,
+    y_col=None,
+    *,
+    gaze_x_col=None,
+    gaze_y_col=None,
+    gaze_stimulus_col=None,
+    sample_id_cols=None,
+    geometry_aoi_col=None,
+    geometry_stimulus_col=None,
+    x_min_col=None,
+    y_min_col=None,
+    x_max_col=None,
+    y_max_col=None,
+    width_col=None,
+    height_col=None,
+    screen_x_range=(0, 1),
+    screen_y_range=(0, 1),
+    tie_method="ambiguous",
+    outside_label="outside",
+    ambiguous_label="ambiguous",
+    missing_label="missing_coordinate",
+    max_margin_change_prop=0.10,
+    max_ambiguous_prop=0.05,
+    ignore_invalid_geometry=True,
+):
+    """Audit AOI coding sensitivity to geometry expansion and contraction."""
+    r_mode = any(
+        (
+            gaze_x_col is not None,
+            gaze_y_col is not None,
+            gaze_stimulus_col is not None,
+            sample_id_cols is not None,
+            geometry_aoi_col is not None,
+            geometry_stimulus_col is not None,
+            x_min_col is not None,
+            y_min_col is not None,
+            x_max_col is not None,
+            y_max_col is not None,
+            width_col is not None,
+            height_col is not None,
+            tuple(screen_x_range) != (0, 1),
+            tuple(screen_y_range) != (0, 1),
+            tie_method != "ambiguous",
+            outside_label != "outside",
+            ambiguous_label != "ambiguous",
+            missing_label != "missing_coordinate",
+            max_margin_change_prop != 0.10,
+            max_ambiguous_prop != 0.05,
+            ignore_invalid_geometry is not True,
+        )
+    )
+    if not r_mode:
+        g = ensure_dataframe(aoi_geometry)
+        rows = []
+        for margin in margins:
+            gm = g.copy()
+            gm["xmin"] -= margin
+            gm["xmax"] += margin
+            gm["ymin"] -= margin
+            gm["ymax"] += margin
+            assigned = add_gazepoint_aoi(data, x_col=x_col, y_col=y_col, aoi_geometry=gm)
+            rows.append(
+                {
+                    "margin": margin,
+                    "assigned_prop": float(assigned.aoi_current.notna().mean()),
+                    "outside_prop": float(
+                        assigned.aoi_current.astype("string").eq("outside").mean()
+                    ),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    gaze = ensure_dataframe(data, copy=False)
+    geometry = ensure_dataframe(aoi_geometry, copy=False)
+    if gaze.empty or geometry.empty:
+        raise ValueError("gaze_data and aoi_geometry must contain at least one row")
+    gaze_x_col = _gp3_margin_resolve_column(
+        gaze,
+        gaze_x_col,
+        ("x", "X", "gaze_x", "gaze_x_norm", "FPOGX", "BPOGX"),
+        required=True,
+        arg="gaze_x_col",
+    )
+    gaze_y_col = _gp3_margin_resolve_column(
+        gaze,
+        gaze_y_col,
+        ("y", "Y", "gaze_y", "gaze_y_norm", "FPOGY", "BPOGY"),
+        required=True,
+        arg="gaze_y_col",
+    )
+    gaze_stimulus_col = _gp3_margin_resolve_column(
+        gaze,
+        gaze_stimulus_col,
+        ("media_id", "MEDIA_ID", "stimulus", "stimulus_id"),
+        required=False,
+        arg="gaze_stimulus_col",
+    )
+    ids = (
+        []
+        if sample_id_cols is None
+        else ([sample_id_cols] if isinstance(sample_id_cols, str) else list(sample_id_cols))
+    )
+    ids = [c for c in ids if c in gaze]
+    margins_array = np.asarray(margins, dtype=float)
+    if margins_array.ndim != 1 or not np.isfinite(margins_array).all():
+        raise ValueError("margins must be a finite numeric vector")
+    if not np.isfinite(max_margin_change_prop) or max_margin_change_prop < 0:
+        raise ValueError("max_margin_change_prop must be non-negative")
+    if not np.isfinite(max_ambiguous_prop) or not 0 <= max_ambiguous_prop <= 1:
+        raise ValueError("max_ambiguous_prop must be in [0, 1]")
+    if tie_method not in {"ambiguous", "first"}:
+        raise ValueError("tie_method must be ambiguous or first")
+    if not isinstance(ignore_invalid_geometry, (bool, np.bool_)):
+        raise ValueError("ignore_invalid_geometry must be boolean")
+    geometry_audit = _gp3_aoi_geometry_r_audit(
+        geometry,
+        aoi_col=geometry_aoi_col,
+        stimulus_col=geometry_stimulus_col,
+        x_min_col=x_min_col,
+        y_min_col=y_min_col,
+        x_max_col=x_max_col,
+        y_max_col=y_max_col,
+        x_col=x_col,
+        y_col=y_col,
+        width_col=width_col,
+        height_col=height_col,
+        screen_x_range=screen_x_range,
+        screen_y_range=screen_y_range,
+        require_within_screen=False,
+    )
+    geometry_summary = geometry_audit["geometry_summary"].copy()
+    settings_lookup = dict(
+        zip(geometry_audit["settings"]["setting"], geometry_audit["settings"]["value"], strict=True)
+    )
+    resolved_aoi = str(settings_lookup["aoi_col"])
+    resolved_stimulus = settings_lookup["stimulus_col"]
+    if pd.isna(resolved_stimulus) or str(resolved_stimulus) == "":
+        resolved_stimulus = None
+    else:
+        resolved_stimulus = str(resolved_stimulus)
+    if (
+        resolved_stimulus is not None
+        and gaze_stimulus_col is None
+        and geometry_summary[resolved_stimulus].nunique(dropna=False) > 1
+    ):
+        raise ValueError("gaze_stimulus_col is required when geometry contains multiple stimuli")
+    geometry_for_coding = geometry_summary
+    if ignore_invalid_geometry:
+        geometry_for_coding = geometry_for_coding.loc[
+            ~geometry_for_coding["aoi_geometry_status"].isin(
+                ["invalid_coordinate", "invalid_dimension"]
+            )
+        ].copy()
+    margins_used = sorted(set([0.0, *margins_array.tolist()]))
+    x = pd.to_numeric(gaze[gaze_x_col], errors="coerce").to_numpy(float)
+    y = pd.to_numeric(gaze[gaze_y_col], errors="coerce").to_numpy(float)
+    sensitivity_rows = []
+    for i in range(len(gaze)):
+        base = {".gp3_sample_index": i + 1}
+        for col in ids:
+            base[col] = gaze.iloc[i][col]
+        if gaze_stimulus_col is not None and gaze_stimulus_col not in base:
+            base[gaze_stimulus_col] = gaze.iloc[i][gaze_stimulus_col]
+        for margin in margins_used:
+            assigned = outside_label
+            status = "no_aoi"
+            n_hits = 0
+            if not np.isfinite(x[i]) or not np.isfinite(y[i]):
+                assigned = missing_label
+                status = "missing_coordinate"
+            else:
+                candidates = geometry_for_coding
+                if gaze_stimulus_col is not None and resolved_stimulus is not None:
+                    candidates = candidates.loc[
+                        candidates[resolved_stimulus]
+                        .astype("string")
+                        .eq(str(gaze.iloc[i][gaze_stimulus_col]))
+                    ]
+                xmin = pd.to_numeric(candidates["x_min"], errors="coerce").to_numpy(float) - margin
+                ymin = pd.to_numeric(candidates["y_min"], errors="coerce").to_numpy(float) - margin
+                xmax = pd.to_numeric(candidates["x_max"], errors="coerce").to_numpy(float) + margin
+                ymax = pd.to_numeric(candidates["y_max"], errors="coerce").to_numpy(float) + margin
+                hit = (
+                    (xmin < xmax)
+                    & (ymin < ymax)
+                    & (x[i] >= xmin)
+                    & (x[i] <= xmax)
+                    & (y[i] >= ymin)
+                    & (y[i] <= ymax)
+                )
+                indices = np.flatnonzero(hit)
+                n_hits = len(indices)
+                if n_hits == 1:
+                    assigned = str(candidates.iloc[indices[0]][resolved_aoi])
+                    status = "single_aoi"
+                elif n_hits > 1:
+                    if tie_method == "first":
+                        assigned = str(candidates.iloc[indices[0]][resolved_aoi])
+                        status = "multiple_aoi_resolved"
+                    else:
+                        assigned = ambiguous_label
+                        status = "ambiguous_aoi"
+            sensitivity_rows.append(
+                {
+                    **base,
+                    "margin": margin,
+                    "assigned_aoi": assigned,
+                    "n_matching_aois": n_hits,
+                    "margin_assignment_status": status,
+                }
+            )
+    sample = pd.DataFrame(sensitivity_rows)
+    base_lookup = sample.loc[
+        sample["margin"].eq(0), [".gp3_sample_index", "assigned_aoi"]
+    ].set_index(".gp3_sample_index")["assigned_aoi"]
+    sample["base_assigned_aoi"] = sample[".gp3_sample_index"].map(base_lookup)
+    sample["changed_from_base"] = sample["assigned_aoi"].ne(sample["base_assigned_aoi"])
+    sample.loc[sample["margin"].eq(0), "changed_from_base"] = False
+    sample = sample.sort_values([".gp3_sample_index", "margin"], kind="stable").reset_index(
+        drop=True
+    )
+    margin_rows = []
+    for margin, block in sample.groupby("margin", sort=True):
+        n = len(block)
+        n_changed = int(block["changed_from_base"].fillna(False).sum())
+        n_ambiguous = int(block["assigned_aoi"].eq(ambiguous_label).sum())
+        change_prop = n_changed / n if n else np.nan
+        ambiguous_prop = n_ambiguous / n if n else np.nan
+        if margin == 0:
+            status = "base_ambiguous" if ambiguous_prop > max_ambiguous_prop else "base"
+        elif change_prop > max_margin_change_prop:
+            status = "margin_sensitive"
+        elif ambiguous_prop > max_ambiguous_prop:
+            status = "ambiguous_margin"
+        else:
+            status = "ok"
+        margin_rows.append(
             {
-                "margin": m,
-                "assigned_prop": float(assigned.aoi_current.notna().mean()),
-                "outside_prop": float(assigned.aoi_current.astype("string").eq("outside").mean()),
+                "margin": margin,
+                "n_samples": n,
+                "n_changed_from_base": n_changed,
+                "margin_change_prop": change_prop,
+                "n_ambiguous": n_ambiguous,
+                "ambiguous_prop": ambiguous_prop,
+                "n_outside": int(block["assigned_aoi"].eq(outside_label).sum()),
+                "outside_prop": float(block["assigned_aoi"].eq(outside_label).mean()),
+                "n_missing_coordinate": int(block["assigned_aoi"].eq(missing_label).sum()),
+                "missing_coordinate_prop": float(block["assigned_aoi"].eq(missing_label).mean()),
+                "margin_sensitivity_status": status,
             }
         )
-    return pd.DataFrame(rows)
+    margin_summary = pd.DataFrame(margin_rows)
+    aoi_summary = (
+        sample.groupby(["margin", "assigned_aoi"], dropna=False, sort=True)
+        .agg(n_samples=("assigned_aoi", "size"), n_changed_from_base=("changed_from_base", "sum"))
+        .reset_index()
+    )
+    totals = aoi_summary.groupby("margin")["n_samples"].transform("sum")
+    aoi_summary["margin_total_samples"] = totals
+    aoi_summary["sample_prop"] = aoi_summary["n_samples"] / totals
+    flagged = sample.loc[
+        sample["margin"].ne(0)
+        & (
+            sample["changed_from_base"].fillna(False)
+            | sample["margin_assignment_status"].eq("ambiguous_aoi")
+        )
+    ].reset_index(drop=True)
+    nonbase = margin_summary.loc[margin_summary["margin"].ne(0), "margin_change_prop"]
+    n_flagged = int((~margin_summary["margin_sensitivity_status"].isin(["ok", "base"])).sum())
+    overview = pd.DataFrame(
+        [
+            {
+                "n_gaze_rows": len(gaze),
+                "n_geometry_rows": len(geometry),
+                "n_aois": len(geometry_summary),
+                "n_aois_used": len(geometry_for_coding),
+                "n_margins": len(margins_used),
+                "n_sample_margin_rows": len(sample),
+                "n_flagged_margins": n_flagged,
+                "max_margin_change_prop_observed": _gp3_margin_safe_stat(nonbase, np.max),
+                "max_ambiguous_prop_observed": _gp3_margin_safe_stat(
+                    margin_summary["ambiguous_prop"], np.max
+                ),
+                "aoi_margin_sensitivity_status": "review" if n_flagged > 0 else "ok",
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "gaze_x_col",
+                "gaze_y_col",
+                "gaze_stimulus_col",
+                "sample_id_cols",
+                "geometry_aoi_col",
+                "geometry_stimulus_col",
+                "margins",
+                "margins_used",
+                "screen_x_range",
+                "screen_y_range",
+                "tie_method",
+                "outside_label",
+                "ambiguous_label",
+                "missing_label",
+                "max_margin_change_prop",
+                "max_ambiguous_prop",
+                "ignore_invalid_geometry",
+            ],
+            "value": [
+                gaze_x_col,
+                gaze_y_col,
+                gaze_stimulus_col if gaze_stimulus_col is not None else pd.NA,
+                ", ".join(ids) if ids else pd.NA,
+                resolved_aoi,
+                resolved_stimulus if resolved_stimulus is not None else pd.NA,
+                ", ".join(map(str, margins_array.tolist())),
+                ", ".join(map(str, margins_used)),
+                ", ".join(map(str, screen_x_range)),
+                ", ".join(map(str, screen_y_range)),
+                tie_method,
+                outside_label,
+                ambiguous_label,
+                missing_label,
+                str(max_margin_change_prop),
+                str(max_ambiguous_prop),
+                str(bool(ignore_invalid_geometry)),
+            ],
+        }
+    )
+    return {
+        "overview": overview,
+        "geometry_summary": geometry_summary,
+        "sample_sensitivity": sample,
+        "margin_summary": margin_summary,
+        "aoi_margin_summary": aoi_summary,
+        "flagged_samples": flagged,
+        "settings": settings,
+        "_gp3_class": "gp3_aoi_margin_sensitivity_audit",
+    }
 
 
 def summarise_aoi_samples(
@@ -6388,21 +6999,326 @@ def transform_gazepoint_aoi_empirical_logit(
 
 
 def audit_gazepoint_aoi_window_denominators(
-    data, success_col="success", total_col="total"
-) -> pd.DataFrame:
+    data,
+    success_col="success",
+    total_col="total",
+    *,
+    window_col=None,
+    window_start_col=None,
+    window_end_col=None,
+    denominator_col=None,
+    target_col=None,
+    condition_col=None,
+    group_cols=None,
+    min_denominator_samples=5,
+    min_valid_denominator_prop=0.70,
+    max_denominator_cv=0.25,
+    max_condition_ratio=2,
+):
+    """Audit AOI window denominator validity and condition imbalance."""
+    r_mode = any(
+        (
+            window_col is not None,
+            window_start_col is not None,
+            window_end_col is not None,
+            denominator_col is not None,
+            target_col is not None,
+            condition_col is not None,
+            group_cols is not None,
+            min_denominator_samples != 5,
+            min_valid_denominator_prop != 0.70,
+            max_denominator_cv != 0.25,
+            max_condition_ratio != 2,
+        )
+    )
+    if not r_mode:
+        df = ensure_dataframe(data, copy=False)
+        s = finite_numeric(df[success_col])
+        n = finite_numeric(df[total_col])
+        return pd.DataFrame(
+            [
+                {
+                    "n_rows": len(df),
+                    "n_invalid": int(((s < 0) | (n < 0) | (s > n)).sum()),
+                    "min_total": float(n.min()),
+                    "max_total": float(n.max()),
+                }
+            ]
+        )
+
     df = ensure_dataframe(data, copy=False)
-    s = finite_numeric(df[success_col])
-    n = finite_numeric(df[total_col])
-    return pd.DataFrame(
+    window_col = "window_label" if window_col is None else window_col
+    window_start_col = "window_start_ms" if window_start_col is None else window_start_col
+    window_end_col = "window_end_ms" if window_end_col is None else window_end_col
+    denominator_col = "n_valid_denominator_samples" if denominator_col is None else denominator_col
+    target_col = "n_target_samples" if target_col is None else target_col
+    condition_col = "condition" if condition_col is None else condition_col
+    total_col = "n_window_samples" if total_col == "total" else total_col
+    if min_denominator_samples <= 0 or not np.isfinite(min_denominator_samples):
+        raise ValueError("min_denominator_samples must be positive")
+    if not 0 <= min_valid_denominator_prop <= 1 or not np.isfinite(min_valid_denominator_prop):
+        raise ValueError("min_valid_denominator_prop must be in [0, 1]")
+    if (
+        max_denominator_cv <= 0
+        or max_condition_ratio <= 0
+        or not np.isfinite(max_denominator_cv)
+        or not np.isfinite(max_condition_ratio)
+    ):
+        raise ValueError("denominator thresholds must be positive finite values")
+    groups = (
+        None
+        if group_cols is None
+        else ([group_cols] if isinstance(group_cols, str) else list(group_cols))
+    )
+    required = [window_col, denominator_col, total_col, target_col]
+    if groups:
+        required += groups
+    missing = [c for c in dict.fromkeys(required) if c not in df]
+    if missing:
+        raise KeyError("Missing required columns: " + ", ".join(missing))
+    if groups is None:
+        groups = [
+            c for c in ["subject", condition_col, "MEDIA_ID", "trial_global", "trial"] if c in df
+        ]
+    work = df.copy()
+    work[".gp3_window"] = work[window_col].astype("string").str.strip().fillna("unknown_window")
+    work.loc[work[".gp3_window"].eq(""), ".gp3_window"] = "unknown_window"
+    work[".gp3_denominator"] = pd.to_numeric(work[denominator_col], errors="coerce")
+    work[".gp3_total"] = pd.to_numeric(work[total_col], errors="coerce")
+    work[".gp3_target"] = pd.to_numeric(work[target_col], errors="coerce")
+    if condition_col in work:
+        work[".gp3_condition"] = work[condition_col].astype("string").str.strip().fillna("all_data")
+        work.loc[work[".gp3_condition"].eq(""), ".gp3_condition"] = "all_data"
+    else:
+        work[".gp3_condition"] = "all_data"
+    work[".gp3_window_start"] = (
+        pd.to_numeric(work[window_start_col], errors="coerce")
+        if window_start_col in work
+        else np.nan
+    )
+    work[".gp3_window_end"] = (
+        pd.to_numeric(work[window_end_col], errors="coerce") if window_end_col in work else np.nan
+    )
+    den = work[".gp3_denominator"].to_numpy(float)
+    total = work[".gp3_total"].to_numpy(float)
+    target = work[".gp3_target"].to_numpy(float)
+    valid_prop = np.divide(
+        den, total, out=np.full(len(work), np.nan), where=np.isfinite(total) & (total > 0)
+    )
+    work[".gp3_valid_denominator_prop"] = valid_prop
+    work[".gp3_failure"] = den - target
+    flags = {
+        "denominator_missing": ~np.isfinite(den),
+        "total_missing": ~np.isfinite(total),
+        "target_missing": ~np.isfinite(target),
+        "denominator_negative": np.isfinite(den) & (den < 0),
+        "total_non_positive": np.isfinite(total) & (total <= 0),
+        "target_negative": np.isfinite(target) & (target < 0),
+        "target_exceeds_denominator": np.isfinite(target) & np.isfinite(den) & (target > den),
+        "denominator_zero": np.isfinite(den) & (den == 0),
+        "denominator_low": np.isfinite(den) & (den > 0) & (den < min_denominator_samples),
+        "valid_denominator_prop_low": np.isfinite(valid_prop)
+        & (valid_prop < min_valid_denominator_prop),
+        "target_zero": np.isfinite(target) & (target == 0),
+        "target_all": np.isfinite(target) & np.isfinite(den) & (den > 0) & (target == den),
+    }
+    for name, values in flags.items():
+        work[name] = values
+    status = np.full(len(work), "ok", dtype=object)
+    precedence = [
+        ("denominator_missing", "missing_denominator"),
+        ("total_missing", "missing_total"),
+        ("target_missing", "missing_target"),
+        ("denominator_negative", "negative_denominator"),
+        ("total_non_positive", "non_positive_total"),
+        ("target_negative", "negative_target"),
+        ("target_exceeds_denominator", "target_exceeds_denominator"),
+        ("denominator_zero", "zero_denominator"),
+        ("denominator_low", "low_denominator"),
+        ("valid_denominator_prop_low", "low_valid_denominator_prop"),
+    ]
+    unresolved = np.ones(len(work), dtype=bool)
+    for flag, label in precedence:
+        hit = work[flag].to_numpy(bool) & unresolved
+        status[hit] = label
+        unresolved[hit] = False
+    work["denominator_audit_status"] = status
+
+    def safe(values, fn):
+        arr = pd.to_numeric(values, errors="coerce").to_numpy(float)
+        arr = arr[np.isfinite(arr)]
+        return float(fn(arr)) if len(arr) else np.nan
+
+    overview = pd.DataFrame(
         [
             {
-                "n_rows": len(df),
-                "n_invalid": int(((s < 0) | (n < 0) | (s > n)).sum()),
-                "min_total": float(n.min()),
-                "max_total": float(n.max()),
+                "n_rows": len(work),
+                "n_windows": work[".gp3_window"].nunique(dropna=False),
+                "n_conditions": work[".gp3_condition"].nunique(dropna=False),
+                "n_missing_denominator": int(work["denominator_missing"].sum()),
+                "n_zero_denominator": int(work["denominator_zero"].sum()),
+                "n_low_denominator": int(work["denominator_low"].sum()),
+                "n_low_valid_denominator_prop": int(work["valid_denominator_prop_low"].sum()),
+                "n_target_exceeds_denominator": int(work["target_exceeds_denominator"].sum()),
+                "n_target_zero": int(work["target_zero"].sum()),
+                "n_target_all": int(work["target_all"].sum()),
+                "denominator_min": safe(work[".gp3_denominator"], np.min),
+                "denominator_median": safe(work[".gp3_denominator"], np.median),
+                "denominator_max": safe(work[".gp3_denominator"], np.max),
+                "valid_denominator_prop_min": safe(work[".gp3_valid_denominator_prop"], np.min),
+                "valid_denominator_prop_median": safe(
+                    work[".gp3_valid_denominator_prop"], np.median
+                ),
+                "valid_denominator_prop_max": safe(work[".gp3_valid_denominator_prop"], np.max),
             }
         ]
     )
+    ov = overview.iloc[0]
+    if ov["n_target_exceeds_denominator"] > 0:
+        audit_status = "invalid_counts"
+    elif ov["n_missing_denominator"] > 0:
+        audit_status = "missing_denominators"
+    elif ov["n_zero_denominator"] > 0:
+        audit_status = "zero_denominators"
+    elif ov["n_low_denominator"] > 0 or ov["n_low_valid_denominator_prop"] > 0:
+        audit_status = "review_denominators"
+    else:
+        audit_status = "ok"
+    overview["denominator_audit_status"] = audit_status
+    wrows = []
+    for keys, block in work.groupby(
+        [".gp3_window", ".gp3_window_start", ".gp3_window_end"], dropna=False, sort=True
+    ):
+        mean = safe(block[".gp3_denominator"], np.mean)
+        sd = (
+            safe(block[".gp3_denominator"], lambda x: np.std(x, ddof=1))
+            if block[".gp3_denominator"].notna().sum() > 1
+            else np.nan
+        )
+        cv = sd / mean if np.isfinite(mean) and mean > 0 and np.isfinite(sd) else np.nan
+        n_zero = int(block["denominator_zero"].sum())
+        n_low = int(block["denominator_low"].sum())
+        n_prop = int(block["valid_denominator_prop_low"].sum())
+        if n_zero:
+            wstatus = "zero_denominator"
+        elif n_low:
+            wstatus = "low_denominator"
+        elif n_prop:
+            wstatus = "low_valid_denominator_prop"
+        elif np.isfinite(cv) and cv > max_denominator_cv:
+            wstatus = "high_denominator_variability"
+        else:
+            wstatus = "ok"
+        wrows.append(
+            {
+                "window_label": keys[0],
+                "window_start_ms": keys[1],
+                "window_end_ms": keys[2],
+                "n_rows": len(block),
+                "denominator_min": safe(block[".gp3_denominator"], np.min),
+                "denominator_mean": mean,
+                "denominator_median": safe(block[".gp3_denominator"], np.median),
+                "denominator_max": safe(block[".gp3_denominator"], np.max),
+                "denominator_sd": sd,
+                "n_zero_denominator": n_zero,
+                "n_low_denominator": n_low,
+                "n_low_valid_denominator_prop": n_prop,
+                "n_target_zero": int(block["target_zero"].sum()),
+                "n_target_all": int(block["target_all"].sum()),
+                "valid_denominator_prop_min": safe(block[".gp3_valid_denominator_prop"], np.min),
+                "valid_denominator_prop_mean": safe(block[".gp3_valid_denominator_prop"], np.mean),
+                "denominator_cv": cv,
+                "window_denominator_status": wstatus,
+            }
+        )
+    window_summary = pd.DataFrame(wrows)
+    crows = []
+    for keys, block in work.groupby(
+        [".gp3_condition", ".gp3_window", ".gp3_window_start", ".gp3_window_end"],
+        dropna=False,
+        sort=True,
+    ):
+        crows.append(
+            {
+                "condition": keys[0],
+                "window_label": keys[1],
+                "window_start_ms": keys[2],
+                "window_end_ms": keys[3],
+                "n_rows": len(block),
+                "denominator_mean": safe(block[".gp3_denominator"], np.mean),
+                "denominator_median": safe(block[".gp3_denominator"], np.median),
+                "denominator_min": safe(block[".gp3_denominator"], np.min),
+                "denominator_max": safe(block[".gp3_denominator"], np.max),
+                "valid_denominator_prop_mean": safe(block[".gp3_valid_denominator_prop"], np.mean),
+                "n_zero_denominator": int(block["denominator_zero"].sum()),
+                "n_low_denominator": int(block["denominator_low"].sum()),
+                "n_target_zero": int(block["target_zero"].sum()),
+                "n_target_all": int(block["target_all"].sum()),
+            }
+        )
+    condition_summary = pd.DataFrame(crows)
+    irows = []
+    if len(condition_summary):
+        for keys, block in condition_summary.groupby(
+            ["window_label", "window_start_ms", "window_end_ms"], dropna=False, sort=True
+        ):
+            vals = pd.to_numeric(block["denominator_mean"], errors="coerce").to_numpy(float)
+            vals = vals[np.isfinite(vals)]
+            ncond = block["condition"].nunique(dropna=False)
+            dmin = float(np.min(vals)) if len(vals) else np.nan
+            dmax = float(np.max(vals)) if len(vals) else np.nan
+            dgrand = float(np.mean(vals)) if len(vals) else np.nan
+            dsd = float(np.std(vals, ddof=1)) if len(vals) > 1 else np.nan
+            ratio = dmax / dmin if np.isfinite(dmin) and dmin > 0 else np.nan
+            cv = dsd / dgrand if np.isfinite(dgrand) and dgrand > 0 and np.isfinite(dsd) else np.nan
+            if ncond < 2:
+                istatus = "single_condition"
+            elif np.isfinite(ratio) and ratio > max_condition_ratio:
+                istatus = "condition_denominator_ratio_high"
+            elif np.isfinite(cv) and cv > max_denominator_cv:
+                istatus = "condition_denominator_cv_high"
+            else:
+                istatus = "ok"
+            irows.append(
+                {
+                    "window_label": keys[0],
+                    "window_start_ms": keys[1],
+                    "window_end_ms": keys[2],
+                    "n_conditions": ncond,
+                    "denominator_mean_min": dmin,
+                    "denominator_mean_max": dmax,
+                    "denominator_mean_sd": dsd,
+                    "denominator_mean_grand": dgrand,
+                    "denominator_condition_ratio": ratio,
+                    "denominator_condition_cv": cv,
+                    "denominator_imbalance_status": istatus,
+                }
+            )
+    imbalance = pd.DataFrame(irows)
+    flagged_rows = work.loc[work["denominator_audit_status"].ne("ok")].reset_index(drop=True)
+    return {
+        "overview": overview,
+        "row_audit": work.reset_index(drop=True),
+        "window_summary": window_summary,
+        "condition_window_summary": condition_summary,
+        "denominator_imbalance": imbalance,
+        "flagged_rows": flagged_rows,
+        "settings": {
+            "window_col": window_col,
+            "window_start_col": window_start_col,
+            "window_end_col": window_end_col,
+            "denominator_col": denominator_col,
+            "total_col": total_col,
+            "target_col": target_col,
+            "condition_col": condition_col,
+            "group_cols": groups,
+            "min_denominator_samples": min_denominator_samples,
+            "min_valid_denominator_prop": min_valid_denominator_prop,
+            "max_denominator_cv": max_denominator_cv,
+            "max_condition_ratio": max_condition_ratio,
+        },
+        "_gp3_class": "gp3_aoi_window_denominator_audit",
+    }
 
 
 def cluster_gazepoint_scanpaths(
