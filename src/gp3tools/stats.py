@@ -2288,6 +2288,98 @@ def estimate_gazepoint_divergence_point(
     min_run: int = 3,
     **kwargs,
 ) -> pd.DataFrame:
+
+    # === R3B DIVERGENCE SELECTOR ===
+    if any(
+        key in kwargs
+        for key in {
+            "outcome_col",
+            "participant_col",
+            "trial_col",
+            "comparison",
+            "bootstrap_unit",
+            "summary_function",
+            "n_boot",
+            "ci",
+            "consecutive_points",
+            "null_value",
+            "min_abs_difference",
+            "direction",
+            "seed",
+            "keep_bootstrap",
+            "name",
+        }
+    ):
+        from ._behavioral_r3b import (
+            estimate_gazepoint_divergence_point as _r3b,
+        )
+
+        return _r3b(
+            data=data,
+            outcome_col=kwargs.pop(
+                "outcome_col",
+                value_col,
+            ),
+            time_col=time_col,
+            condition_col=condition_col,
+            participant_col=kwargs.pop(
+                "participant_col",
+                None,
+            ),
+            trial_col=kwargs.pop(
+                "trial_col",
+                None,
+            ),
+            comparison=kwargs.pop(
+                "comparison",
+                None,
+            ),
+            bootstrap_unit=kwargs.pop(
+                "bootstrap_unit",
+                "participant",
+            ),
+            summary_function=kwargs.pop(
+                "summary_function",
+                "mean",
+            ),
+            n_boot=kwargs.pop(
+                "n_boot",
+                1000,
+            ),
+            ci=kwargs.pop(
+                "ci",
+                0.95,
+            ),
+            consecutive_points=kwargs.pop(
+                "consecutive_points",
+                min_run,
+            ),
+            null_value=kwargs.pop(
+                "null_value",
+                0.0,
+            ),
+            min_abs_difference=kwargs.pop(
+                "min_abs_difference",
+                0.0,
+            ),
+            direction=kwargs.pop(
+                "direction",
+                "either",
+            ),
+            seed=kwargs.pop(
+                "seed",
+                None,
+            ),
+            keep_bootstrap=kwargs.pop(
+                "keep_bootstrap",
+                False,
+            ),
+            name=kwargs.pop(
+                "name",
+                "divergence_point",
+            ),
+        )
+
     times, diff = _bin_condition_difference(
         ensure_dataframe(data), value_col, time_col, condition_col
     )
@@ -2719,6 +2811,66 @@ def run_gazepoint_model_leave_one_out(
 
 
 def run_gazepoint_pupil_multiverse(data, registry=None, **kwargs) -> pd.DataFrame:
+
+    # === R3B PUPIL MULTIVERSE SELECTOR ===
+    if any(
+        key in kwargs
+        for key in {
+            "multiverse",
+            "branch_ids",
+            "pupil_col",
+            "time_col",
+            "group_cols",
+            "summarise_windows",
+            "windows",
+            "keep_outputs",
+            "stop_on_error",
+        }
+    ):
+        from ._behavioral_r3b import (
+            run_gazepoint_pupil_multiverse as _r3b,
+        )
+
+        return _r3b(
+            data=data,
+            multiverse=kwargs.pop(
+                "multiverse",
+                registry,
+            ),
+            branch_ids=kwargs.pop(
+                "branch_ids",
+                None,
+            ),
+            pupil_col=kwargs.pop(
+                "pupil_col",
+                "PUPIL",
+            ),
+            time_col=kwargs.pop(
+                "time_col",
+                "TIME",
+            ),
+            group_cols=kwargs.pop(
+                "group_cols",
+                None,
+            ),
+            summarise_windows=kwargs.pop(
+                "summarise_windows",
+                True,
+            ),
+            windows=kwargs.pop(
+                "windows",
+                None,
+            ),
+            keep_outputs=kwargs.pop(
+                "keep_outputs",
+                False,
+            ),
+            stop_on_error=kwargs.pop(
+                "stop_on_error",
+                False,
+            ),
+        )
+
     from .pupil import preprocess_gazepoint_signals
 
     regs = ensure_dataframe(registry) if registry is not None else pd.DataFrame([{}])
@@ -2758,6 +2910,85 @@ def run_gazepoint_pupil_multiverse(data, registry=None, **kwargs) -> pd.DataFram
 
 
 def run_gazepoint_aoi_multiverse(data, specifications=None, **kwargs) -> pd.DataFrame:
+
+    # === R3B AOI MULTIVERSE SELECTOR ===
+    if any(
+        key in kwargs
+        for key in {
+            "multiverse",
+            "branch_ids",
+            "windows",
+            "time_col",
+            "aoi_col",
+            "subject_col",
+            "condition_col",
+            "group_cols",
+            "target_aoi_values",
+            "distractor_aoi_values",
+            "success_col",
+            "outcome_label",
+            "keep_outputs",
+            "stop_on_error",
+        }
+    ):
+        from ._behavioral_r3b import (
+            run_gazepoint_aoi_multiverse as _r3b,
+        )
+
+        return _r3b(
+            data=data,
+            multiverse=kwargs.pop(
+                "multiverse",
+                specifications,
+            ),
+            branch_ids=kwargs.pop(
+                "branch_ids",
+                None,
+            ),
+            windows=kwargs.pop("windows"),
+            time_col=kwargs.pop(
+                "time_col",
+                "TIME",
+            ),
+            aoi_col=kwargs.pop(
+                "aoi_col",
+                "AOI",
+            ),
+            subject_col=kwargs.pop(
+                "subject_col",
+                "USER",
+            ),
+            condition_col=kwargs.pop(
+                "condition_col",
+                "condition",
+            ),
+            group_cols=kwargs.pop(
+                "group_cols",
+                None,
+            ),
+            target_aoi_values=kwargs.pop("target_aoi_values"),
+            distractor_aoi_values=kwargs.pop(
+                "distractor_aoi_values",
+                None,
+            ),
+            success_col=kwargs.pop(
+                "success_col",
+                "success",
+            ),
+            outcome_label=kwargs.pop(
+                "outcome_label",
+                "target_aoi",
+            ),
+            keep_outputs=kwargs.pop(
+                "keep_outputs",
+                False,
+            ),
+            stop_on_error=kwargs.pop(
+                "stop_on_error",
+                False,
+            ),
+        )
+
     specs = ensure_dataframe(specifications) if specifications is not None else pd.DataFrame([{}])
     rows = []
     for i, _ in specs.iterrows():

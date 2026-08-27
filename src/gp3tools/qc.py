@@ -363,6 +363,18 @@ def as_gazepoint_master(
 
 def create_gazepoint_master(data, **kwargs) -> pd.DataFrame:
     """Create a standardized sample-level master table."""
+
+    from ._behavioral_r3a import _dispatch_r3a, _should_use_r3a
+
+    if _should_use_r3a(
+        "create_gazepoint_master",
+        locals(),
+    ):
+        return _dispatch_r3a(
+            "create_gazepoint_master",
+            locals(),
+        )
+
     df = as_gazepoint_master(data)
     if "sample_index" not in df.columns:
         df["sample_index"] = np.arange(len(df), dtype=int)

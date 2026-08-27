@@ -852,6 +852,18 @@ def _face_numeric_cols(df):
 def summarize_gazepoint_face_windows(
     data, group_cols=None, value_cols=None, **kwargs
 ) -> pd.DataFrame:
+
+    from ._behavioral_r3a import _dispatch_r3a, _should_use_r3a
+
+    if _should_use_r3a(
+        "summarize_gazepoint_face_windows",
+        locals(),
+    ):
+        return _dispatch_r3a(
+            "summarize_gazepoint_face_windows",
+            locals(),
+        )
+
     df = standardize_gazepoint_face_columns(data)
     groups = normalize_group_cols(df, group_cols)
     vals = value_cols or _face_numeric_cols(df)
@@ -867,6 +879,18 @@ def summarise_gazepoint_face_windows(data, **kwargs):
 def summarize_gazepoint_face_reactivity(
     data, baseline=None, group_cols=None, value_cols=None, **kwargs
 ) -> pd.DataFrame:
+
+    from ._behavioral_r3a import _dispatch_r3a, _should_use_r3a
+
+    if _should_use_r3a(
+        "summarize_gazepoint_face_reactivity",
+        locals(),
+    ):
+        return _dispatch_r3a(
+            "summarize_gazepoint_face_reactivity",
+            locals(),
+        )
+
     out = summarize_gazepoint_face_windows(data, group_cols=group_cols, value_cols=value_cols)
     num = out.select_dtypes(include=np.number).columns
     for c in num:

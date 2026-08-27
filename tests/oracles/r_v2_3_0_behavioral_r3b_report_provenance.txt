@@ -1,0 +1,25 @@
+R3-B REPORT ORACLE PROVENANCE
+=============================
+
+gp3tools_version=2.3.0
+current_create_gazepoint_report_formals=results,output_file,title,overwrite,max_rows,save_plots,plot_dir
+
+historical_fixture=compact_results_no_plots
+historical_with_metadata_status=ERROR
+historical_with_metadata_message=unused argument (metadata = list(fixture = "r3b", version = "2.3.0"))
+historical_without_metadata_status=ERROR
+historical_without_metadata_message=`results` is missing required elements: sampling, flagged_quality, aoi_table
+
+classification=ORACLE_PROVENANCE_EXCEPTION
+affected_frozen_assertions=files/report_lines|files/report_normalized_md5
+
+Rationale:
+The historical fixture recovered from the oracle-generation shell history
+passes metadata= and supplies quality/summary/note only.
+The frozen gp3tools 2.3.0 diagnostic report function has no metadata formal
+and requires sampling/quality/flagged_quality/aoi_table.
+Therefore the historical report-content checksum assertions cannot be
+re-executed against the frozen R 2.3.0 reference and are provenance evidence,
+not an executable behavioral requirement.
+
+The frozen CSV itself remains unchanged.

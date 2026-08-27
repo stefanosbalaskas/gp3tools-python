@@ -247,6 +247,18 @@ def detect_gazepoint_fixations_velocity(
 
 def detect_gazepoint_fixations_ivt(data, **kwargs) -> pd.DataFrame:
     """Alias for I-VT fixation detection."""
+
+    from ._behavioral_r3a import _dispatch_r3a, _should_use_r3a
+
+    if _should_use_r3a(
+        "detect_gazepoint_fixations_ivt",
+        locals(),
+    ):
+        return _dispatch_r3a(
+            "detect_gazepoint_fixations_ivt",
+            locals(),
+        )
+
     return detect_gazepoint_fixations_velocity(data, **kwargs)
 
 
@@ -1480,6 +1492,18 @@ def compare_gazepoint_event_detectors(
 
 
 def summarise_gazepoint_event_detector_agreement(data, **kwargs) -> pd.DataFrame:
+
+    from ._behavioral_r3a import _dispatch_r3a, _should_use_r3a
+
+    if _should_use_r3a(
+        "summarise_gazepoint_event_detector_agreement",
+        locals(),
+    ):
+        return _dispatch_r3a(
+            "summarise_gazepoint_event_detector_agreement",
+            locals(),
+        )
+
     comp = (
         data
         if isinstance(data, pd.DataFrame) and "agreement" in data

@@ -1161,6 +1161,73 @@ def create_gazepoint_report(
     metadata=None,
     **kwargs,
 ) -> Path:
+
+    # === R3B CREATE REPORT SELECTOR ===
+    # === R3B CANONICAL REPORT KWARG GUARD ===
+    _r3b_canonical_report_kwargs = {
+        "overwrite",
+        "max_rows",
+        "save_plots",
+        "plot_dir",
+    }
+    if any(key in kwargs for key in _r3b_canonical_report_kwargs):
+        from ._behavioral_r3b import (
+            create_gazepoint_report as _r3b_create_report,
+        )
+
+        return _r3b_create_report(
+            results=results,
+            output_file=output_file,
+            title=title,
+            metadata=metadata,
+            **kwargs,
+        )
+
+    if (
+        isinstance(results, dict)
+        and {
+            "sampling",
+            "quality",
+            "flagged_quality",
+            "aoi_table",
+        }.issubset(results)
+        and metadata is None
+        and any(
+            key in kwargs
+            for key in {
+                "overwrite",
+                "max_rows",
+                "save_plots",
+                "plot_dir",
+            }
+        )
+    ):
+        from ._behavioral_r3b import (
+            create_gazepoint_report as _r3b,
+        )
+
+        return _r3b(
+            results=results,
+            output_file=output_file,
+            title=title,
+            overwrite=kwargs.pop(
+                "overwrite",
+                True,
+            ),
+            max_rows=kwargs.pop(
+                "max_rows",
+                30,
+            ),
+            save_plots=kwargs.pop(
+                "save_plots",
+                True,
+            ),
+            plot_dir=kwargs.pop(
+                "plot_dir",
+                None,
+            ),
+        )
+
     sections = []
     if isinstance(results, pd.DataFrame):
         results = {"Results": results}
@@ -2397,6 +2464,121 @@ def run_gazepoint_workflow(
     save_plots=False,
     **kwargs,
 ) -> dict[str, Any]:
+
+    # === R3B WORKFLOW SELECTOR ===
+    if (
+        data is None
+        and export_dir is not None
+        and any(
+            key in kwargs
+            for key in {
+                "all_gaze_pattern",
+                "fixation_pattern",
+                "check_file_pairs",
+                "group_cols",
+                "user_col",
+                "sample_rate",
+                "min_gaze_valid_pct",
+                "min_pupil_valid_pct",
+                "expected_hz",
+                "hz_tolerance",
+                "min_duration_sec",
+                "prefix",
+                "overwrite",
+                "plot_output_dir",
+                "report_file",
+                "report_title",
+                "report_plot_dir",
+                "report_max_rows",
+            }
+        )
+    ):
+        from ._behavioral_r3b import (
+            run_gazepoint_workflow as _r3b,
+        )
+
+        return _r3b(
+            export_dir=export_dir,
+            output_dir=output_dir,
+            create_report=create_report,
+            save_plots=save_plots,
+            all_gaze_pattern=kwargs.pop(
+                "all_gaze_pattern",
+                "all_gaze",
+            ),
+            fixation_pattern=kwargs.pop(
+                "fixation_pattern",
+                "fixations",
+            ),
+            check_file_pairs=kwargs.pop(
+                "check_file_pairs",
+                True,
+            ),
+            group_cols=kwargs.pop(
+                "group_cols",
+                (
+                    "USER_FILE",
+                    "MEDIA_ID",
+                ),
+            ),
+            user_col=kwargs.pop(
+                "user_col",
+                "USER_FILE",
+            ),
+            sample_rate=kwargs.pop(
+                "sample_rate",
+                None,
+            ),
+            min_gaze_valid_pct=kwargs.pop(
+                "min_gaze_valid_pct",
+                80.0,
+            ),
+            min_pupil_valid_pct=kwargs.pop(
+                "min_pupil_valid_pct",
+                80.0,
+            ),
+            expected_hz=kwargs.pop(
+                "expected_hz",
+                None,
+            ),
+            hz_tolerance=kwargs.pop(
+                "hz_tolerance",
+                5.0,
+            ),
+            min_duration_sec=kwargs.pop(
+                "min_duration_sec",
+                1.0,
+            ),
+            prefix=kwargs.pop(
+                "prefix",
+                "gazepoint",
+            ),
+            overwrite=kwargs.pop(
+                "overwrite",
+                False,
+            ),
+            plot_output_dir=kwargs.pop(
+                "plot_output_dir",
+                None,
+            ),
+            report_file=kwargs.pop(
+                "report_file",
+                None,
+            ),
+            report_title=kwargs.pop(
+                "report_title",
+                "Gazepoint diagnostic report",
+            ),
+            report_plot_dir=kwargs.pop(
+                "report_plot_dir",
+                None,
+            ),
+            report_max_rows=kwargs.pop(
+                "report_max_rows",
+                30,
+            ),
+        )
+
     from .io import read_gazepoint_folder
     from .pupil import preprocess_gazepoint_signals
     from .qc import (

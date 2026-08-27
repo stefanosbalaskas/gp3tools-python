@@ -1,0 +1,10 @@
+{
+  "expected_plot_dir_basename": "canonical_current_report_files",
+  "fixture": "current_diagnostic_bundle_no_plots",
+  "n_flagged": 0,
+  "normalized_md5": "f13d27aa4ef2f7324a3e88603895174a",
+  "r_package": "gp3tools",
+  "r_version": "2.3.0",
+  "report_lines": 69,
+  "title": "R3-B Current Canonical Report"
+}

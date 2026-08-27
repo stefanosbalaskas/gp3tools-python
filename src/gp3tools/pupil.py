@@ -7551,6 +7551,18 @@ def stress_test_gazepoint_binocular_reconstruction(
 def analyse_gazepoint_binocular_sensitivity(
     data, methods=("available_eye", "linear_regression"), **kwargs
 ) -> pd.DataFrame:
+
+    from ._behavioral_r3a import _dispatch_r3a, _should_use_r3a
+
+    if _should_use_r3a(
+        "analyse_gazepoint_binocular_sensitivity",
+        locals(),
+    ):
+        return _dispatch_r3a(
+            "analyse_gazepoint_binocular_sensitivity",
+            locals(),
+        )
+
     rows = []
     for method in methods:
         val = validate_gazepoint_binocular_reconstruction(data, method=method, **kwargs).copy()
@@ -7560,6 +7572,18 @@ def analyse_gazepoint_binocular_sensitivity(
 
 
 def summarise_gazepoint_binocular_reporting(data, **kwargs) -> dict[str, pd.DataFrame]:
+
+    from ._behavioral_r3a import _dispatch_r3a, _should_use_r3a
+
+    if _should_use_r3a(
+        "summarise_gazepoint_binocular_reporting",
+        locals(),
+    ):
+        return _dispatch_r3a(
+            "summarise_gazepoint_binocular_reporting",
+            locals(),
+        )
+
     return {
         "diagnostics": diagnose_gazepoint_binocular_pupil(data, **kwargs),
         "validation": validate_gazepoint_binocular_reconstruction(data, **kwargs),
