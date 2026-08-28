@@ -24,7 +24,7 @@ statistics and research reporting.
 [Browse the API](API_REFERENCE.md){ .md-button }
 [Release v0.1.0a1](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1){ .md-button }
 
-<div class="gp3-badges">
+<div class="gp3-badges" markdown="1">
 
 [![CI](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml)
 [![Documentation](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml)
