@@ -1,0 +1,105 @@
+:root {
+  --gp3-blue: #2563eb;
+  --gp3-cyan: #0891b2;
+  --gp3-muted: #64748b;
+  --gp3-border: rgba(100,116,139,.22);
+  --gp3-surface: rgba(248,250,252,.92);
+}
+[data-md-color-scheme="slate"] {
+  --gp3-muted: #a7b4c5;
+  --gp3-border: rgba(148,163,184,.22);
+  --gp3-surface: rgba(15,23,42,.72);
+}
+.md-grid { max-width: 1440px; }
+.md-typeset h1 { font-weight: 780; letter-spacing: -.045em; }
+.md-typeset h2 { font-weight: 720; letter-spacing: -.025em; }
+.gp3-hero {
+  margin: 0 0 2rem;
+  padding: clamp(1.6rem,5vw,4.5rem);
+  border: 1px solid var(--gp3-border);
+  border-radius: 1.3rem;
+  background:
+    radial-gradient(circle at 85% 15%,rgba(8,145,178,.18),transparent 34%),
+    radial-gradient(circle at 12% 84%,rgba(37,99,235,.15),transparent 36%),
+    var(--gp3-surface);
+  box-shadow: 0 24px 70px rgba(15,23,42,.08);
+}
+.gp3-hero h1 {
+  margin: .15rem 0 .3rem;
+  font-size: clamp(2.4rem,6vw,4.6rem);
+  line-height: 1;
+}
+.gp3-hero h3 { max-width: 900px; color: var(--gp3-muted); font-weight: 500; }
+.gp3-kicker {
+  font-size: .68rem;
+  font-weight: 800;
+  letter-spacing: .16em;
+  color: var(--gp3-cyan);
+}
+.gp3-badges { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: 1.25rem; }
+.gp3-badges img { height: 20px; }
+.gp3-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit,minmax(145px,1fr));
+  gap: .75rem;
+  margin: 1.25rem 0 2.5rem;
+}
+.gp3-metric {
+  min-height: 105px;
+  padding: 1rem;
+  border: 1px solid var(--gp3-border);
+  border-radius: 1rem;
+  background: var(--gp3-surface);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.gp3-metric strong { font-size: 1.7rem; color: var(--gp3-blue); }
+[data-md-color-scheme="slate"] .gp3-metric strong { color: #67e8f9; }
+.gp3-metric span { color: var(--gp3-muted); font-size: .78rem; font-weight: 650; }
+.md-typeset .grid.cards > ul > li,
+.md-typeset .grid.cards > ol > li {
+  border-radius: 1rem;
+  transition: transform .16s ease, box-shadow .16s ease;
+}
+.md-typeset .grid.cards > ul > li:hover,
+.md-typeset .grid.cards > ol > li:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 12px 32px rgba(15,23,42,.10);
+}
+.gp3-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fit,minmax(280px,1fr));
+  gap: 1rem;
+  margin: 1.25rem 0 2rem;
+}
+.gp3-gallery figure {
+  overflow: hidden;
+  margin: 0;
+  border: 1px solid var(--gp3-border);
+  border-radius: 1rem;
+  background: var(--gp3-surface);
+}
+.gp3-gallery img {
+  display: block;
+  width: 100%;
+  min-height: 220px;
+  max-height: 330px;
+  object-fit: contain;
+  padding: .6rem;
+  background: white;
+}
+.gp3-gallery figcaption {
+  padding: .75rem 1rem .9rem;
+  color: var(--gp3-muted);
+  font-size: .82rem;
+  font-weight: 650;
+}
+.md-typeset .md-button,
+.md-typeset .admonition,
+.md-typeset details { border-radius: .75rem; }
+@media screen and (max-width:760px) {
+  .gp3-hero { padding: 1.4rem; }
+  .gp3-hero h1 { font-size: 2.45rem; }
+  .gp3-gallery { grid-template-columns: 1fr; }
+}

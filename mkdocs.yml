@@ -1,30 +1,144 @@
 site_name: gp3tools for Python
 site_url: https://stefanosbalaskas.github.io/gp3tools-python/
+site_author: Stefanos Balaskas
+site_description: Reproducible Gazepoint GP3 eye-tracking analysis, quality control, pupillometry, AOI, scanpath, modelling, visualisation, and reporting workflows in Python.
+
 repo_url: https://github.com/stefanosbalaskas/gp3tools-python
 repo_name: stefanosbalaskas/gp3tools-python
-site_description: Python migration of gp3tools Gazepoint GP3 workflows
-nav:
-- Home: index.md
-- API parity: API_PARITY.md
-- API reference: API_REFERENCE.md
-- Parity & validation status: PARITY_STATUS.md
-- Articles:
-  - End-to-end workflow: articles/end-to-end-workflow.md
-  - Pupil workflow: articles/pupil-workflow.md
-  - AOI workflow: articles/aoi-workflow.md
-  - Fixations and scanpaths: articles/fixation-transitions-scanpaths.md
-  - Statistical extensions: articles/statistical-extensions-plots.md
-  - Cluster permutation: articles/cluster-permutation-timecourse.md
-  - Face workflow: articles/face-complete-workflow.md
-  - Ecosystem exports: articles/ecosystem-exports.md
-  - Complete Python workflow: articles/complete-python-workflow.md
-  - Validation and release: articles/validation-release.md
+edit_uri: edit/main/docs/
+
+copyright: >
+  Copyright &copy; 2026 Stefanos Balaskas ·
+  Released under the MIT License
+
 theme:
   name: material
+  language: en
+  icon:
+    logo: material/eye
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
   features:
-  - navigation.tabs
-  - navigation.sections
-  - navigation.top
-  - search.suggest
-  - search.highlight
-  - content.code.copy
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/stefanosbalaskas/gp3tools-python
+      name: gp3tools Python on GitHub
+    - icon: material/language-r
+      link: https://github.com/stefanosbalaskas/gp3tools
+      name: Original gp3tools R package
+    - icon: material/book-open-variant
+      link: https://doi.org/10.3390/jemr19040076
+      name: Peer-reviewed gp3tools paper
+
+nav:
+  - Home: index.md
+  - Start:
+      - Getting started: getting-started.md
+      - Complete Python workflow: articles/complete-python-workflow.md
+      - End-to-end workflow: articles/end-to-end-workflow.md
+      - Synthetic showcase: articles/paper-grade-synthetic-showcase.md
+      - Private-data safety: articles/private-data-safety.md
+  - Pupil & signals:
+      - Pupil workflow: articles/pupil-workflow.md
+      - Baseline audit: articles/pupil-baseline-audit.md
+      - Integrated signal preprocessing: articles/integrated-signal-preprocessing.md
+      - Velocity fixations & blinks: articles/velocity-fixations-blinks.md
+      - Binocular fusion: articles/binocular-pupil-fusion.md
+      - Binocular reconstruction: articles/binocular-pupil-reconstruction.md
+      - Event-detector comparison: articles/event-detector-comparison.md
+  - AOI & sequences:
+      - AOI workflow: articles/aoi-workflow.md
+      - AOI modelling: articles/aoi-modelling-workflow.md
+      - Advanced AOI assignment: articles/advanced-aoi-assignment.md
+      - AOI sliding windows & simulation: articles/aoi-sliding-fixation-simulation.md
+      - AOI sequence diagnostics: articles/aoi-sequence-reliability.md
+      - Fixations, transitions & scanpaths: articles/fixation-transitions-scanpaths.md
+      - Scanpath clustering: articles/scanpath-clustering.md
+      - Cluster stability: articles/scanpath-cluster-stability.md
+      - Scanpath QC quick wins: articles/scanpath-qc-quick-wins.md
+  - QC & reporting:
+      - QC dashboard workflow: articles/qc-dashboard-workflow.md
+      - QC reporting bundle: articles/qc-reporting-bundle.md
+      - Missingness & coverage: articles/missingness-data-coverage.md
+      - Task phases & coverage: articles/task-phase-coverage.md
+      - Stimulus-layout QC: articles/stimulus-layout-qc.md
+      - Model readiness & sensitivity: articles/model-readiness-sensitivity.md
+      - Performance benchmarking: articles/performance-benchmarking.md
+  - Visualisation:
+      - Plot gallery: articles/plot-gallery.md
+      - Expanded plot gallery: articles/expanded-plot-gallery.md
+      - Heatmaps & spatial visualisation: articles/heatmaps-spatial.md
+  - Models & inference:
+      - Statistical extensions: articles/statistical-extensions-plots.md
+      - Metric extraction & model boundaries: articles/metric-extraction-model-boundaries.md
+      - Cluster-permutation workflow: articles/cluster-permutation-timecourse.md
+      - Bayesian planning: articles/bayesian-planning.md
+      - Experimental Bayesian bridge: articles/experimental-bayesian-bridge.md
+  - Face & multimodal:
+      - Complete face workflow: articles/face-complete-workflow.md
+      - Face export import: articles/face-export-import.md
+      - Face quality audit: articles/face-quality-audit.md
+      - Face synchronisation: articles/face-synchronisation.md
+      - Face window summaries: articles/face-window-summaries.md
+      - Multimodal modelling: articles/multimodal-modelling.md
+      - Face reporting: articles/face-reporting.md
+  - Interoperability:
+      - Ecosystem exports: articles/ecosystem-exports.md
+      - gpbiometrics integration: articles/gpbiometrics-integration.md
+      - Naming policy: articles/naming-policy.md
+      - R-to-Python API migration: articles/full-api-migration.md
+  - Reference:
+      - API reference: API_REFERENCE.md
+      - R/Python API parity: API_PARITY.md
+      - Parity & validation status: PARITY_STATUS.md
+      - Validation & release: articles/validation-release.md

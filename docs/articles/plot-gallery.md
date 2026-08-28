@@ -42,17 +42,3 @@ print(gp3.api_status().query("r_export in @funcs"))
 ![Transition matrix](../assets/transition-matrix.png)
 
 ![Binocular diagnostic](../assets/binocular.png)
-
-## Rendered examples
-
-![Gaze heatmap](../assets/heatmap.png)
-
-![Pupil time course](../assets/pupil-timecourse.png)
-
-![Missingness profile](../assets/missingness.png)
-
-![Scanpath](../assets/scanpath.png)
-
-![Transition matrix](../assets/transition-matrix.png)
-
-![Binocular diagnostic](../assets/binocular.png)
