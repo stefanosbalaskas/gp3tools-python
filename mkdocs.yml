@@ -7,6 +7,7 @@ nav:
 - Home: index.md
 - API parity: API_PARITY.md
 - API reference: API_REFERENCE.md
+- Parity & validation status: PARITY_STATUS.md
 - Articles:
   - End-to-end workflow: articles/end-to-end-workflow.md
   - Pupil workflow: articles/pupil-workflow.md
@@ -16,6 +17,8 @@ nav:
   - Cluster permutation: articles/cluster-permutation-timecourse.md
   - Face workflow: articles/face-complete-workflow.md
   - Ecosystem exports: articles/ecosystem-exports.md
+  - Complete Python workflow: articles/complete-python-workflow.md
+  - Validation and release: articles/validation-release.md
 theme:
   name: material
   features:

@@ -11,6 +11,9 @@ import numpy as np
 import pandas as pd
 from jinja2 import Template
 
+from ._behavioral_r4 import wrap_r4 as _r4_wrap
+from ._compat import r_aliases
+from ._r4_dual_contract import r4_dual_contract
 from ._utils import ensure_dataframe
 
 
@@ -59,7 +62,8 @@ def write_gazepoint_outputs(results, output_dir, prefix="gazepoint", **kwargs):
     return written
 
 
-def export_gazepoint_master_audit(data, output_dir, prefix="master_audit", **kwargs):
+def export_gazepoint_master_audit(data, output_dir=".", prefix="master_audit", **kwargs):
+    """Export the current Python master audit; output_dir now matches R optionality."""
     from .qc import audit_gazepoint_master
 
     return export_gazepoint_tables(audit_gazepoint_master(data), output_dir, prefix=prefix)
@@ -78,29 +82,1069 @@ def save_gazepoint_plots(plots, output_dir, prefix="plot", dpi=150, **kwargs):
     return out
 
 
-def create_gazepoint_reporting_checklist(data=None) -> pd.DataFrame:
-    items = [
-        "hardware and sampling rate",
-        "calibration procedure",
-        "tracking-quality criteria",
-        "missing-data handling",
-        "pupil preprocessing",
-        "AOI definitions",
-        "event detector",
-        "exclusion criteria",
-        "statistical model",
-        "software/version",
-        "sensitivity analyses",
-        "open materials/data",
+_GP3_REPORTING_R_UNSET = object()
+
+
+def _gp3_reporting_r_object_summary(objects):
+    if objects is None:
+        return pd.DataFrame(
+            columns=["object_label", "class", "object_name", "status", "message", "n_rows_overview"]
+        )
+    if isinstance(objects, pd.DataFrame):
+        objects = {"object_1": objects}
+    elif isinstance(objects, (list, tuple)):
+        objects = {f"object_{i + 1}": obj for i, obj in enumerate(objects)}
+    elif not isinstance(objects, dict):
+        raise TypeError("objects must be None, a data frame, list, tuple, or dict")
+    rows = []
+    for label, obj in objects.items():
+        overview = (
+            obj.get("overview")
+            if isinstance(obj, dict)
+            else (obj if isinstance(obj, pd.DataFrame) else None)
+        )
+        object_name = str(label)
+        status = "info"
+        message = ""
+        if isinstance(overview, pd.DataFrame) and len(overview):
+            row = overview.iloc[0]
+            if "object_name" in overview.columns and pd.notna(row["object_name"]):
+                object_name = str(row["object_name"])
+            status_candidates = [
+                c
+                for c in overview.columns
+                if any(k in c.lower() for k in ("status", "decision", "ready", "complete", "valid"))
+            ]
+            if status_candidates:
+                text = str(row[status_candidates[0]]).lower()
+                if any(k in text for k in ("fail", "false", "not ready")):
+                    status = "fail"
+                elif any(k in text for k in ("warn", "review")):
+                    status = "warn"
+                elif any(k in text for k in ("pass", "true", "ready", "ok")):
+                    status = "pass"
+            message_candidates = [
+                c for c in overview.columns if "message" in c.lower() or c.lower() == "text"
+            ]
+            if message_candidates and pd.notna(row[message_candidates[0]]):
+                message = str(row[message_candidates[0]])
+        rows.append(
+            {
+                "object_label": str(label),
+                "class": obj.get("gp3_class", "dict")
+                if isinstance(obj, dict)
+                else type(obj).__name__,
+                "object_name": object_name,
+                "status": status,
+                "message": message,
+                "n_rows_overview": 0 if overview is None else len(overview),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _gp3_reporting_r_match(object_summary, patterns, missing_status="warn"):
+    if object_summary.empty:
+        return missing_status, None
+    hay = (
+        object_summary[["object_label", "class", "object_name", "message"]]
+        .fillna("")
+        .astype(str)
+        .agg(" ".join, axis=1)
+        .str.lower()
+    )
+    mask = pd.Series(False, index=object_summary.index)
+    for pattern in patterns:
+        mask |= hay.str.contains(str(pattern).lower(), regex=False)
+    if not mask.any():
+        return missing_status, None
+    statuses = object_summary.loc[mask, "status"].astype(str).str.lower()
+    if statuses.eq("fail").any():
+        status = "fail"
+    elif statuses.eq("warn").any():
+        status = "warn"
+    elif statuses.eq("pass").any():
+        status = "pass"
+    else:
+        status = "info"
+    evidence = "; ".join(
+        f"{row.object_label} [{row['class']}: {row.status}]"
+        for _, row in object_summary.loc[mask].iterrows()
+    )
+    return status, evidence
+
+
+def create_gazepoint_reporting_checklist(
+    data=None,
+    *,
+    objects=_GP3_REPORTING_R_UNSET,
+    analysis_type=_GP3_REPORTING_R_UNSET,
+    study_title=_GP3_REPORTING_R_UNSET,
+    required_sections=_GP3_REPORTING_R_UNSET,
+    include_optional=_GP3_REPORTING_R_UNSET,
+    name=_GP3_REPORTING_R_UNSET,
+):
+    """Create the legacy checklist or the structured R v2.3.0 checklist."""
+    r_mode = any(
+        value is not _GP3_REPORTING_R_UNSET
+        for value in (
+            objects,
+            analysis_type,
+            study_title,
+            required_sections,
+            include_optional,
+            name,
+        )
+    )
+    if not r_mode:
+        items = [
+            "hardware and sampling rate",
+            "calibration procedure",
+            "tracking-quality criteria",
+            "missing-data handling",
+            "pupil preprocessing",
+            "AOI definitions",
+            "event detector",
+            "exclusion criteria",
+            "statistical model",
+            "software/version",
+            "sensitivity analyses",
+            "open materials/data",
+        ]
+        return pd.DataFrame({"item": items, "reported": [False] * len(items)})
+
+    objects = None if objects is _GP3_REPORTING_R_UNSET else objects
+    analysis_type = "general" if analysis_type is _GP3_REPORTING_R_UNSET else analysis_type
+    study_title = None if study_title is _GP3_REPORTING_R_UNSET else study_title
+    required_sections = (
+        []
+        if required_sections is _GP3_REPORTING_R_UNSET or required_sections is None
+        else (
+            [required_sections] if isinstance(required_sections, str) else list(required_sections)
+        )
+    )
+    include_optional = (
+        True if include_optional is _GP3_REPORTING_R_UNSET else bool(include_optional)
+    )
+    name = "gazepoint_reporting_checklist" if name is _GP3_REPORTING_R_UNSET else name
+    if analysis_type not in {"general", "pupil", "aoi", "combined"}:
+        raise ValueError("analysis_type must be general, pupil, aoi, or combined")
+    if data is not None and not isinstance(data, pd.DataFrame):
+        raise TypeError("data must be None or a data frame")
+
+    object_summary = _gp3_reporting_r_object_summary(objects)
+    items = []
+
+    def add(area, item_id, item, status, evidence, recommendation, required):
+        items.append(
+            {
+                "reporting_area": area,
+                "item_id": item_id,
+                "item": item,
+                "status": status,
+                "evidence": evidence,
+                "recommendation": recommendation,
+                "required": bool(required),
+            }
+        )
+
+    def matched(
+        area,
+        item_id,
+        item,
+        patterns,
+        missing_status,
+        missing_evidence,
+        recommendation,
+        required=True,
+    ):
+        status, evidence = _gp3_reporting_r_match(object_summary, patterns, missing_status)
+        add(area, item_id, item, status, evidence or missing_evidence, recommendation, required)
+
+    add(
+        "study_identification",
+        "study_title",
+        "Study title or short study label is available.",
+        "pass" if study_title else "warn",
+        str(study_title) if study_title else "No study title supplied.",
+        "Report the study title/label consistently across outputs."
+        if study_title
+        else "Supply study_title or report a clear study label in the manuscript/report.",
+        True,
+    )
+    add(
+        "study_identification",
+        "analysis_type",
+        "Analysis type is declared.",
+        "pass",
+        analysis_type,
+        f"Report this as a {analysis_type} Gazepoint/gp3tools analysis.",
+        True,
+    )
+    add(
+        "data_structure",
+        "dataset_available",
+        "Dataset/data frame was supplied to the checklist.",
+        "pass" if data is not None else "warn",
+        f"{len(data)} rows and {data.shape[1]} columns."
+        if data is not None
+        else "No data frame supplied.",
+        "Report the analytic row count and key data columns."
+        if data is not None
+        else "Supply the final analysis data frame to document row/column structure.",
+        True,
+    )
+    if data is not None:
+        pcol = next(
+            (
+                c
+                for c in ["subject", "participant", "participant_id", "pID", "USER_FILE"]
+                if c in data
+            ),
+            None,
+        )
+        tcol = next(
+            (c for c in ["trial_global", "trial", "trial_id", "MEDIA_ID", "media_id"] if c in data),
+            None,
+        )
+        if pcol and tcol:
+            n_p = int(data[pcol].dropna().nunique())
+            n_t = int(data[[pcol, tcol]].astype("string").agg("||".join, axis=1).nunique())
+            pt_status = "pass"
+            pt_evidence = f"{n_p} participants; {n_t} participant-trial units."
+        else:
+            pt_status = "warn"
+            pt_evidence = "Participant/trial columns were not both detected."
+    else:
+        pt_status = "warn"
+        pt_evidence = "No data frame supplied."
+    add(
+        "data_structure",
+        "participant_trial_structure",
+        "Participant and trial structure can be reported.",
+        pt_status,
+        pt_evidence,
+        "Report participant count, trial count, and participant-trial units.",
+        True,
+    )
+
+    matched(
+        "readiness_gate",
+        "real_data_readiness_gate",
+        "Explicit real-data readiness gate is available.",
+        ["gp3_real_data_readiness_gate", "real_data_readiness"],
+        "warn",
+        "No gp3_real_data_readiness_gate object supplied.",
+        "Use check_gazepoint_real_data_readiness() before final confirmatory analysis.",
+    )
+    matched(
+        "workflow_and_import",
+        "workflow_or_file_pair_check",
+        "Import/workflow/file-pair checks are documented.",
+        ["gp3_workflow", "file_pair", "master_audit", "master_validation"],
+        "warn",
+        "No workflow, file-pair, master-audit, or master-validation object supplied.",
+        "Report source files, import workflow, master-table construction, and validation checks.",
+    )
+    matched(
+        "sampling_and_tracking",
+        "sampling_rate_reported",
+        "Sampling-rate checks are available or should be reported.",
+        ["sampling", "check_sampling_rate"],
+        "warn",
+        "No sampling-rate object detected.",
+        "Report expected and observed sampling rate, dropped samples, and timing irregularities.",
+    )
+    matched(
+        "sampling_and_tracking",
+        "tracking_quality_reported",
+        "Tracking/gaze-signal quality checks are available or should be reported.",
+        ["tracking_quality", "gaze_signal_quality", "condition_quality_imbalance"],
+        "warn",
+        "No tracking-quality or gaze-signal-quality object detected.",
+        "Report missing gaze, valid tracking, exclusions, and condition-level quality imbalance.",
+    )
+    matched(
+        "design_and_exclusions",
+        "design_balance_reported",
+        "Design balance or post-exclusion balance is documented.",
+        ["design_balance", "post_exclusion_balance", "condition_imbalance"],
+        "warn",
+        "No design-balance or post-exclusion-balance object detected.",
+        "Report condition/sample balance before and after exclusions.",
+    )
+    matched(
+        "design_and_exclusions",
+        "exclusion_flow_reported",
+        "Exclusion flow is documented.",
+        ["exclusion_flow"],
+        "warn",
+        "No exclusion-flow object detected.",
+        "Report row, trial, participant, and condition losses due to exclusions.",
+    )
+
+    if analysis_type in {"aoi", "combined"}:
+        matched(
+            "aoi_reporting",
+            "aoi_definition_and_geometry",
+            "AOI definitions, geometry, overlap, or verification are documented.",
+            ["aoi_geometry", "aoi_overlap", "aoi_coding", "aoi_verification", "aoi_margin"],
+            "warn",
+            "No AOI geometry/coding/verification object detected.",
+            "Report AOI definitions, coordinates, overlap checks, and verification procedure.",
+        )
+        matched(
+            "aoi_reporting",
+            "aoi_outcomes_reported",
+            "AOI outcome summaries or AOI model objects are available.",
+            ["aoi_trial_features", "aoi_windows", "aoi_glmm", "aoi_gamm", "aoi_transition"],
+            "warn",
+            "No AOI outcome/model object detected.",
+            "Report AOI metrics, denominators, model family, link function, and random effects.",
+        )
+
+    if analysis_type in {"pupil", "combined"}:
+        matched(
+            "pupil_reporting",
+            "pupil_preprocessing_reported",
+            "Pupil preprocessing decisions are documented.",
+            [
+                "pupil_preprocessing",
+                "preprocessing_registry",
+                "pupil_artifacts",
+                "interpolate_gazepoint_pupil",
+                "smooth_gazepoint_pupil",
+                "baseline_correct",
+            ],
+            "warn",
+            "No pupil preprocessing/audit object detected.",
+            "Report artifact rules, interpolation method, baseline correction, smoothing, and retained samples.",
+        )
+        matched(
+            "pupil_reporting",
+            "pupil_quality_audits_reported",
+            "Pupil quality audits are documented.",
+            [
+                "pupil_gaps",
+                "pupil_baseline",
+                "pupil_imbalance",
+                "pupil_drift",
+                "pupil_overlap",
+                "pupil_reliability",
+            ],
+            "warn",
+            "No pupil quality-audit object detected.",
+            "Report gap structure, baseline quality, drift, imbalance, overlap risk, and reliability if relevant.",
+        )
+        matched(
+            "pupil_reporting",
+            "stimulus_luminance_reported",
+            "Stimulus luminance/brightness audit is available or discussed.",
+            ["stimulus_luminance", "luminance"],
+            "warn",
+            "No stimulus luminance audit detected.",
+            "Report luminance/brightness control or acknowledge it as a limitation for pupil outcomes.",
+        )
+
+    matched(
+        "models_and_diagnostics",
+        "model_results_reported",
+        "Model summaries or fixed-effect tables are available.",
+        ["model", "fixed_effects", "emmeans", "glmm", "gamm", "gca", "lmm"],
+        "warn",
+        "No model summary/fixed-effect object detected.",
+        "Report model formula, family/link, fixed effects, random effects, diagnostics, and inference criterion.",
+    )
+    matched(
+        "models_and_diagnostics",
+        "model_diagnostics_reported",
+        "Model diagnostics are available or should be reported.",
+        ["diagnose", "convergence", "singularity", "overdispersion", "model_diagnostic"],
+        "warn",
+        "No model diagnostic object detected.",
+        "Report convergence, singularity, overdispersion, residual, and sensitivity diagnostics where relevant.",
+    )
+    matched(
+        "sensitivity_and_robustness",
+        "sensitivity_analyses_reported",
+        "Sensitivity, multiverse, or optional external cross-checks are available.",
+        [
+            "sensitivity",
+            "multiverse",
+            "crosscheck",
+            "pchip",
+            "gazer",
+            "eyetools",
+            "transition_count_nb",
+            "time_varying_transition",
+        ],
+        "info",
+        "No optional sensitivity/external-cross-check object detected.",
+        "Report optional sensitivity checks when used; otherwise state that they were not part of the planned analysis.",
+        False,
+    )
+    add(
+        "reproducibility",
+        "package_workflow_reported",
+        "Package workflow and software environment can be reported.",
+        "pass",
+        f"Checklist generated by gp3tools object `{name}`.",
+        "Report gp3tools version, Python version, key optional packages, and analysis script availability.",
+        True,
+    )
+    if include_optional:
+        matched(
+            "advanced_optional_methods",
+            "advanced_sequence_or_transition_methods",
+            "Advanced sequence or transition-method reporting is available if used.",
+            ["markovchain", "semimarkov", "hmm", "transition_matrix", "time_varying_transition"],
+            "info",
+            "No advanced sequence/transition object detected.",
+            "If sequence models are used, report state definitions, transition denominators, and model assumptions.",
+            False,
+        )
+        matched(
+            "advanced_optional_methods",
+            "external_detector_or_adapter_reporting",
+            "External detector/package-adapter reporting is available if used.",
+            ["adapter", "eyetrackingr", "pupillometryr", "gazer", "eyetools", "external"],
+            "info",
+            "No external detector/adapter object detected.",
+            "If external packages are used, report package names, versions, input mapping, and any skipped/partial branches.",
+            False,
+        )
+
+    checklist = pd.DataFrame(items)
+    if required_sections:
+        checklist.loc[checklist["item_id"].isin(required_sections), "required"] = True
+    order = pd.Categorical(checklist["status"], ["fail", "warn", "pass", "info"], ordered=True)
+    checklist = (
+        checklist.assign(_order=order)
+        .sort_values(["_order", "reporting_area", "item_id"])
+        .drop(columns="_order")
+        .reset_index(drop=True)
+    )
+    counts = checklist["status"].value_counts()
+    n_fail = int(counts.get("fail", 0))
+    n_warn = int(counts.get("warn", 0))
+    n_pass = int(counts.get("pass", 0))
+    n_info = int(counts.get("info", 0))
+    checklist_status = "fail" if n_fail else ("warn" if n_warn else "pass")
+    section_rows = []
+    for area, frame in checklist.groupby("reporting_area", sort=True):
+        section_rows.append(
+            {
+                "reporting_area": area,
+                "n_items": len(frame),
+                "n_required": int(frame["required"].sum()),
+                "n_fail": int(frame["status"].eq("fail").sum()),
+                "n_warn": int(frame["status"].eq("warn").sum()),
+                "n_pass": int(frame["status"].eq("pass").sum()),
+                "n_info": int(frame["status"].eq("info").sum()),
+                "area_status": "fail"
+                if frame["status"].eq("fail").any()
+                else ("warn" if frame["status"].eq("warn").any() else "pass"),
+            }
+        )
+    section_summary = pd.DataFrame(section_rows)
+    title_text = study_title or "Untitled Gazepoint study"
+    decision = (
+        f"Reporting checklist is incomplete: {n_fail} blocking reporting item(s) require attention."
+        if checklist_status == "fail"
+        else (
+            f"Reporting checklist is conditionally complete: no blocking reporting failures, but {n_warn} warning-level item(s) should be reviewed."
+            if checklist_status == "warn"
+            else "Reporting checklist is complete: no blocking or warning-level reporting items were detected."
+        )
+    )
+    text_summary = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "study_title": title_text,
+                "analysis_type": analysis_type,
+                "checklist_status": checklist_status,
+                "text": f"{title_text} was checked as a {analysis_type} Gazepoint/gp3tools analysis. {decision} Item counts: {n_pass} pass, {n_warn} warn, {n_fail} fail, {n_info} info.",
+            }
+        ]
+    )
+    if data is None:
+        data_summary = pd.DataFrame(
+            [
+                {
+                    "object_name": name,
+                    "analysis_type": analysis_type,
+                    "n_rows": np.nan,
+                    "n_columns": np.nan,
+                    "n_participants": np.nan,
+                    "n_trial_units": np.nan,
+                }
+            ]
+        )
+    else:
+        pcol = next(
+            (
+                c
+                for c in ["subject", "participant", "participant_id", "pID", "USER_FILE"]
+                if c in data
+            ),
+            None,
+        )
+        tcol = next(
+            (c for c in ["trial_global", "trial", "trial_id", "MEDIA_ID", "media_id"] if c in data),
+            None,
+        )
+        n_p = int(data[pcol].dropna().nunique()) if pcol else np.nan
+        n_t = (
+            int(data[[pcol, tcol]].astype("string").agg("||".join, axis=1).nunique())
+            if pcol and tcol
+            else np.nan
+        )
+        data_summary = pd.DataFrame(
+            [
+                {
+                    "object_name": name,
+                    "analysis_type": analysis_type,
+                    "n_rows": len(data),
+                    "n_columns": data.shape[1],
+                    "n_participants": n_p,
+                    "n_trial_units": n_t,
+                }
+            ]
+        )
+    overview = pd.DataFrame(
+        [
+            {
+                "object_name": name,
+                "study_title": study_title if study_title else pd.NA,
+                "analysis_type": analysis_type,
+                "checklist_status": checklist_status,
+                "ready_for_reporting": n_fail == 0,
+                "n_items": len(checklist),
+                "n_required_items": int(checklist["required"].sum()),
+                "n_fail": n_fail,
+                "n_warn": n_warn,
+                "n_pass": n_pass,
+                "n_info": n_info,
+                "n_objects_supplied": len(object_summary),
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "analysis_type",
+                "study_title",
+                "required_sections",
+                "include_optional",
+                "name",
+            ],
+            "value": [
+                analysis_type,
+                study_title if study_title else pd.NA,
+                ", ".join(required_sections) if required_sections else pd.NA,
+                str(include_optional),
+                name,
+            ],
+        }
+    )
+    return {
+        "overview": overview,
+        "checklist": checklist,
+        "section_summary": section_summary,
+        "object_summary": object_summary,
+        "data_summary": data_summary,
+        "text_summary": text_summary,
+        "settings": settings,
+        "gp3_class": "gp3_reporting_checklist",
+    }
+
+
+def create_gazepoint_analysis_decision_audit(
+    results=None,
+    branch_roles=None,
+    required_confirmatory=(),
+    diagnostics_required=True,
+    require_clean_diagnostics=False,
+    **branches,
+):
+    """Create an R-v2.3.0-style analysis decision audit."""
+    import numpy as np
+    import pandas as pd
+
+    legacy_plain_decisions = (
+        results is None
+        and branch_roles is None
+        and not required_confirmatory
+        and bool(diagnostics_required) is True
+        and bool(require_clean_diagnostics) is False
+        and bool(branches)
+        and all(
+            value is None or isinstance(value, (str, int, float, bool, np.number, np.bool_))
+            for value in branches.values()
+        )
+    )
+    if legacy_plain_decisions:
+        return pd.DataFrame(
+            [{"decision": key, "value": str(value)} for key, value in branches.items()]
+        )
+
+    if results is not None:
+        if not isinstance(results, dict):
+            raise ValueError("`results` must be a named list when supplied.")
+        merged = dict(results)
+        merged.update(branches)
+        branches = merged
+    if not branches:
+        raise ValueError(
+            "At least one named analysis result must be supplied through `...` or `results`."
+        )
+    if any(not isinstance(name, str) or not name for name in branches):
+        raise ValueError("All analysis result objects must be named.")
+    if not isinstance(diagnostics_required, (bool, np.bool_)):
+        raise ValueError("`diagnostics_required` must be TRUE or FALSE.")
+    if not isinstance(require_clean_diagnostics, (bool, np.bool_)):
+        raise ValueError("`require_clean_diagnostics` must be TRUE or FALSE.")
+    required_confirmatory = list(required_confirmatory or [])
+
+    allowed = {
+        "confirmatory",
+        "sensitivity",
+        "exploratory",
+        "diagnostic",
+        "preprocessing",
+        "reporting",
+        "unknown",
+    }
+    branch_names = list(branches)
+
+    if branch_roles is None:
+        roles = pd.DataFrame(
+            {
+                "branch_name": branch_names,
+                "decision_type": ["unknown"] * len(branch_names),
+                "analysis_family": [pd.NA] * len(branch_names),
+                "interpretation_scope": [pd.NA] * len(branch_names),
+                "notes": [pd.NA] * len(branch_names),
+            }
+        )
+    else:
+        if not isinstance(branch_roles, pd.DataFrame):
+            raise ValueError("`branch_roles` must be a data frame when supplied.")
+        if not {"branch_name", "decision_type"}.issubset(branch_roles.columns):
+            missing = [c for c in ("branch_name", "decision_type") if c not in branch_roles.columns]
+            raise ValueError("`branch_roles` is missing required column(s): " + ", ".join(missing))
+        roles = branch_roles.copy()
+        roles["branch_name"] = roles["branch_name"].astype(str)
+        roles["decision_type"] = roles["decision_type"].astype(str).str.lower()
+        bad = [x for x in pd.unique(roles["decision_type"]) if x not in allowed]
+        if bad:
+            raise ValueError(
+                "`branch_roles$decision_type` contains unsupported value(s): "
+                + ", ".join(map(str, bad))
+            )
+        for c in ("analysis_family", "interpretation_scope", "notes"):
+            if c not in roles:
+                roles[c] = pd.NA
+        roles = roles[
+            ["branch_name", "decision_type", "analysis_family", "interpretation_scope", "notes"]
+        ]
+        missing_roles = [name for name in branch_names if name not in set(roles["branch_name"])]
+        if missing_roles:
+            roles = pd.concat(
+                [
+                    roles,
+                    pd.DataFrame(
+                        {
+                            "branch_name": missing_roles,
+                            "decision_type": ["unknown"] * len(missing_roles),
+                            "analysis_family": [pd.NA] * len(missing_roles),
+                            "interpretation_scope": [pd.NA] * len(missing_roles),
+                            "notes": [pd.NA] * len(missing_roles),
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
+        roles = roles.set_index("branch_name").loc[branch_names].reset_index()
+
+    def object_class(obj):
+        if obj is None:
+            return "NULL"
+        if isinstance(obj, pd.DataFrame):
+            return "data.frame"
+        if isinstance(obj, dict):
+            return "list"
+        if isinstance(obj, (list, tuple)):
+            return "list"
+        return type(obj).__name__
+
+    def object_type(obj):
+        if obj is None:
+            return "NULL"
+        if isinstance(obj, (dict, list, tuple, pd.DataFrame)):
+            return "list"
+        if isinstance(obj, (bool, np.bool_)):
+            return "logical"
+        if isinstance(obj, str):
+            return "character"
+        if isinstance(obj, (int, float, np.number)):
+            return "double"
+        return type(obj).__name__
+
+    def branch_status(obj):
+        if obj is None:
+            return "not_run"
+        if isinstance(obj, pd.DataFrame):
+            status_cols = [c for c in obj.columns if "status" in str(c)]
+            if status_cols:
+                vals = [str(x) for x in pd.unique(obj[status_cols[0]].dropna())]
+                if vals:
+                    return ", ".join(vals)
+            return "table_available"
+        if not isinstance(obj, dict):
+            return "object_available"
+        for nm in (
+            "model_status",
+            "sensitivity_status",
+            "cluster_status",
+            "summary_status",
+            "diagnostic_status",
+            "workflow_status",
+            "validation_status",
+            "status",
+        ):
+            if nm in obj and obj[nm] is not None:
+                value = obj[nm]
+                if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+                    return ", ".join(map(str, value))
+                return str(value)
+        overview = obj.get("overview")
+        if isinstance(overview, pd.DataFrame) and len(overview):
+            status_cols = [c for c in overview.columns if "status" in str(c)]
+            if status_cols:
+                vals = [str(x) for x in pd.unique(overview[status_cols[0]].dropna())]
+                if vals:
+                    return ", ".join(vals)
+        return "object_available"
+
+    def logical_field(obj, field):
+        if isinstance(obj, dict) and field in obj and isinstance(obj[field], (bool, np.bool_)):
+            return bool(obj[field])
+        return pd.NA
+
+    branch_rows = []
+    for name, obj in branches.items():
+        role = roles.loc[roles["branch_name"].eq(name)].iloc[0]
+        branch_rows.append(
+            {
+                "branch_name": name,
+                "decision_type": role["decision_type"],
+                "analysis_family": role["analysis_family"],
+                "interpretation_scope": role["interpretation_scope"],
+                "notes": role["notes"],
+                "branch_run": obj is not None,
+                "object_class": object_class(obj),
+                "object_type": object_type(obj),
+                "branch_status": branch_status(obj),
+                "fallback_used": logical_field(obj, "fallback_used"),
+                "singular_fit": logical_field(obj, "singular_fit"),
+                "has_model": isinstance(obj, dict) and obj.get("model") is not None,
+                "has_diagnostics": isinstance(obj, dict) and obj.get("diagnostics") is not None,
+            }
+        )
+    branch_audit = pd.DataFrame(branch_rows)
+
+    def status_is_warning(values):
+        out = []
+        for value in values:
+            x = str(value).lower()
+            out.append("warning" in x or "singular" in x or "overdispers" in x or "failed" in x)
+        return np.asarray(out, dtype=bool)
+
+    def status_is_error(values):
+        return np.asarray(["error" in str(x).lower() for x in values], dtype=bool)
+
+    def status_is_skipped(values):
+        return np.asarray(
+            [("skipped" in str(x).lower()) or ("not_applicable" in str(x).lower()) for x in values],
+            dtype=bool,
+        )
+
+    diagnostic_rows = []
+    for name, obj in branches.items():
+        if obj is None:
+            diagnostic_rows.append(
+                {
+                    "branch_name": name,
+                    "diagnostic_source": "none",
+                    "diagnostic_status": "not_run",
+                    "n_warning": np.nan,
+                    "n_error": np.nan,
+                    "n_skipped": np.nan,
+                    "message": "Branch was not run.",
+                }
+            )
+            continue
+        diagnostics = obj.get("diagnostics") if isinstance(obj, dict) else None
+        if diagnostics is None:
+            diagnostic_rows.append(
+                {
+                    "branch_name": name,
+                    "diagnostic_source": "none",
+                    "diagnostic_status": "not_available",
+                    "n_warning": np.nan,
+                    "n_error": np.nan,
+                    "n_skipped": np.nan,
+                    "message": "No diagnostics component was found.",
+                }
+            )
+            continue
+        tables = []
+        if isinstance(diagnostics, dict):
+            tables = [x for x in diagnostics.values() if isinstance(x, pd.DataFrame)]
+        elif isinstance(diagnostics, pd.DataFrame):
+            tables = [diagnostics]
+        if not tables:
+            diagnostic_rows.append(
+                {
+                    "branch_name": name,
+                    "diagnostic_source": "diagnostics",
+                    "diagnostic_status": "not_available",
+                    "n_warning": np.nan,
+                    "n_error": np.nan,
+                    "n_skipped": np.nan,
+                    "message": "Diagnostics object did not contain data-frame components.",
+                }
+            )
+            continue
+        combined = pd.concat(tables, ignore_index=True, sort=False)
+        status_cols = [c for c in combined.columns if "status" in str(c)]
+        message_cols = [c for c in combined.columns if "message" in str(c) or "warning" in str(c)]
+        status_values = []
+        for c in status_cols:
+            status_values.extend([str(x) for x in combined[c].tolist() if pd.notna(x) and str(x)])
+        messages = []
+        for c in message_cols:
+            messages.extend([str(x) for x in combined[c].tolist() if pd.notna(x) and str(x)])
+        if not status_values:
+            collapsed = "not_available"
+        elif status_is_error(status_values).any():
+            collapsed = "error"
+        elif status_is_warning(status_values).any():
+            collapsed = "diagnostic_warning"
+        elif status_is_skipped(status_values).any():
+            collapsed = "skipped"
+        else:
+            collapsed = "ok"
+        unique_messages = list(dict.fromkeys(messages))
+        diagnostic_rows.append(
+            {
+                "branch_name": name,
+                "diagnostic_source": "diagnostics",
+                "diagnostic_status": collapsed,
+                "n_warning": int(status_is_warning(status_values).sum()),
+                "n_error": int(status_is_error(status_values).sum()),
+                "n_skipped": int(status_is_skipped(status_values).sum()),
+                "message": " | ".join(unique_messages) if unique_messages else pd.NA,
+            }
+        )
+
+    diagnostics_summary = branch_audit[["branch_name", "decision_type"]].merge(
+        pd.DataFrame(diagnostic_rows), on="branch_name", how="left", sort=False
+    )
+
+    cautions = []
+
+    def add_caution(names, caution_type, level, message):
+        for name in names:
+            cautions.append(
+                {
+                    "branch_name": name,
+                    "caution_type": caution_type,
+                    "caution_level": level,
+                    "message": message,
+                }
+            )
+
+    add_caution(
+        branch_audit.loc[branch_audit["decision_type"].eq("unknown"), "branch_name"],
+        "unclassified_branch",
+        "moderate",
+        "Branch was run but not classified as confirmatory, sensitivity, exploratory, diagnostic, preprocessing, or reporting.",
+    )
+    add_caution(
+        branch_audit.loc[branch_audit["decision_type"].eq("exploratory"), "branch_name"],
+        "exploratory_not_confirmatory",
+        "moderate",
+        "Exploratory branches should not be reported as confirmatory hypothesis tests.",
+    )
+    add_caution(
+        branch_audit.loc[branch_audit["decision_type"].eq("sensitivity"), "branch_name"],
+        "sensitivity_not_primary",
+        "low",
+        "Sensitivity branches should be interpreted as robustness checks rather than primary confirmatory tests.",
+    )
+    run_names = set(branch_audit.loc[branch_audit["branch_run"], "branch_name"])
+    missing_required = [x for x in required_confirmatory if x not in run_names]
+    add_caution(
+        missing_required,
+        "missing_required_confirmatory_branch",
+        "high",
+        "A required confirmatory branch was not supplied or was not run.",
+    )
+    if diagnostics_required:
+        mask = (
+            branch_audit["decision_type"].eq("confirmatory")
+            & branch_audit["has_model"]
+            & ~branch_audit["has_diagnostics"]
+        )
+        add_caution(
+            branch_audit.loc[mask, "branch_name"],
+            "confirmatory_model_without_diagnostics",
+            "moderate",
+            "Confirmatory model branch has no extractable diagnostics component.",
+        )
+    warning_statuses = {"warning", "diagnostic_warning", "singular_fit", "overdispersed"}
+    warning_names = diagnostics_summary.loc[
+        diagnostics_summary["diagnostic_status"].isin(warning_statuses), "branch_name"
     ]
-    return pd.DataFrame({"item": items, "reported": [False] * len(items)})
+    add_caution(
+        warning_names,
+        "diagnostic_warning",
+        "high" if require_clean_diagnostics else "moderate",
+        "At least one diagnostic component returned a warning-like status.",
+    )
+    error_names = diagnostics_summary.loc[
+        diagnostics_summary["diagnostic_status"].eq("error"), "branch_name"
+    ]
+    add_caution(
+        error_names,
+        "diagnostic_error",
+        "high",
+        "At least one diagnostic component returned an error status.",
+    )
+    fallback_names = branch_audit.loc[
+        branch_audit["fallback_used"].fillna(False).astype(bool), "branch_name"
+    ]
+    add_caution(
+        fallback_names,
+        "fallback_model_used",
+        "moderate",
+        "A fallback model or fallback analysis path was used.",
+    )
+    singular_names = branch_audit.loc[
+        branch_audit["singular_fit"].fillna(False).astype(bool), "branch_name"
+    ]
+    add_caution(
+        singular_names,
+        "singular_fit",
+        "moderate",
+        "A singular random-effects structure was reported.",
+    )
+    interpretation_cautions = pd.DataFrame(
+        cautions, columns=["branch_name", "caution_type", "caution_level", "message"]
+    )
 
+    has_diag_error = diagnostics_summary["diagnostic_status"].eq("error").any()
+    has_required_warning = (
+        diagnostics_summary["branch_name"].isin(required_confirmatory)
+        & diagnostics_summary["diagnostic_status"].isin(warning_statuses)
+    ).any()
+    has_high = (
+        interpretation_cautions["caution_level"].eq("high").any()
+        if len(interpretation_cautions)
+        else False
+    )
+    has_any = bool(len(interpretation_cautions))
+    if missing_required:
+        readiness_status = "not_ready"
+        readiness_message = "Missing required confirmatory branch(es): " + ", ".join(
+            missing_required
+        )
+    elif has_diag_error:
+        readiness_status = "not_ready"
+        readiness_message = "At least one branch has a diagnostic error."
+    elif require_clean_diagnostics and has_required_warning:
+        readiness_status = "not_ready"
+        readiness_message = "A required confirmatory branch has diagnostic warnings and clean diagnostics were required."
+    elif has_high or has_any:
+        readiness_status = "ready_with_cautions"
+        readiness_message = (
+            "Analysis branches are available, but interpretation cautions should be reported."
+        )
+    else:
+        readiness_status = "ready"
+        readiness_message = (
+            "Analysis branches are available with no flagged interpretation cautions."
+        )
 
-def create_gazepoint_analysis_decision_audit(**decisions) -> pd.DataFrame:
-    return (
-        pd.DataFrame([{"decision": k, "value": str(v)} for k, v in decisions.items()])
-        if decisions
-        else pd.DataFrame(columns=["decision", "value"])
+    readiness = pd.DataFrame(
+        [
+            {
+                "readiness_status": readiness_status,
+                "message": readiness_message,
+                "n_required_confirmatory": len(required_confirmatory),
+                "n_missing_required_confirmatory": len(missing_required),
+                "n_cautions": len(interpretation_cautions),
+                "n_high_cautions": int(
+                    interpretation_cautions["caution_level"].eq("high").sum()
+                    if len(interpretation_cautions)
+                    else 0
+                ),
+                "require_clean_diagnostics": bool(require_clean_diagnostics),
+            }
+        ]
+    )
+    overview = pd.DataFrame(
+        [
+            {
+                "n_branches": len(branch_audit),
+                "n_confirmatory": int(branch_audit["decision_type"].eq("confirmatory").sum()),
+                "n_sensitivity": int(branch_audit["decision_type"].eq("sensitivity").sum()),
+                "n_exploratory": int(branch_audit["decision_type"].eq("exploratory").sum()),
+                "n_diagnostic": int(branch_audit["decision_type"].eq("diagnostic").sum()),
+                "n_preprocessing": int(branch_audit["decision_type"].eq("preprocessing").sum()),
+                "n_reporting": int(branch_audit["decision_type"].eq("reporting").sum()),
+                "n_unknown": int(branch_audit["decision_type"].eq("unknown").sum()),
+                "n_diagnostic_warnings": int(
+                    diagnostics_summary["diagnostic_status"].isin(warning_statuses).sum()
+                ),
+                "n_cautions": len(interpretation_cautions),
+                "readiness_status": readiness_status,
+                "readiness_message": readiness_message,
+            }
+        ]
+    )
+    settings = pd.DataFrame(
+        {
+            "setting": [
+                "required_confirmatory",
+                "diagnostics_required",
+                "require_clean_diagnostics",
+            ],
+            "value": [
+                ", ".join(required_confirmatory),
+                "TRUE" if diagnostics_required else "FALSE",
+                "TRUE" if require_clean_diagnostics else "FALSE",
+            ],
+        }
+    )
+
+    class _AnalysisAuditResult(dict):
+        @property
+        def empty(self):
+            return False
+
+    return _AnalysisAuditResult(
+        {
+            "overview": overview,
+            "branch_audit": branch_audit,
+            "diagnostics_summary": diagnostics_summary,
+            "interpretation_cautions": interpretation_cautions,
+            "readiness": readiness,
+            "settings": settings,
+        }
     )
 
 
@@ -119,6 +1163,73 @@ def create_gazepoint_report(
     metadata=None,
     **kwargs,
 ) -> Path:
+
+    # === R3B CREATE REPORT SELECTOR ===
+    # === R3B CANONICAL REPORT KWARG GUARD ===
+    _r3b_canonical_report_kwargs = {
+        "overwrite",
+        "max_rows",
+        "save_plots",
+        "plot_dir",
+    }
+    if any(key in kwargs for key in _r3b_canonical_report_kwargs):
+        from ._behavioral_r3b import (
+            create_gazepoint_report as _r3b_create_report,
+        )
+
+        return _r3b_create_report(
+            results=results,
+            output_file=output_file,
+            title=title,
+            metadata=metadata,
+            **kwargs,
+        )
+
+    if (
+        isinstance(results, dict)
+        and {
+            "sampling",
+            "quality",
+            "flagged_quality",
+            "aoi_table",
+        }.issubset(results)
+        and metadata is None
+        and any(
+            key in kwargs
+            for key in {
+                "overwrite",
+                "max_rows",
+                "save_plots",
+                "plot_dir",
+            }
+        )
+    ):
+        from ._behavioral_r3b import (
+            create_gazepoint_report as _r3b,
+        )
+
+        return _r3b(
+            results=results,
+            output_file=output_file,
+            title=title,
+            overwrite=kwargs.pop(
+                "overwrite",
+                True,
+            ),
+            max_rows=kwargs.pop(
+                "max_rows",
+                30,
+            ),
+            save_plots=kwargs.pop(
+                "save_plots",
+                True,
+            ),
+            plot_dir=kwargs.pop(
+                "plot_dir",
+                None,
+            ),
+        )
+
     sections = []
     if isinstance(results, pd.DataFrame):
         results = {"Results": results}
@@ -140,36 +1251,495 @@ def create_gazepoint_report(
     return p
 
 
-def report_gazepoint_missingness(data) -> str:
-    df = ensure_dataframe(data)
-    p = float(df.isna().mean().mean())
-    return f"Across {len(df)} rows and {df.shape[1]} columns, the mean cell-level missingness proportion was {p:.3f}."
+def report_gazepoint_missingness(
+    data,
+    cols=None,
+    group_cols=None,
+    digits=None,
+    max_variables=None,
+):
+    """Return legacy text or the R v2.3.0 structured missingness report."""
+    if cols is None and group_cols is None and digits is None and max_variables is None:
+        from .qc import summarise_gazepoint_missingness
+
+        summary = summarise_gazepoint_missingness(data)
+        if summary.empty:
+            return "No missingness summary available."
+        column_name = "column" if "column" in summary else "variable"
+        rate_name = "missing_prop" if "missing_prop" in summary else "missing_rate"
+        top = summary.sort_values(rate_name, ascending=False).iloc[0]
+        return f"Highest missingness: {top[column_name]} ({top[rate_name]:.1%})."
+
+    from .qc import summarise_gazepoint_missingness
+
+    digits = 1 if digits is None else int(digits)
+    max_variables = 5 if max_variables is None else int(max_variables)
+    if digits < 0 or max_variables < 1:
+        raise ValueError("digits must be non-negative and max_variables positive")
+    if isinstance(data, pd.DataFrame) and {
+        "group_id",
+        "variable",
+        "n_rows",
+        "n_missing",
+        "missing_rate",
+    }.issubset(data.columns):
+        summary = data.copy()
+    else:
+        summary = summarise_gazepoint_missingness(data, cols=cols, group_cols=group_cols)
+    variable_summary = (
+        summary.groupby("variable", dropna=False, sort=False)[["n_rows", "n_missing"]]
+        .sum()
+        .reset_index()
+    )
+    variable_summary["missing_rate"] = np.where(
+        variable_summary["n_rows"] > 0,
+        variable_summary["n_missing"] / variable_summary["n_rows"],
+        np.nan,
+    )
+    variable_summary = variable_summary.sort_values("missing_rate", ascending=False)
+    total_rows = float(variable_summary["n_rows"].sum())
+    total_missing = float(variable_summary["n_missing"].sum())
+    overall_rate = total_missing / total_rows if total_rows > 0 else np.nan
+    top = variable_summary.head(max_variables)
+    top_text = (
+        ", ".join(
+            f"{row.variable} ({round(100 * row.missing_rate, digits)}%)"
+            for row in top.itertuples(index=False)
+        )
+        or "no variables"
+    )
+    text = (
+        f"Missingness was summarized across {summary['variable'].nunique()} variable(s). "
+        f"The overall cell-level missingness rate was {round(100 * overall_rate, digits)}%. "
+        f"The highest missingness variable(s) were: {top_text}. These values are descriptive "
+        "data-coverage diagnostics and do not by themselves define exclusion decisions."
+    )
+    overall = pd.DataFrame(
+        [
+            {
+                "n_variables": int(summary["variable"].nunique()),
+                "n_groups": int(summary["group_id"].nunique()),
+                "total_cells": total_rows,
+                "total_missing": total_missing,
+                "overall_missing_rate": overall_rate,
+            }
+        ]
+    )
+    return {
+        "summary": summary,
+        "overall": overall,
+        "variable_summary": variable_summary,
+        "report_text": text,
+    }
 
 
-def report_gazepoint_phase_coverage(data) -> str:
-    df = ensure_dataframe(data)
-    return f"Phase-coverage table contains {len(df)} row(s)."
+def report_gazepoint_phase_coverage(
+    data,
+    phase_col="task_phase",
+    group_cols=None,
+    time_col=None,
+    value_cols=None,
+    digits=None,
+):
+    """Return legacy text or the R v2.3.0 structured phase-coverage report."""
+    if group_cols is None and time_col is None and value_cols is None and digits is None:
+        df = ensure_dataframe(data, copy=False)
+        if phase_col not in df:
+            return "No task-phase column available."
+        counts = df[phase_col].value_counts(dropna=False)
+        return f"Task-phase coverage: {len(counts)} phase(s) across {len(df)} row(s)."
+
+    from .qc import summarise_gazepoint_phase_coverage
+
+    digits = 1 if digits is None else int(digits)
+    if digits < 0:
+        raise ValueError("digits must be non-negative")
+    required_summary = {"group_id", "phase", "n_rows"}
+    summary = (
+        data.copy()
+        if isinstance(data, pd.DataFrame) and required_summary.issubset(data.columns)
+        else summarise_gazepoint_phase_coverage(
+            data,
+            phase_col=phase_col,
+            group_cols=group_cols,
+            time_col=time_col,
+            value_cols=value_cols,
+        )
+    )
+    phase_totals = (
+        summary.groupby("phase", dropna=False, sort=False)["n_rows"]
+        .sum()
+        .reset_index()
+        .sort_values("n_rows", ascending=False)
+    )
+    total_rows = int(phase_totals["n_rows"].sum())
+    n_phases = int(summary["phase"].nunique(dropna=False))
+    n_groups = int(summary["group_id"].nunique(dropna=False))
+    least = phase_totals.sort_values("n_rows", ascending=True).iloc[0]
+    if "complete_value_rate" in summary:
+        rates = pd.to_numeric(summary["complete_value_rate"], errors="coerce")
+        weights = pd.to_numeric(summary["n_rows"], errors="coerce")
+        valid = rates.notna() & weights.notna()
+        weighted_complete = (
+            float(np.average(rates[valid], weights=weights[valid])) if valid.any() else np.nan
+        )
+    else:
+        weighted_complete = np.nan
+    complete_text = (
+        f" The weighted complete-value rate across summarized phases was "
+        f"{round(100 * weighted_complete, digits)}%."
+        if np.isfinite(weighted_complete)
+        else ""
+    )
+    report_text = (
+        f"Task-phase coverage was summarized across {n_phases} phase(s) and {n_groups} "
+        f"group(s), representing {total_rows} row(s). The least represented phase was "
+        f"'{least['phase']}' with {int(least['n_rows'])} row(s).{complete_text} "
+        "These values are descriptive data-coverage diagnostics and do not by themselves "
+        "define exclusion decisions."
+    )
+    overall = pd.DataFrame(
+        [
+            {
+                "n_phases": n_phases,
+                "n_groups": n_groups,
+                "total_rows": total_rows,
+                "least_represented_phase": least["phase"],
+                "least_represented_phase_rows": int(least["n_rows"]),
+                "weighted_complete_value_rate": weighted_complete,
+            }
+        ]
+    )
+    return {
+        "summary": summary,
+        "overall": overall,
+        "phase_totals": phase_totals,
+        "report_text": report_text,
+    }
 
 
-def report_gazepoint_qc_overview(data) -> str:
+def report_gazepoint_qc_overview(data, max_objects=None):
+    """Return the legacy short text or an R-style structured QC overview."""
     from .qc import summarise_gazepoint_qc_status
 
-    q = summarise_gazepoint_qc_status(data)
-    return f"QC summary contains {len(q)} evaluated unit(s)."
+    if isinstance(data, pd.DataFrame) and {"object_name", "qc_status"}.issubset(data.columns):
+        summary_table = data[["object_name", "qc_status"]].copy()
+    elif isinstance(data, pd.DataFrame) and {"component", "status"}.issubset(data.columns):
+        summary_table = data[["component", "status"]].copy()
+    else:
+        summary_table = summarise_gazepoint_qc_status(data)
+    if max_objects is None:
+        return f"QC summary contains {len(summary_table)} evaluated unit(s)."
+    try:
+        max_objects = int(max_objects)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_objects must be a positive integer") from exc
+    if max_objects < 1:
+        raise ValueError("max_objects must be a positive integer")
+
+    if {"component", "status"}.issubset(summary_table.columns):
+        object_summary = summary_table.rename(
+            columns={"component": "object_name", "status": "qc_status"}
+        ).copy()
+    else:
+        object_summary = summary_table.copy()
+        if "object_name" not in object_summary:
+            object_summary["object_name"] = [f"object_{i + 1}" for i in range(len(object_summary))]
+        if "qc_status" not in object_summary:
+            object_summary["qc_status"] = "unknown"
+    status = object_summary["qc_status"].astype(str)
+    counts = {
+        label: int(status.eq(label).sum()) for label in ["pass", "warn", "fail", "info", "unknown"]
+    }
+    counts["unknown"] += int(
+        ~status.isin(
+            ["pass", "warn", "fail", "info", "unknown", "available", "not_available"]
+        ).sum()
+    )
+    counts["pass"] += int(status.eq("available").sum())
+    counts["unknown"] += int(status.eq("not_available").sum())
+    overall_status = (
+        "fail" if counts["fail"] else "warn" if counts["warn"] or counts["unknown"] else "pass"
+    )
+    overview = pd.DataFrame(
+        [
+            {
+                "n_objects": len(object_summary),
+                "n_pass": counts["pass"],
+                "n_warn": counts["warn"],
+                "n_fail": counts["fail"],
+                "n_info": counts["info"],
+                "n_unknown": counts["unknown"],
+                "qc_overview_status": overall_status,
+            }
+        ]
+    )
+    review = object_summary.loc[
+        object_summary["qc_status"].astype(str).isin(["fail", "warn", "unknown", "not_available"])
+    ].copy()
+    priority = {"fail": 0, "warn": 1, "unknown": 2, "not_available": 2}
+    if len(review):
+        review["_order"] = review["qc_status"].astype(str).map(priority).fillna(3)
+        review = review.sort_values(["_order", "object_name"], kind="stable")
+    names = review["object_name"].head(max_objects).astype(str).tolist() if len(review) else []
+    review_text = ", ".join(names) if names else "none"
+    report_text = (
+        f"QC overview collected {len(object_summary)} object(s): "
+        f"{counts['pass']} pass, {counts['warn']} warn, {counts['fail']} fail, "
+        f"{counts['info']} info, and {counts['unknown']} unknown. "
+        f"Overall QC overview status was '{overall_status}'. "
+        f"Object(s) needing review or interpretation: {review_text}. "
+        "This overview is a reporting aid only; it does not replace the underlying "
+        "audit outputs, readiness gates, or exclusion decisions."
+    )
+    return {
+        "summary": {"overview": overview, "object_summary": object_summary},
+        "object_summary": object_summary,
+        "report_text": report_text,
+        "_gp3_class": "gp3_qc_overview_report",
+    }
 
 
-def report_gazepoint_face_qc(data) -> str:
-    from .face import audit_gazepoint_face_quality
+def report_gazepoint_face_qc(
+    face_data=None,
+    quality_audit=None,
+    sync_audit=None,
+    window_summary=None,
+    reactivity_summary=None,
+    multimodal_model=None,
+    checklist=None,
+    output="markdown",
+    include_cautions=True,
+):
+    """Report external facial-behaviour QC and reporting readiness."""
+    from .face import create_gazepoint_face_reporting_checklist
 
-    q = audit_gazepoint_face_quality(data)
-    return f"Face-quality audit evaluated {int(q['n'].iloc[0])} row(s)."
+    if output not in {"markdown", "list"}:
+        raise ValueError("output must be 'markdown' or 'list'")
+
+    if checklist is None:
+        checklist = create_gazepoint_face_reporting_checklist(
+            face_data=face_data,
+            quality_audit=quality_audit,
+            sync_audit=sync_audit,
+            window_summary=window_summary,
+            reactivity_summary=reactivity_summary,
+            multimodal_model=multimodal_model,
+            include_interpretation_cautions=include_cautions,
+        )
+    if not isinstance(checklist, pd.DataFrame):
+        raise TypeError("checklist must be a data frame")
+
+    def extract_table(value, key):
+        if isinstance(value, dict) and isinstance(value.get(key), pd.DataFrame):
+            return value[key].copy()
+        return pd.DataFrame()
+
+    def select_columns(value, candidates):
+        if not isinstance(value, pd.DataFrame):
+            return pd.DataFrame()
+        columns = [column for column in candidates if column in value.columns]
+        return value[columns].copy() if columns else value.copy()
+
+    model_summary = pd.DataFrame()
+    if isinstance(multimodal_model, dict) and isinstance(multimodal_model.get("settings"), dict):
+        settings = multimodal_model["settings"]
+        model_summary = pd.DataFrame(
+            [
+                {
+                    "model_class": multimodal_model.get("_gp3_class", "dict"),
+                    "outcome": settings.get("outcome"),
+                    "predictors": ", ".join(map(str, settings.get("predictors", []) or [])),
+                    "covariates": ", ".join(map(str, settings.get("covariates", []) or [])),
+                    "random_effects": settings.get("random_effects"),
+                    "n_rows_input": settings.get("n_rows_input"),
+                    "n_rows_model": settings.get("n_rows_model"),
+                }
+            ]
+        )
+
+    cautions = (
+        [
+            "External facial-behaviour outputs should be reported as algorithmic or tool-derived measurements, not as direct evidence of emotional states.",
+            "Report face-data quality, confidence, validity, synchronisation, and window coverage before interpreting model estimates.",
+            "Avoid claims of true emotion detection, hidden affect, psychological diagnosis, micro-expression evidence, or causal mechanism unless the study design and validation evidence support them.",
+        ]
+        if include_cautions
+        else []
+    )
+
+    sections = {
+        "checklist": checklist.copy(),
+        "quality_overview": extract_table(quality_audit, "overview"),
+        "quality_issues": extract_table(quality_audit, "issue_summary"),
+        "sync_overview": extract_table(sync_audit, "overview"),
+        "sync_issues": extract_table(sync_audit, "issue_summary"),
+        "window_summary_overview": select_columns(
+            window_summary,
+            [
+                "participant_id",
+                "trial_id",
+                "face_window_label",
+                "n_rows",
+                "n_used",
+                "valid_percent",
+                "face_confidence_mean",
+            ],
+        ),
+        "reactivity_overview": select_columns(
+            reactivity_summary,
+            [
+                "participant_id",
+                "trial_id",
+                "measure",
+                "statistic",
+                "baseline_window",
+                "response_window",
+                "baseline_value",
+                "response_value",
+                "reactivity",
+                "absolute_reactivity",
+            ],
+        ),
+        "model_summary": model_summary,
+        "cautions": cautions,
+        "_gp3_class": "gp3_face_qc_report_list",
+    }
+
+    if output == "list":
+        return sections
+
+    def table_lines(table):
+        if not isinstance(table, pd.DataFrame) or len(table) < 1:
+            return ["_Not supplied._"]
+        if len(table.columns) < 1:
+            return ["_No columns._"]
+        text = table.copy()
+        for column in text.columns:
+            text[column] = (
+                text[column].astype("string").fillna("").str.replace("|", "/", regex=False)
+            )
+        header = "| " + " | ".join(map(str, text.columns)) + " |"
+        divider = "| " + " | ".join(["---"] * len(text.columns)) + " |"
+        body = [
+            "| " + " | ".join(map(str, row)) + " |"
+            for row in text.itertuples(index=False, name=None)
+        ]
+        return [header, divider, *body]
+
+    lines = [
+        "# External facial-behaviour QC report",
+        "",
+        "This report summarises technical reporting readiness for external facial-behaviour data used with Gazepoint workflows. It does not infer facial expressions or emotional states.",
+        "",
+    ]
+    for title, key in [
+        ("Reporting checklist", "checklist"),
+        ("Face-data quality overview", "quality_overview"),
+        ("Face-data quality issues", "quality_issues"),
+        ("Synchronisation overview", "sync_overview"),
+        ("Synchronisation issues", "sync_issues"),
+        ("Window-summary overview", "window_summary_overview"),
+        ("Reactivity overview", "reactivity_overview"),
+        ("Model summary", "model_summary"),
+    ]:
+        lines.extend([f"## {title}", "", *table_lines(sections[key]), ""])
+    if cautions:
+        lines.extend(["## Interpretation cautions", ""])
+        lines.extend(f"- {item}" for item in cautions)
+
+    return "\n".join(lines).rstrip()
 
 
-def report_gazepoint_multiverse(data) -> str:
-    from .stats import summarise_gazepoint_multiverse_results
+def report_gazepoint_multiverse(
+    data,
+    *,
+    branch_col=None,
+    term_col=None,
+    estimate_col=None,
+    p_col=None,
+    status_col=None,
+    alpha=None,
+):
+    """Report multiverse results; bare DataFrame input retains the historical string."""
+    if all(
+        value is None for value in (branch_col, term_col, estimate_col, p_col, status_col, alpha)
+    ):
+        from .stats import summarise_gazepoint_multiverse_results
 
-    s = summarise_gazepoint_multiverse_results(data)
-    return f"Multiverse contained {int(s['n_specifications'].iloc[0])} specification(s)."
+        summary = summarise_gazepoint_multiverse_results(data)
+        if isinstance(summary, pd.DataFrame):
+            return (
+                f"Multiverse contained {int(summary['n_specifications'].iloc[0])} specification(s)."
+            )
+
+    alpha = 0.05 if alpha is None else float(alpha)
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between 0 and 1")
+    if isinstance(data, dict):
+        frame = data.get("branch_summary")
+        if frame is None:
+            frame = data.get("branch_results")
+    else:
+        frame = data
+    frame = ensure_dataframe(frame, copy=False)
+
+    def first(supplied, candidates):
+        if supplied is not None:
+            if supplied not in frame.columns:
+                raise ValueError(f"{supplied} was not found")
+            return supplied
+        return next((candidate for candidate in candidates if candidate in frame.columns), None)
+
+    branch_col = first(branch_col, ["branch", "specification", "model", "analysis", ".gp3_branch"])
+    term_col = first(term_col, ["term", "parameter", "effect", "coefficient"])
+    estimate_col = first(estimate_col, ["estimate", "effect_size", "beta", "b"])
+    p_col = first(p_col, ["p.value", "p_value", "p", "Pr(>|z|)", "Pr(>|t|)"])
+    status_col = first(status_col, ["status", "model_status", "fit_status", "branch_status"])
+    work = frame.copy()
+    if branch_col is None:
+        work[".gp3_branch"] = "all"
+        branch_col = ".gp3_branch"
+    if status_col is None:
+        work[".gp3_status"] = "unknown"
+        status_col = ".gp3_status"
+
+    branch_summary = (
+        work.groupby(branch_col, sort=True, dropna=True)
+        .agg(
+            n_rows=(branch_col, "size"),
+            status=(status_col, lambda values: ";".join(sorted(set(map(str, values))))),
+        )
+        .reset_index()
+        .rename(columns={branch_col: "branch"})
+    )
+    if term_col is not None:
+        n_terms = work.groupby(branch_col, sort=True)[term_col].nunique()
+        branch_summary["n_terms"] = branch_summary["branch"].map(n_terms)
+    else:
+        branch_summary["n_terms"] = np.nan
+    status_summary = (
+        work[status_col]
+        .astype(str)
+        .value_counts(sort=False)
+        .rename_axis("status")
+        .rename("n")
+        .reset_index()
+    )
+    status_summary["prop"] = status_summary["n"] / status_summary["n"].sum()
+    inferential = pd.DataFrame()
+    if estimate_col is not None and p_col is not None:
+        inferential = work[
+            [branch_col] + ([term_col] if term_col else []) + [estimate_col, p_col]
+        ].copy()
+        inferential["significant"] = pd.to_numeric(inferential[p_col], errors="coerce") < alpha
+    return {
+        "branch_summary": branch_summary,
+        "status_summary": status_summary,
+        "inferential_summary": inferential,
+        "alpha": alpha,
+        "_gp3_class": "gp3_multiverse_report",
+    }
 
 
 def benchmark_gazepoint_export_performance(data, repeats=3, **kwargs) -> pd.DataFrame:
@@ -196,48 +1766,694 @@ def benchmark_gazepoint_export_performance(data, repeats=3, **kwargs) -> pd.Data
     return pd.DataFrame(rows)
 
 
+def _gp3_perf_summarise_trials(results) -> pd.DataFrame:
+    df = ensure_dataframe(results, copy=False)
+
+    if not len(df):
+        return pd.DataFrame()
+
+    required = {
+        "scale_id",
+        "total_rows",
+        "n_files",
+        "rows_per_file",
+        "operation",
+        "status",
+        "elapsed_s",
+        "heap_delta_mb",
+        "output_size_mb",
+    }
+
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError("trial benchmark data is missing: " + ", ".join(sorted(missing)))
+
+    group_cols = [
+        "scale_id",
+        "total_rows",
+        "n_files",
+        "rows_per_file",
+        "operation",
+    ]
+
+    rows = []
+
+    for keys, part in df.groupby(
+        group_cols,
+        dropna=False,
+        sort=False,
+    ):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        values = dict(zip(group_cols, keys, strict=True))
+        ok = part["status"].astype("string").eq("ok")
+
+        elapsed = pd.to_numeric(
+            part.loc[ok, "elapsed_s"],
+            errors="coerce",
+        )
+
+        heap = pd.to_numeric(
+            part.loc[ok, "heap_delta_mb"],
+            errors="coerce",
+        )
+
+        output = pd.to_numeric(
+            part.loc[ok, "output_size_mb"],
+            errors="coerce",
+        )
+
+        def median_or_nan(x):
+            x = x[np.isfinite(x)]
+            return float(x.median()) if len(x) else np.nan
+
+        def min_or_nan(x):
+            x = x[np.isfinite(x)]
+            return float(x.min()) if len(x) else np.nan
+
+        def max_or_nan(x):
+            x = x[np.isfinite(x)]
+            return float(x.max()) if len(x) else np.nan
+
+        rows.append(
+            {
+                **values,
+                "n_trials": int(len(part)),
+                "n_success": int(ok.sum()),
+                "median_elapsed_s": median_or_nan(elapsed),
+                "minimum_elapsed_s": min_or_nan(elapsed),
+                "maximum_elapsed_s": max_or_nan(elapsed),
+                "median_heap_delta_mb": median_or_nan(heap),
+                "maximum_heap_delta_mb": max_or_nan(heap),
+                "median_output_size_mb": median_or_nan(output),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+
+    return out.sort_values(
+        [
+            "operation",
+            "total_rows",
+            "n_files",
+        ],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def _gp3_perf_as_summary(x) -> pd.DataFrame:
+    if isinstance(x, dict):
+        if "summary" not in x:
+            raise TypeError("benchmark dictionary must contain a 'summary' table")
+
+        return ensure_dataframe(
+            x["summary"],
+            copy=False,
+        ).copy()
+
+    df = ensure_dataframe(
+        x,
+        copy=False,
+    )
+
+    if {
+        "trial",
+        "elapsed_s",
+        "status",
+    }.issubset(df.columns):
+        return _gp3_perf_summarise_trials(df)
+
+    return df.copy()
+
+
+def _gp3_perf_validate_limits(limits) -> pd.DataFrame:
+    df = ensure_dataframe(
+        limits,
+        copy=False,
+    )
+
+    required = {
+        "operation",
+        "max_seconds_per_million_rows",
+        "max_heap_delta_mb_per_million_rows",
+        "max_scaling_exponent",
+    }
+
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError("limits is missing: " + ", ".join(sorted(missing)))
+
+    return df.copy()
+
+
+def _gp3_perf_positive_scalar(value, argument: str) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{argument} must be one positive finite number") from exc
+
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"{argument} must be one positive finite number")
+
+    return value
+
+
+def _gp3_perf_scaling_exponents(summary) -> pd.DataFrame:
+    df = ensure_dataframe(
+        summary,
+        copy=False,
+    )
+
+    rows = []
+
+    for operation in pd.unique(df["operation"]):
+        part = df.loc[df["operation"].eq(operation)].copy()
+
+        elapsed = pd.to_numeric(
+            part["median_elapsed_s"],
+            errors="coerce",
+        )
+
+        total_rows = pd.to_numeric(
+            part["total_rows"],
+            errors="coerce",
+        )
+
+        valid = np.isfinite(elapsed) & (elapsed > 0) & np.isfinite(total_rows) & (total_rows > 0)
+
+        elapsed = elapsed[valid].to_numpy(float)
+        total_rows = total_rows[valid].to_numpy(float)
+
+        exponent = np.nan
+
+        if len(np.unique(total_rows)) >= 2:
+            exponent = float(
+                np.polyfit(
+                    np.log(total_rows),
+                    np.log(elapsed),
+                    1,
+                )[0]
+            )
+
+        rows.append(
+            {
+                "operation": operation,
+                "scaling_exponent": exponent,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _gp3_perf_check_rows(
+    current,
+    check: str,
+    passed,
+) -> pd.DataFrame:
+    df = ensure_dataframe(
+        current,
+        copy=False,
+    )
+
+    passed = pd.Series(
+        passed,
+        index=df.index,
+    ).fillna(False)
+
+    return pd.DataFrame(
+        {
+            "operation": df["operation"].to_numpy(),
+            "total_rows": df["total_rows"].to_numpy(),
+            "n_files": df["n_files"].to_numpy(),
+            "check": check,
+            "status": np.where(
+                passed.to_numpy(bool),
+                "pass",
+                "fail",
+            ),
+        }
+    )
+
+
 def gp3tools_performance_limits() -> pd.DataFrame:
+    """Return the R gp3tools v2.3.0 performance thresholds."""
     return pd.DataFrame(
         {
             "operation": [
-                "CSV import",
-                "sample QC",
-                "pupil preprocessing",
-                "AOI assignment",
-                "plotting",
+                "generate",
+                "import",
+                "master",
+                "sampling",
+                "quality",
             ],
-            "guidance": [
-                "stream/chunk very large files",
-                "vectorized native path",
-                "group-aware interpolation",
-                "prefer vectorized geometry",
-                "downsample for display",
+            "max_seconds_per_million_rows": [
+                90.0,
+                240.0,
+                240.0,
+                180.0,
+                180.0,
             ],
-            "note": ["No hard row limit"] * 5,
+            "max_heap_delta_mb_per_million_rows": [
+                1200.0,
+                1800.0,
+                1800.0,
+                1200.0,
+                1200.0,
+            ],
+            "max_scaling_exponent": [
+                1.6,
+                1.6,
+                1.6,
+                1.6,
+                1.6,
+            ],
         }
     )
 
 
 def check_gazepoint_performance_regression(
-    current, baseline, tolerance=0.20, metric="elapsed_seconds"
-) -> pd.DataFrame:
-    c = float(ensure_dataframe(current)[metric].mean())
-    b = float(ensure_dataframe(baseline)[metric].mean())
-    change = (c - b) / b if b else np.nan
-    return pd.DataFrame(
+    current=None,
+    baseline=None,
+    tolerance=0.20,
+    metric="elapsed_seconds",
+    *,
+    x=None,
+    limits=None,
+    elapsed_ratio_limit=1.5,
+    memory_ratio_limit=1.5,
+):
+    """Check performance regressions.
+
+    ``x`` activates the R gp3tools v2.3.0 benchmark-regression
+    interface. The historical Python ``current``/``baseline`` interface
+    remains available for backward compatibility.
+
+    A single positional R-style summary is also accepted when ``baseline``
+    is omitted and the table has the R performance-summary columns.
+    """
+    if x is not None:
+        if current is not None:
+            raise TypeError("supply either current or x, not both")
+
+        current = x
+        r_mode = True
+    else:
+        r_required = {
+            "operation",
+            "total_rows",
+            "n_files",
+            "median_elapsed_s",
+            "median_heap_delta_mb",
+            "n_success",
+            "n_trials",
+        }
+
+        r_mode = False
+
+        if current is not None:
+            try:
+                candidate = _gp3_perf_as_summary(current)
+                r_mode = r_required.issubset(candidate.columns)
+            except Exception:
+                r_mode = False
+
+    if not r_mode:
+        if current is None or baseline is None:
+            raise TypeError("current and baseline are required for the legacy Python interface")
+
+        current_df = ensure_dataframe(
+            current,
+            copy=False,
+        )
+
+        baseline_df = ensure_dataframe(
+            baseline,
+            copy=False,
+        )
+
+        if metric not in current_df:
+            raise ValueError(f"current is missing metric {metric!r}")
+
+        if metric not in baseline_df:
+            raise ValueError(f"baseline is missing metric {metric!r}")
+
+        c = float(
+            pd.to_numeric(
+                current_df[metric],
+                errors="coerce",
+            ).mean()
+        )
+
+        b = float(
+            pd.to_numeric(
+                baseline_df[metric],
+                errors="coerce",
+            ).mean()
+        )
+
+        change = (c - b) / b if b else np.nan
+
+        return pd.DataFrame(
+            {
+                "current": [c],
+                "baseline": [b],
+                "relative_change": [change],
+                "regression": [bool(np.isfinite(change) and change > tolerance)],
+            }
+        )
+
+    if current is None:
+        raise TypeError("x is required for the R-compatible interface")
+
+    if limits is None:
+        limits = gp3tools_performance_limits()
+
+    limits = _gp3_perf_validate_limits(limits)
+
+    elapsed_ratio_limit = _gp3_perf_positive_scalar(
+        elapsed_ratio_limit,
+        "elapsed_ratio_limit",
+    )
+
+    memory_ratio_limit = _gp3_perf_positive_scalar(
+        memory_ratio_limit,
+        "memory_ratio_limit",
+    )
+
+    evaluated = _gp3_perf_as_summary(current)
+
+    required = {
+        "operation",
+        "total_rows",
+        "n_files",
+        "median_elapsed_s",
+        "median_heap_delta_mb",
+        "n_success",
+        "n_trials",
+    }
+
+    missing = required - set(evaluated.columns)
+
+    if missing:
+        raise ValueError("x is missing required columns: " + ", ".join(sorted(missing)))
+
+    evaluated = evaluated.copy()
+
+    total_rows = pd.to_numeric(
+        evaluated["total_rows"],
+        errors="coerce",
+    )
+
+    elapsed = pd.to_numeric(
+        evaluated["median_elapsed_s"],
+        errors="coerce",
+    )
+
+    heap = pd.to_numeric(
+        evaluated["median_heap_delta_mb"],
+        errors="coerce",
+    )
+
+    denominator = np.maximum(
+        total_rows.to_numpy(float) / 1_000_000.0,
+        np.finfo(float).eps,
+    )
+
+    evaluated["seconds_per_million_rows"] = elapsed.to_numpy(float) / denominator
+
+    evaluated["heap_mb_per_million_rows"] = heap.to_numpy(float) / denominator
+
+    evaluated = evaluated.merge(
+        limits,
+        on="operation",
+        how="left",
+        sort=False,
+    )
+
+    scaling = _gp3_perf_scaling_exponents(evaluated)
+
+    evaluated = evaluated.merge(
+        scaling,
+        on="operation",
+        how="left",
+        sort=False,
+    )
+
+    elapsed_limit = pd.to_numeric(
+        evaluated["max_seconds_per_million_rows"],
+        errors="coerce",
+    )
+
+    memory_limit = pd.to_numeric(
+        evaluated["max_heap_delta_mb_per_million_rows"],
+        errors="coerce",
+    )
+
+    scaling_limit = pd.to_numeric(
+        evaluated["max_scaling_exponent"],
+        errors="coerce",
+    )
+
+    scaling_value = pd.to_numeric(
+        evaluated["scaling_exponent"],
+        errors="coerce",
+    )
+
+    evaluated["elapsed_limit_pass"] = elapsed_limit.isna() | (
+        evaluated["seconds_per_million_rows"] <= elapsed_limit
+    )
+
+    evaluated["memory_limit_pass"] = memory_limit.isna() | (
+        evaluated["heap_mb_per_million_rows"] <= memory_limit
+    )
+
+    evaluated["scaling_limit_pass"] = (
+        scaling_limit.isna() | scaling_value.isna() | (scaling_value <= scaling_limit)
+    )
+
+    evaluated["operation_success"] = pd.to_numeric(
+        evaluated["n_success"],
+        errors="coerce",
+    ) == pd.to_numeric(
+        evaluated["n_trials"],
+        errors="coerce",
+    )
+
+    baseline_used = baseline is not None
+
+    if baseline_used:
+        baseline_summary = _gp3_perf_as_summary(baseline)
+
+        baseline_keys = [
+            "operation",
+            "total_rows",
+            "n_files",
+        ]
+
+        baseline_required = set(
+            baseline_keys
+            + [
+                "median_elapsed_s",
+                "median_heap_delta_mb",
+            ]
+        )
+
+        baseline_missing = baseline_required - set(baseline_summary.columns)
+
+        if baseline_missing:
+            raise ValueError(
+                "baseline is missing required columns: " + ", ".join(sorted(baseline_missing))
+            )
+
+        baseline_keep = baseline_summary[
+            baseline_keys
+            + [
+                "median_elapsed_s",
+                "median_heap_delta_mb",
+            ]
+        ].rename(
+            columns={
+                "median_elapsed_s": "baseline_elapsed_s",
+                "median_heap_delta_mb": "baseline_heap_delta_mb",
+            }
+        )
+
+        evaluated = evaluated.merge(
+            baseline_keep,
+            on=baseline_keys,
+            how="left",
+            sort=False,
+        )
+
+        evaluated["elapsed_ratio"] = evaluated["median_elapsed_s"] / evaluated["baseline_elapsed_s"]
+
+        evaluated["memory_ratio"] = (
+            evaluated["median_heap_delta_mb"] / evaluated["baseline_heap_delta_mb"]
+        )
+
+        evaluated["baseline_elapsed_pass"] = evaluated["elapsed_ratio"].isna() | (
+            evaluated["elapsed_ratio"] <= elapsed_ratio_limit
+        )
+
+        evaluated["baseline_memory_pass"] = evaluated["memory_ratio"].isna() | (
+            evaluated["memory_ratio"] <= memory_ratio_limit
+        )
+
+    else:
+        evaluated["baseline_elapsed_s"] = np.nan
+        evaluated["baseline_heap_delta_mb"] = np.nan
+        evaluated["elapsed_ratio"] = np.nan
+        evaluated["memory_ratio"] = np.nan
+        evaluated["baseline_elapsed_pass"] = True
+        evaluated["baseline_memory_pass"] = True
+
+    checks = pd.concat(
+        [
+            _gp3_perf_check_rows(
+                evaluated,
+                "operation_completed",
+                evaluated["operation_success"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "elapsed_absolute_limit",
+                evaluated["elapsed_limit_pass"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "memory_absolute_limit",
+                evaluated["memory_limit_pass"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "scaling_exponent_limit",
+                evaluated["scaling_limit_pass"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "elapsed_baseline_ratio",
+                evaluated["baseline_elapsed_pass"],
+            ),
+            _gp3_perf_check_rows(
+                evaluated,
+                "memory_baseline_ratio",
+                evaluated["baseline_memory_pass"],
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    n_pass = int(checks["status"].eq("pass").sum())
+
+    n_fail = int(checks["status"].eq("fail").sum())
+
+    overall = pd.DataFrame(
         {
-            "current": [c],
-            "baseline": [b],
-            "relative_change": [change],
-            "regression": [bool(np.isfinite(change) and change > tolerance)],
+            "pass": [n_fail == 0],
+            "n_checks": [int(len(checks))],
+            "n_pass": [n_pass],
+            "n_fail": [n_fail],
         }
     )
 
+    return {
+        "overall": overall,
+        "checks": checks,
+        "evaluated": evaluated,
+        "limits": limits,
+        "baseline_used": baseline_used,
+        "elapsed_ratio_limit": elapsed_ratio_limit,
+        "memory_ratio_limit": memory_ratio_limit,
+    }
 
-def write_gazepoint_performance_benchmark(data, path="performance_benchmark.csv") -> Path:
+
+def write_gazepoint_performance_benchmark(
+    data=None,
+    path="performance_benchmark.csv",
+    *,
+    x=None,
+    output_dir=None,
+    prefix="gp3tools-performance",
+):
+    """Write performance benchmark output.
+
+    Benchmark dictionaries use the R v2.3.0 four-file export contract.
+    Plain DataFrames retain the original Python single-file interface.
+    """
+    if x is not None or output_dir is not None:
+        if x is None or output_dir is None:
+            raise ValueError("x and output_dir must be supplied together")
+
+        if data is not None:
+            raise TypeError("data cannot be combined with the R-compatible x/output_dir interface")
+
+        if not isinstance(x, dict):
+            raise TypeError("x must be a benchmark dictionary")
+
+        regression = x.get(
+            "regression",
+            {},
+        )
+
+        if not isinstance(regression, dict):
+            raise TypeError("x['regression'] must be a dictionary")
+
+        required = {
+            "trials": x.get("trials"),
+            "summary": x.get("summary"),
+            "checks": regression.get("checks"),
+            "evaluated": regression.get("evaluated"),
+        }
+
+        missing = [name for name, value in required.items() if value is None]
+
+        if missing:
+            raise ValueError("benchmark object is missing: " + ", ".join(missing))
+
+        root = Path(output_dir)
+        root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError("prefix must be a non-empty string")
+
+        files = {
+            "trials": root / f"{prefix}-trials.csv",
+            "summary": root / f"{prefix}-summary.csv",
+            "checks": root / f"{prefix}-checks.csv",
+            "evaluated": root / f"{prefix}-evaluated.csv",
+        }
+
+        for name, file in files.items():
+            ensure_dataframe(
+                required[name],
+                copy=False,
+            ).to_csv(
+                file,
+                index=False,
+            )
+
+        return {name: file.resolve() for name, file in files.items()}
+
+    if data is None:
+        raise TypeError("data is required for the Python interface")
+
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    ensure_dataframe(data).to_csv(p, index=False)
+    p.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    ensure_dataframe(data).to_csv(
+        p,
+        index=False,
+    )
+
     return p
 
 
@@ -250,6 +2466,121 @@ def run_gazepoint_workflow(
     save_plots=False,
     **kwargs,
 ) -> dict[str, Any]:
+
+    # === R3B WORKFLOW SELECTOR ===
+    if (
+        data is None
+        and export_dir is not None
+        and any(
+            key in kwargs
+            for key in {
+                "all_gaze_pattern",
+                "fixation_pattern",
+                "check_file_pairs",
+                "group_cols",
+                "user_col",
+                "sample_rate",
+                "min_gaze_valid_pct",
+                "min_pupil_valid_pct",
+                "expected_hz",
+                "hz_tolerance",
+                "min_duration_sec",
+                "prefix",
+                "overwrite",
+                "plot_output_dir",
+                "report_file",
+                "report_title",
+                "report_plot_dir",
+                "report_max_rows",
+            }
+        )
+    ):
+        from ._behavioral_r3b import (
+            run_gazepoint_workflow as _r3b,
+        )
+
+        return _r3b(
+            export_dir=export_dir,
+            output_dir=output_dir,
+            create_report=create_report,
+            save_plots=save_plots,
+            all_gaze_pattern=kwargs.pop(
+                "all_gaze_pattern",
+                "all_gaze",
+            ),
+            fixation_pattern=kwargs.pop(
+                "fixation_pattern",
+                "fixations",
+            ),
+            check_file_pairs=kwargs.pop(
+                "check_file_pairs",
+                True,
+            ),
+            group_cols=kwargs.pop(
+                "group_cols",
+                (
+                    "USER_FILE",
+                    "MEDIA_ID",
+                ),
+            ),
+            user_col=kwargs.pop(
+                "user_col",
+                "USER_FILE",
+            ),
+            sample_rate=kwargs.pop(
+                "sample_rate",
+                None,
+            ),
+            min_gaze_valid_pct=kwargs.pop(
+                "min_gaze_valid_pct",
+                80.0,
+            ),
+            min_pupil_valid_pct=kwargs.pop(
+                "min_pupil_valid_pct",
+                80.0,
+            ),
+            expected_hz=kwargs.pop(
+                "expected_hz",
+                None,
+            ),
+            hz_tolerance=kwargs.pop(
+                "hz_tolerance",
+                5.0,
+            ),
+            min_duration_sec=kwargs.pop(
+                "min_duration_sec",
+                1.0,
+            ),
+            prefix=kwargs.pop(
+                "prefix",
+                "gazepoint",
+            ),
+            overwrite=kwargs.pop(
+                "overwrite",
+                False,
+            ),
+            plot_output_dir=kwargs.pop(
+                "plot_output_dir",
+                None,
+            ),
+            report_file=kwargs.pop(
+                "report_file",
+                None,
+            ),
+            report_title=kwargs.pop(
+                "report_title",
+                "Gazepoint diagnostic report",
+            ),
+            report_plot_dir=kwargs.pop(
+                "report_plot_dir",
+                None,
+            ),
+            report_max_rows=kwargs.pop(
+                "report_max_rows",
+                30,
+            ),
+        )
+
     from .io import read_gazepoint_folder
     from .pupil import preprocess_gazepoint_signals
     from .qc import (
@@ -302,16 +2633,121 @@ def summarise_gazepoint_workflow(result) -> pd.DataFrame:
 
 
 def create_gazepoint_cross_package_report(
-    result, output_file="cross_package_report.html", **kwargs
+    result=None,
+    output_file=None,
+    *,
+    x=None,
+    **kwargs,
 ):
+    source = x if x is not None else result
+
+    if isinstance(source, dict) and {
+        "audit",
+        "report_text",
+    } <= set(source):
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected keyword argument(s): {unknown}")
+
+        from ._behavioral_r2 import create_cross_package_report
+
+        return create_cross_package_report(
+            source,
+            output_file=output_file,
+        )
+
+    # Historical Python report route.
+    chosen = "cross_package_report.html" if output_file is None else output_file
     return create_gazepoint_report(
-        result, output_file, title="gp3tools cross-package report", **kwargs
+        source,
+        output_file=chosen,
+        **kwargs,
     )
 
 
-def export_gazepoint_cluster_results(result, output_dir="cluster_results", prefix="cluster"):
+def export_gazepoint_cluster_results(
+    result,
+    output_dir="cluster_results",
+    prefix="cluster",
+    *,
+    overwrite=False,
+):
     root = Path(output_dir)
+    if root.exists() and any(root.iterdir()) and not overwrite:
+        # Preserve the historical API when its default output_dir/prefix path is used.
+        # R-compatible callers can set overwrite=True to reuse a populated directory.
+        raise FileExistsError("output directory already exists; use overwrite=True to reuse it")
     root.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(result, dict) and any(
+        key in result
+        for key in (
+            "cluster_summary",
+            "cluster_table",
+            "null_distribution",
+            "null_statistics",
+            "max_cluster_statistics",
+            "permutation_distribution",
+            "cluster_status",
+        )
+    ):
+        from .stats import report_gazepoint_cluster_permutation, summarize_gazepoint_time_clusters
+
+        try:
+            clusters = summarize_gazepoint_time_clusters(result)
+        except Exception:
+            clusters = None
+            for key in ("clusters", "cluster_summary", "cluster_table"):
+                if key in result and result[key] is not None:
+                    clusters = result[key]
+                    break
+        written_rows = []
+        if isinstance(clusters, pd.DataFrame):
+            path = root / "cluster_summary.csv"
+            clusters.to_csv(path, index=False)
+            written_rows.append({"file": str(path), "file_type": "cluster_summary"})
+        null_values = next(
+            (
+                result[key]
+                for key in [
+                    "null_distribution",
+                    "null_statistics",
+                    "max_cluster_statistics",
+                    "permutation_distribution",
+                ]
+                if key in result and np.asarray(result[key]).ndim == 1
+            ),
+            None,
+        )
+        if null_values is not None:
+            path = root / "null_distribution.csv"
+            pd.DataFrame({"null_statistic": np.asarray(null_values, dtype=float)}).to_csv(
+                path, index=False
+            )
+            written_rows.append({"file": str(path), "file_type": "null_distribution"})
+        try:
+            report = report_gazepoint_cluster_permutation(result)
+            report_text = (
+                report.get("report_text", str(report)) if isinstance(report, dict) else str(report)
+            )
+            path = root / "cluster_report.txt"
+            path.write_text(report_text, encoding="utf-8")
+            written_rows.append({"file": str(path), "file_type": "report_text"})
+        except Exception:
+            pass
+        if "settings" in result:
+            settings = result["settings"]
+            settings_frame = (
+                pd.DataFrame([settings])
+                if isinstance(settings, dict)
+                else ensure_dataframe(settings)
+            )
+            path = root / "cluster_settings.csv"
+            settings_frame.to_csv(path, index=False)
+            written_rows.append({"file": str(path), "file_type": "settings"})
+        if written_rows:
+            return pd.DataFrame(written_rows)
+
     if isinstance(result, dict):
         return write_gazepoint_outputs(result, root, prefix=prefix)
     return export_gazepoint_tables({"clusters": ensure_dataframe(result)}, root, prefix=prefix)
@@ -338,3 +2774,21 @@ def launch_gazepoint_qc_dashboard(data=None, **kwargs):
             return f"Rows: {len(df):,}\nColumns: {df.shape[1]}\nMissing cells: {int(df.isna().sum().sum()):,}"
 
     return App(app_ui, server)
+
+
+# BEGIN R V2.3.0 CALL-SURFACE ALIASES
+export_gazepoint_cluster_results = r_aliases(export_gazepoint_cluster_results, outdir="output_dir")
+report_gazepoint_multiverse = r_aliases(report_gazepoint_multiverse, multiverse_results="data")
+report_gazepoint_qc_overview = r_aliases(report_gazepoint_qc_overview, qc_bundle="data")
+summarise_gazepoint_workflow = r_aliases(summarise_gazepoint_workflow, results="result")
+# END R V2.3.0 CALL-SURFACE ALIASES
+
+# === R4 CANONICAL WRAPPER: summarise_gazepoint_workflow ===
+summarise_gazepoint_workflow = _r4_wrap(
+    summarise_gazepoint_workflow, name="summarise_gazepoint_workflow"
+)
+
+# === R4 DUAL CONTRACT: summarise_gazepoint_workflow ===
+summarise_gazepoint_workflow = r4_dual_contract(
+    summarise_gazepoint_workflow, name="summarise_gazepoint_workflow"
+)

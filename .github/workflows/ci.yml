@@ -61,6 +61,14 @@ jobs:
             --cov-report=xml:coverage.xml \
             --cov-fail-under=90
 
+
+      - name: Examples smoke
+        if: matrix.python-version == '3.13'
+        run: |
+          python examples/full_workflow.py
+          python examples/pupil_qc.py
+          python examples/plot_gallery.py
+
       - name: Build wheel and source distribution
         if: matrix.python-version == '3.13'
         run: |

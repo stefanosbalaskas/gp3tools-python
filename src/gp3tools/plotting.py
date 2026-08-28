@@ -261,21 +261,76 @@ def plot_gazepoint_binocular_diagnostics(data, left_col=None, right_col=None, ax
     return fig
 
 
-def plot_gazepoint_model_predictions(model, data=None, ax=None, **kwargs):
+def plot_gazepoint_model_predictions(model=None, data=None, ax=None, **kwargs):
+    """Plot model predictions; model is optional for R-compatible call surfaces."""
+    if model is None:
+        raise ValueError("model is required by the current native Python plotting backend")
     fig, ax = _figax(ax)
-    pred = np.asarray(model.predict(data) if data is not None else model.fittedvalues)
+    pred = np.asarray(
+        model.predict(data) if data is not None else getattr(model, "fittedvalues", [])
+    )
     ax.plot(np.arange(len(pred)), pred)
     ax.set_title("Model predictions")
     return fig
 
 
-def plot_gazepoint_model_residuals(model, ax=None, **kwargs):
+def plot_gazepoint_model_residuals(
+    model=None,
+    data=None,
+    fitted_col=None,
+    residual_col=None,
+    type="residuals_fitted",
+    title=None,
+    ax=None,
+    **kwargs,
+):
+    """Plot residual-vs-fitted or QQ diagnostics from a model or data frame."""
+    if type not in {"residuals_fitted", "qq"}:
+        raise ValueError("type must be residuals_fitted or qq")
+    if data is not None:
+        df = ensure_dataframe(data, copy=False)
+        if fitted_col is None:
+            fitted_col = next((c for c in ("fitted", "fitted_value", ".fitted") if c in df), None)
+        if residual_col is None:
+            residual_col = next(
+                (c for c in ("residual", "residuals", ".resid", ".residual") if c in df),
+                None,
+            )
+        if fitted_col is None or residual_col is None:
+            raise ValueError("Could not identify fitted and residual columns")
+        fitted = pd.to_numeric(df[fitted_col], errors="coerce").to_numpy(float)
+        resid = pd.to_numeric(df[residual_col], errors="coerce").to_numpy(float)
+    else:
+        if model is None:
+            raise ValueError("Supply either model or data")
+        resid = np.asarray(getattr(model, "resid", []), dtype=float)
+        fitted = np.asarray(
+            getattr(model, "fittedvalues", np.arange(len(resid))),
+            dtype=float,
+        )
+    finite = np.isfinite(fitted) & np.isfinite(resid)
+    fitted = fitted[finite]
+    resid = resid[finite]
+    if not len(resid):
+        raise ValueError("No finite fitted/residual pairs are available")
     fig, ax = _figax(ax)
-    resid = np.asarray(getattr(model, "resid", []))
-    fitted = np.asarray(getattr(model, "fittedvalues", np.arange(len(resid))))
-    ax.scatter(fitted, resid, s=10)
-    ax.axhline(0, linestyle="--")
-    ax.set_title("Model residuals")
+    if type == "residuals_fitted":
+        ax.scatter(fitted, resid, s=10)
+        ax.axhline(0, linestyle="--")
+        ax.set_xlabel("Fitted values")
+        ax.set_ylabel("Residuals")
+    else:
+        from scipy import stats as _stats
+
+        ordered = np.sort(resid)
+        theoretical = _stats.norm.ppf((np.arange(1, len(ordered) + 1) - 0.5) / len(ordered))
+        ax.scatter(theoretical, ordered, s=10)
+        if len(ordered) >= 2:
+            slope, intercept = np.polyfit(theoretical, ordered, 1)
+            ax.plot(theoretical, intercept + slope * theoretical)
+        ax.set_xlabel("Theoretical quantiles")
+        ax.set_ylabel("Residual quantiles")
+    ax.set_title("Model residuals" if title is None else str(title))
     return fig
 
 
