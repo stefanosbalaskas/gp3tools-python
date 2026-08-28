@@ -1,5 +1,14 @@
 # gp3tools for Python
 
+[![CI](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml)
+[![Documentation](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml)
+[![Release](https://img.shields.io/github/v/release/stefanosbalaskas/gp3tools-python?include_prereleases&label=release)](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1)
+![Python](https://img.shields.io/badge/Python-3.11--3.13-3776AB)
+![License](https://img.shields.io/badge/license-MIT-success)
+
+**Documentation:** https://stefanosbalaskas.github.io/gp3tools-python/
+
+
 A Python implementation of the public workflow of **gp3tools**, the R package for importing, inspecting, analysing, visualising, modelling, and reporting Gazepoint GP3 / Gazepoint Analysis exports.
 
 > **Status: 0.1.0a1 comprehensive migration build.** The complete 278-function public name surface frozen from the R `v2.3.0` `NAMESPACE` is present. Core data, QC, pupil, AOI, sequence, event, plotting, reporting, face, simulation, and export workflows are native Python. Statistical functions tied to R-specific backends are **Python-native adaptations**, not claims of coefficient-for-coefficient equivalence to `lme4`, `glmmTMB`, `mgcv`, or `brms`.
