@@ -1,0 +1,129 @@
+name: pypi
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release tag to publish to PyPI
+        required: true
+        type: string
+  release:
+    types: [published]
+
+concurrency:
+  group: pypi-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish to PyPI
+    runs-on: ubuntu-latest
+    environment: pypi
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      PUBLISH_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+    steps:
+      - name: Validate requested tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$PUBLISH_TAG" in
+            v*) ;;
+            *)
+              echo "Release tag must start with v: $PUBLISH_TAG" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Check whether version is already published
+        id: existing
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${PUBLISH_TAG#v}"
+          if curl --fail --silent --show-error \
+            "https://pypi.org/pypi/gp3tools/${VERSION}/json" \
+            >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "gp3tools ${VERSION} already exists on PyPI; publication is an idempotent no-op."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout exact release tag
+        if: steps.existing.outputs.published != 'true'
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Download exact GitHub Release distributions
+        if: steps.existing.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          gh release view "$PUBLISH_TAG" \
+            --repo "${{ github.repository }}" \
+            --json isDraft,tagName \
+            --jq 'select(.isDraft == false) | .tagName' |
+            grep -Fx "$PUBLISH_TAG"
+
+          gh release download "$PUBLISH_TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern '*.whl' \
+            --pattern '*.tar.gz' \
+            --dir dist
+
+      - name: Verify tag, version, distributions, and metadata
+        if: steps.existing.outputs.published != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${PUBLISH_TAG#v}"
+
+          test -f "dist/gp3tools-${VERSION}-py3-none-any.whl"
+          test -f "dist/gp3tools-${VERSION}.tar.gz"
+
+          python -m pip install "twine==7.0.0"
+          python -m twine check dist/*
+
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          tag = os.environ["PUBLISH_TAG"]
+          version = tag.removeprefix("v")
+
+          project = tomllib.loads(
+              pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          )["project"]
+
+          if project["name"] != "gp3tools":
+              raise SystemExit(
+                  f"Unexpected project name: {project['name']}"
+              )
+
+          if project["version"] != version:
+              raise SystemExit(
+                  f"Tag/version mismatch: {tag} vs {project['version']}"
+              )
+
+          print(f"Verified gp3tools {version} for PyPI publication")
+          PY
+
+          sha256sum dist/*
+
+      - name: Publish distributions to PyPI
+        if: steps.existing.outputs.published != 'true'
+        # Same pinned PyPA publishing action used by gpbiometricspy.
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
