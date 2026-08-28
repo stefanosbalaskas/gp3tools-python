@@ -24,13 +24,28 @@ statistics and research reporting.
 [Browse the API](API_REFERENCE.md){ .md-button }
 [Release v0.1.0a1](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1){ .md-button }
 
-<div class="gp3-badges" markdown="1">
+<div class="gp3-badges">
 
-[![CI](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml)
-[![Documentation](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml)
-[![Release](https://img.shields.io/github/v/release/stefanosbalaskas/gp3tools-python?include_prereleases&label=release)](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1)
-![Python](https://img.shields.io/badge/Python-3.11--3.13-3776AB)
-![License](https://img.shields.io/badge/license-MIT-success)
+<a href="https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml">
+  <img src="https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml/badge.svg?branch=main"
+       alt="CI">
+</a>
+
+<a href="https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml">
+  <img src="https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml/badge.svg?branch=main"
+       alt="Documentation">
+</a>
+
+<a href="https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1">
+  <img src="https://img.shields.io/github/v/release/stefanosbalaskas/gp3tools-python?include_prereleases&label=release"
+       alt="Release">
+</a>
+
+<img src="https://img.shields.io/badge/Python-3.11--3.13-3776AB"
+     alt="Python 3.11–3.13">
+
+<img src="https://img.shields.io/badge/license-MIT-success"
+     alt="MIT License">
 
 </div>
 </div>
