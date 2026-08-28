@@ -9,7 +9,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ._behavioral_r4 import wrap_r4 as _r4_wrap
 from ._compat import r_aliases
+from ._r4_dual_contract import r4_dual_contract
 from ._utils import (
     as_bool,
     attach_attrs,
@@ -4904,3 +4906,26 @@ validate_gazepoint_master = r_aliases(validate_gazepoint_master, master="data")
 
 # R v2.3.0 alias rebinding after compatibility wrappers
 summarize_gazepoint_qc_status = summarise_gazepoint_qc_status
+
+# === R4 CANONICAL WRAPPER: audit_gazepoint_master ===
+audit_gazepoint_master = _r4_wrap(audit_gazepoint_master, name="audit_gazepoint_master")
+
+# === R4 CANONICAL WRAPPER: summarise_gazepoint_qc_status ===
+summarise_gazepoint_qc_status = _r4_wrap(
+    summarise_gazepoint_qc_status, name="summarise_gazepoint_qc_status"
+)
+
+# === R4 CANONICAL WRAPPER: summarize_gazepoint_qc_status ===
+summarize_gazepoint_qc_status = _r4_wrap(
+    summarize_gazepoint_qc_status, name="summarize_gazepoint_qc_status"
+)
+
+# === R4 DUAL CONTRACT: summarise_gazepoint_qc_status ===
+summarise_gazepoint_qc_status = r4_dual_contract(
+    summarise_gazepoint_qc_status, name="summarise_gazepoint_qc_status"
+)
+
+# === R4 DUAL CONTRACT: summarize_gazepoint_qc_status ===
+summarize_gazepoint_qc_status = r4_dual_contract(
+    summarize_gazepoint_qc_status, name="summarize_gazepoint_qc_status"
+)

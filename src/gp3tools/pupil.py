@@ -8,6 +8,7 @@ from scipy import interpolate, ndimage, signal, stats
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
+from ._behavioral_r4 import wrap_r4 as _r4_wrap
 from ._compat import r_aliases
 from ._utils import (
     ensure_dataframe,
@@ -8379,3 +8380,11 @@ mean_gazepoint_pupil = r_aliases(
     mean_gazepoint_pupil, master_df="data", lp_col="left_col", rp_col="right_col"
 )
 # END R V2.3.0 CALL-SURFACE ALIASES
+
+# === R4 CANONICAL WRAPPER: summarize_gazepoint_pupil_response_features ===
+summarize_gazepoint_pupil_response_features = _r4_wrap(
+    summarize_gazepoint_pupil_response_features, name="summarize_gazepoint_pupil_response_features"
+)
+
+# === R4 CANONICAL WRAPPER: detect_gazepoint_blinks ===
+detect_gazepoint_blinks = _r4_wrap(detect_gazepoint_blinks, name="detect_gazepoint_blinks")

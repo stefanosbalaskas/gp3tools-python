@@ -91,3 +91,10 @@ Balaskas, S. (2026). *gp3tools: An R Package for Reproducible Analysis and Repor
 ## License
 
 MIT.
+
+<!-- GP3TOOLS_PARITY_STATUS -->
+## R 2.3.0 parity and validation
+
+The Python package freezes the **278-export** R 2.3.0 public API while exposing **285** Python public names in the validated parity branch. Behavioral equality is evidence graded: exact and numerical-tolerance claims are made only where frozen R oracles exist; backend-adapted statistical families are labelled accordingly.
+
+The release gate includes R1β€“R3 frozen behavioral regressions, R4 canonical structure/compatibility tests plus frozen-oracle integrity checks, whole-surface smoke, plot catalog smoke, runnable examples, Ruff, compilation, strict documentation build, **β‰¥90% test coverage**, wheel/sdist construction and isolated-wheel validation. See `docs/PARITY_STATUS.md`.

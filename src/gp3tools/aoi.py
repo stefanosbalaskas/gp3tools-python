@@ -11,7 +11,10 @@ import pandas as pd
 from shapely.geometry import MultiPoint, Point, Polygon
 from sklearn.cluster import AgglomerativeClustering
 
+from ._behavioral_r4 import geometry_validation_bridge as _r4_geometry_validation_bridge
+from ._behavioral_r4 import wrap_r4 as _r4_wrap
 from ._compat import r_aliases
+from ._r4_dual_contract import r4_dual_contract
 from ._utils import (
     collapse_consecutive,
     ensure_dataframe,
@@ -8508,3 +8511,34 @@ extract_gazepoint_representative_scanpaths = r_aliases(
     extract_gazepoint_representative_scanpaths, x="clustered"
 )
 # END R V2.3.0 CALL-SURFACE ALIASES
+
+# === R4 CANONICAL WRAPPER: add_gazepoint_aoi ===
+add_gazepoint_aoi = _r4_wrap(add_gazepoint_aoi, name="add_gazepoint_aoi")
+
+# === R4 CANONICAL WRAPPER: add_gazepoint_dynamic_aoi ===
+add_gazepoint_dynamic_aoi = _r4_wrap(add_gazepoint_dynamic_aoi, name="add_gazepoint_dynamic_aoi")
+
+# === R4 CANONICAL WRAPPER: add_gazepoint_polygon_aoi ===
+add_gazepoint_polygon_aoi = _r4_wrap(add_gazepoint_polygon_aoi, name="add_gazepoint_polygon_aoi")
+
+# === R4 CANONICAL WRAPPER: audit_gazepoint_aoi_coding_matrix ===
+audit_gazepoint_aoi_coding_matrix = _r4_wrap(
+    audit_gazepoint_aoi_coding_matrix, name="audit_gazepoint_aoi_coding_matrix"
+)
+
+# === R4 CANONICAL WRAPPER: audit_gazepoint_aoi_geometry ===
+audit_gazepoint_aoi_geometry = _r4_wrap(
+    audit_gazepoint_aoi_geometry, name="audit_gazepoint_aoi_geometry"
+)
+
+# === R4 DUAL CONTRACT: add_gazepoint_aoi ===
+add_gazepoint_aoi = r4_dual_contract(add_gazepoint_aoi, name="add_gazepoint_aoi")
+
+# === R4 DUAL CONTRACT: audit_gazepoint_aoi_geometry ===
+audit_gazepoint_aoi_geometry = r4_dual_contract(
+    audit_gazepoint_aoi_geometry, name="audit_gazepoint_aoi_geometry"
+)
+
+# === R4 GEOMETRY VALIDATION INSTALL ===
+
+audit_gazepoint_aoi_geometry = _r4_geometry_validation_bridge(audit_gazepoint_aoi_geometry)

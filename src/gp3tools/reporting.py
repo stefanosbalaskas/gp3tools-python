@@ -11,7 +11,9 @@ import numpy as np
 import pandas as pd
 from jinja2 import Template
 
+from ._behavioral_r4 import wrap_r4 as _r4_wrap
 from ._compat import r_aliases
+from ._r4_dual_contract import r4_dual_contract
 from ._utils import ensure_dataframe
 
 
@@ -2780,3 +2782,13 @@ report_gazepoint_multiverse = r_aliases(report_gazepoint_multiverse, multiverse_
 report_gazepoint_qc_overview = r_aliases(report_gazepoint_qc_overview, qc_bundle="data")
 summarise_gazepoint_workflow = r_aliases(summarise_gazepoint_workflow, results="result")
 # END R V2.3.0 CALL-SURFACE ALIASES
+
+# === R4 CANONICAL WRAPPER: summarise_gazepoint_workflow ===
+summarise_gazepoint_workflow = _r4_wrap(
+    summarise_gazepoint_workflow, name="summarise_gazepoint_workflow"
+)
+
+# === R4 DUAL CONTRACT: summarise_gazepoint_workflow ===
+summarise_gazepoint_workflow = r4_dual_contract(
+    summarise_gazepoint_workflow, name="summarise_gazepoint_workflow"
+)

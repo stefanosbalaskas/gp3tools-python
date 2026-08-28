@@ -9,6 +9,7 @@ explicit optional R bridge rather than silently changing scientific semantics.
 from __future__ import annotations
 
 import inspect
+from functools import wraps as _gp3_wraps
 
 import pandas as pd
 
@@ -52,6 +53,46 @@ for _module_name in _MODULE_NAMES:
 for _name in R_EXPORTS:
     if _name not in globals():
         globals()[_name] = make_r_bridge_wrapper(_name)
+
+
+# === VELOCITY PUBLIC DUAL CONTRACT ===
+_gp3_velocity_native = globals()["detect_gazepoint_fixations_velocity"]
+
+
+@_gp3_wraps(_gp3_velocity_native)
+def _gp3_velocity_public(
+    *args,
+    **kwargs,
+):
+    result = _gp3_velocity_native(
+        *args,
+        **kwargs,
+    )
+
+    mode = kwargs.get("return_mode")
+
+    if mode is None:
+        mode = kwargs.get("return")
+
+    canonical_r4 = kwargs.get("all_gaze") is not None
+
+    if (
+        not canonical_r4
+        and mode == "both"
+        and isinstance(
+            result,
+            dict,
+        )
+        and "_gp3_class" not in result
+    ):
+        result = dict(result)
+
+        result["_gp3_class"] = "gp3_velocity_fixation_result"
+
+    return result
+
+
+globals()["detect_gazepoint_fixations_velocity"] = _gp3_velocity_public
 
 
 def api_status() -> pd.DataFrame:

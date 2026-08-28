@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ._behavioral_r4 import wrap_r4 as _r4_wrap
 from ._compat import r_aliases
 from ._utils import ensure_dataframe, infer_column, normalize_group_cols, time_to_seconds
 
@@ -1873,3 +1874,8 @@ detect_gazepoint_fixations_velocity = r_aliases(
     min_duration="min_duration_ms",
 )
 # END R V2.3.0 CALL-SURFACE ALIASES
+
+# === R4 CANONICAL WRAPPER: detect_gazepoint_fixations_velocity ===
+detect_gazepoint_fixations_velocity = _r4_wrap(
+    detect_gazepoint_fixations_velocity, name="detect_gazepoint_fixations_velocity"
+)
