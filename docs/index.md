@@ -44,6 +44,16 @@ statistics and research reporting.
 <img src="https://img.shields.io/badge/Python-3.11--3.13-3776AB"
      alt="Python 3.11–3.13">
 
+<a href="https://pypi.org/project/gp3tools/">
+  <img src="https://img.shields.io/pypi/v/gp3tools?include_prereleases&label=PyPI"
+       alt="PyPI">
+</a>
+
+<a href="https://doi.org/10.5281/zenodo.22150772">
+  <img src="https://zenodo.org/badge/DOI/10.5281/zenodo.22150772.svg"
+       alt="DOI 10.5281/zenodo.22150772">
+</a>
+
 <img src="https://img.shields.io/badge/license-MIT-success"
      alt="MIT License">
 
@@ -65,13 +75,19 @@ statistics and research reporting.
 === "pip"
 
     ```bash
-    python -m pip install https://github.com/stefanosbalaskas/gp3tools-python/releases/download/v0.1.0a1/gp3tools-0.1.0a1-py3-none-any.whl
+    python -m pip install "gp3tools==0.1.0a1"
+    ```
+
+=== "latest alpha"
+
+    ```bash
+    python -m pip install --pre gp3tools
     ```
 
 === "uv"
 
     ```bash
-    uv pip install https://github.com/stefanosbalaskas/gp3tools-python/releases/download/v0.1.0a1/gp3tools-0.1.0a1-py3-none-any.whl
+    uv pip install "gp3tools==0.1.0a1"
     ```
 
 Verify:
@@ -232,4 +248,6 @@ without private participant data.
 
 [GitHub](https://github.com/stefanosbalaskas/gp3tools-python){ .md-button .md-button--primary }
 [Release](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1){ .md-button }
+[PyPI](https://pypi.org/project/gp3tools/){ .md-button }
+[Zenodo DOI](https://doi.org/10.5281/zenodo.22150772){ .md-button }
 [R implementation](https://github.com/stefanosbalaskas/gp3tools){ .md-button }

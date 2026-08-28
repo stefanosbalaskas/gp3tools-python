@@ -12,16 +12,24 @@ private participant exports.
 === "pip"
 
     ```bash
-    python -m pip install https://github.com/stefanosbalaskas/gp3tools-python/releases/download/v0.1.0a1/gp3tools-0.1.0a1-py3-none-any.whl
+    python -m pip install "gp3tools==0.1.0a1"
+    ```
+
+=== "latest alpha"
+
+    ```bash
+    python -m pip install --pre gp3tools
     ```
 
 === "uv"
 
     ```bash
-    uv pip install https://github.com/stefanosbalaskas/gp3tools-python/releases/download/v0.1.0a1/gp3tools-0.1.0a1-py3-none-any.whl
+    uv pip install "gp3tools==0.1.0a1"
     ```
 
 The GitHub CI matrix validates Python **3.11, 3.12 and 3.13**.
+
+The published distributions are available from [PyPI](https://pypi.org/project/gp3tools/), and the archived software release is available at [Zenodo DOI 10.5281/zenodo.22150772](https://doi.org/10.5281/zenodo.22150772).
 
 ## Verify
 
