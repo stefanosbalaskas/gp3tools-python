@@ -14,8 +14,8 @@ copyright: >
 theme:
   name: material
   language: en
+  logo: assets/python-suite-logo.png
   icon:
-    logo: material/eye
     repo: fontawesome/brands/github
   palette:
     - media: "(prefers-color-scheme: light)"
