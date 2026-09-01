@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/stefanosbalaskas/gp3tools-python/main/docs/assets/python-suite-logo.png" width="260" alt="Python Suite research packages logo">
+</p>
+
 # gp3tools for Python
 
 [![CI](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml)
