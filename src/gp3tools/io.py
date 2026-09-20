@@ -189,7 +189,7 @@ def inspect_gazepoint_columns(data=None, *, x=None) -> pd.DataFrame:
             "R-compatible alias 'x'; supply only one."
         )
     target = x if x is not None else data
-    if isinstance(target, (str, bytes)):
+    if isinstance(target, (str, bytes, Path)):
         target = read_gazepoint(target)
     else:
         target = standardise_gazepoint_names(target)
