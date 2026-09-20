@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/ci.yml)
 [![Documentation](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/stefanosbalaskas/gp3tools-python/actions/workflows/docs.yml)
-[![Release](https://img.shields.io/github/v/release/stefanosbalaskas/gp3tools-python?include_prereleases&label=release)](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1)
+[![Release](https://img.shields.io/github/v/release/stefanosbalaskas/gp3tools-python?include_prereleases&label=release)](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0)
 [![PyPI](https://img.shields.io/pypi/v/gp3tools?include_prereleases&label=PyPI)](https://pypi.org/project/gp3tools/)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22150772.svg)](https://doi.org/10.5281/zenodo.22150772)
 ![Python](https://img.shields.io/badge/Python-3.11--3.13-3776AB)
@@ -17,14 +17,14 @@
 
 A Python implementation of the public workflow of **gp3tools**, the R package for importing, inspecting, analysing, visualising, modelling, and reporting Gazepoint GP3 / Gazepoint Analysis exports.
 
-> **Status: 0.1.0a1 comprehensive migration build.** The complete 278-function public name surface frozen from the R `v2.3.0` `NAMESPACE` is present. Core data, QC, pupil, AOI, sequence, event, plotting, reporting, face, simulation, and export workflows are native Python. Statistical functions tied to R-specific backends are **Python-native adaptations**, not claims of coefficient-for-coefficient equivalence to `lme4`, `glmmTMB`, `mgcv`, or `brms`.
+> **Status: 0.1.0 initial stable release.** The complete 278-function public name surface frozen from the R `v2.3.0` `NAMESPACE` is present. Core data, QC, pupil, AOI, sequence, event, plotting, reporting, face, simulation, and export workflows are native Python. Statistical functions tied to R-specific backends are **Python-native adaptations**, not claims of coefficient-for-coefficient equivalence to `lme4`, `glmmTMB`, `mgcv`, or `brms`.
 
 ## Installation
 
 Install the validated alpha release from PyPI:
 
 ```bash
-python -m pip install "gp3tools==0.1.0a1"
+python -m pip install "gp3tools==0.1.0"
 ```
 
 or allow the latest pre-release explicitly:

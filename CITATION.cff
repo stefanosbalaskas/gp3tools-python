@@ -2,7 +2,7 @@
 message: "If you use gp3tools for Python, cite the gp3tools software paper and report the Python package version."
 title: "gp3tools for Python"
 type: software
-version: "0.1.0a1"
+version: "0.1.0"
 authors:
   - family-names: "Balaskas"
     given-names: "Stefanos"
