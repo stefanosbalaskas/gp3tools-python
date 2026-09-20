@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,7 +8,6 @@ import gp3tools as gp3
 import gp3tools._exports as exports_mod
 import gp3tools.face as face_mod
 import gp3tools.io as io_mod
-
 
 # ---------------------------------------------------------------------------
 # gp3tools.__init__
