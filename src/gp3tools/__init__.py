@@ -1,6 +1,6 @@
 """gp3tools for Python: reproducible Gazepoint GP3 analysis.
 
-This alpha migration exposes the complete public function-name surface from the
+This initial stable release exposes the complete public function-name surface from the
 R gp3tools v2.3.0 NAMESPACE. Core workflows have native Python implementations;
 backend-specific functions without a validated native implementation use an
 explicit optional R bridge rather than silently changing scientific semantics.
@@ -18,7 +18,7 @@ from ._exports import R_EXPORTS
 from ._rbridge import BackendUnavailableError
 from .datasets import load_example_data, load_example_fixations, load_example_master
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0"
 
 _MODULE_NAMES = (
     "io",
