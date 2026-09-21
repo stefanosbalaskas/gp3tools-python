@@ -1869,3 +1869,144 @@ def test_stats_grid_multiverse_and_cluster_report_paths(
     )
 
     assert "none reached" in nonsig["report_text"]
+
+
+def test_events_final_coverage_contract_paths(tmp_path):
+    stationary = pd.DataFrame(
+        {
+            "x": [0.5, 0.5, 0.5],
+            "y": [0.5, 0.5, 0.5],
+            "time": [0.0, 0.1, 0.2],
+        }
+    )
+    empty_saccades = events.compute_gazepoint_saccade_metrics(
+        stationary,
+        x_col="x",
+        y_col="y",
+        time_col="time",
+    )
+    assert empty_saccades.empty
+
+    auto = pd.DataFrame(
+        {
+            "subject": ["S1", "S1"],
+            "trial": ["T1", "T1"],
+            "fixation_id": [1, 2],
+            "start": [0.0, 0.2],
+            "duration": [0.1, 0.1],
+            "x": [0.2, 0.8],
+            "y": [0.2, 0.8],
+            "aoi": ["T", "D"],
+        }
+    )
+    auto_summary = events.summarise_gazepoint_fixation_trials(
+        auto,
+        fixation_id_col="fixation_id",
+        start_col="start",
+        duration_col="duration",
+        x_col="x",
+        y_col="y",
+        aoi_col="aoi",
+        target_aoi_values=["T"],
+        distractor_aoi_values=["D"],
+    )
+    assert len(auto_summary) == 1
+
+    blank_groups = auto.copy()
+    blank_groups["subject"] = ""
+    blank_groups["trial"] = ""
+    blank_summary = events.summarise_gazepoint_fixation_trials(
+        blank_groups,
+        fixation_id_col="fixation_id",
+        start_col="start",
+        duration_col="duration",
+    )
+    assert len(blank_summary) == 1
+
+    with pytest.raises(ValueError, match="Missing required columns"):
+        events.summarise_gazepoint_fixation_trials(
+            auto[["fixation_id", "start", "duration"]],
+            subject_col="person",
+            trial_col="trial_name",
+            fixation_id_col="fixation_id",
+            start_col="start",
+            duration_col="duration",
+        )
+
+    with pytest.raises(ValueError, match="automatically detect grouping"):
+        events.summarise_gazepoint_fixation_trials(
+            auto[["fixation_id", "start", "duration"]],
+            fixation_id_col="fixation_id",
+            start_col="start",
+            duration_col="duration",
+        )
+
+    reliability = pd.DataFrame(
+        {
+            "subject": ["A"] * 4 + ["B"] * 4 + ["C"] * 4,
+            "trial": ["1", "2", "3", "4"] * 3,
+            "duration": [1.0, 2.0, 3.0, 4.0] * 3,
+            "aoi": ["T", "D", "T", "D"] * 3,
+            "time": [0.0, 1.0, 2.0, 3.0] * 3,
+        }
+    )
+
+    total = events.audit_gazepoint_fixation_reliability(
+        reliability,
+        subject_col="subject",
+        trial_col="trial",
+        duration_col="duration",
+        metric="total_fixation_duration",
+        min_trials=4,
+    )
+    assert len(total) == 1
+
+    dwell = events.audit_gazepoint_fixation_reliability(
+        reliability,
+        subject_col="subject",
+        trial_col="trial",
+        aoi_col="aoi",
+        target_aoi="T",
+        duration_col="duration",
+        metric="aoi_dwell_prop",
+        min_trials=4,
+    )
+    assert len(dwell) == 1
+
+    blank_aoi = reliability.assign(aoi="")
+    entropy = events.audit_gazepoint_fixation_reliability(
+        blank_aoi,
+        subject_col="subject",
+        trial_col="trial",
+        aoi_col="aoi",
+        metric="entropy_score",
+        min_trials=4,
+    )
+    assert len(entropy) == 1
+
+    standard = pd.DataFrame(
+        {
+            "USER_ID": ["S1", "S1"],
+            "TIME": [0.0, 1.0],
+        }
+    )
+    with pytest.raises(TypeError, match="Unexpected keyword"):
+        events.create_gazepoint_event_review_template(
+            standard,
+            impossible=True,
+        )
+
+    with pytest.raises(ValueError, match="missing required column"):
+        events.create_gazepoint_event_review_template(
+            standard,
+            trial_col="TRIAL",
+        )
+
+    review_path = tmp_path / "final-review.csv"
+    reviewed = events.create_gazepoint_event_review_template(
+        standard,
+        reviewer="reviewer-1",
+        path=review_path,
+    )
+    assert reviewed["reviewer"].eq("reviewer-1").all()
+    assert review_path.exists()
