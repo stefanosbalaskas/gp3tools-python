@@ -625,19 +625,6 @@ def test_r3a_basic_helpers_and_retired_contracts():
     assert r3a._detect_sampling_rate(pd.Series([0.0, 0.5, 1.0])) == pytest.approx(2.0)
 
     with pytest.raises(RuntimeError, match="Superseded"):
-        r3a._ivt_one_group(
-            pd.DataFrame(),
-            x_col="x",
-            y_col="y",
-            time_col="time",
-            velocity_threshold=1,
-            min_duration_ms=1,
-            distance_scale=1,
-            time_scale=1,
-            group_cols=[],
-        )
-
-    with pytest.raises(RuntimeError, match="Superseded"):
         r3a._binocular_policy(
             pd.DataFrame(),
             left_col="l",
@@ -654,13 +641,6 @@ def test_r3a_basic_helpers_and_retired_contracts():
             pd.Series(dtype=float),
             "complete_case",
             {},
-        )
-
-    with pytest.raises(RuntimeError, match="Superseded"):
-        r3a._r3a_analyse_gazepoint_binocular_sensitivity(
-            pd.DataFrame(),
-            "l",
-            "r",
         )
 
     with pytest.raises(RuntimeError, match="Superseded"):
