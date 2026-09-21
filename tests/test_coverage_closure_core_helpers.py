@@ -332,6 +332,7 @@ def test_aoi_r_list_label_and_resolution_helpers():
             None,
             ["AOI"],
             name="aoi_col",
+            allow_none=True,
         )
         == "AOI"
     )
@@ -341,6 +342,7 @@ def test_aoi_r_list_label_and_resolution_helpers():
             None,
             ["missing"],
             name="x",
+            allow_none=True,
         )
     with pytest.raises(ValueError, match="Missing required"):
         aoi._gp3_aoi_r_resolve_column(

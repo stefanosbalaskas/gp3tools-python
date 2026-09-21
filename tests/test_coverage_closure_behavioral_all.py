@@ -511,7 +511,7 @@ def test_r2_recalibration_validation_paths():
         method="mean_shift",
         min_valid_points=2,
     )
-    assert fitted["gaze_recalibration_status"].eq("ok").all()
+    assert fitted["gaze_recalibration_status"].eq("complete").all()
 
 
 def test_r2_face_subset_empty_metrics_and_missing_group_label():
@@ -955,7 +955,7 @@ def test_r3b_divergence_all_missing_bootstrap_and_zero_direction():
         {
             "condition": ["A", "B"] * 3,
             "time": [0, 0, 1, 1, 2, 2],
-            "outcome": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "outcome": [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
         }
     )
 
@@ -969,6 +969,7 @@ def test_r3b_divergence_all_missing_bootstrap_and_zero_direction():
         n_boot=2,
         ci=0.8,
         consecutive_points=1,
+        null_value=1.0,
         min_abs_difference=0,
         direction="two_sided",
         seed=1,
