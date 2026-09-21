@@ -242,8 +242,6 @@ def prepare_gazepoint_timecourse_test_data(
     def aggregate_series(series):
         values = pd.to_numeric(series, errors="coerce")
         values = values[np.isfinite(values)]
-        if len(values) == 0:
-            return np.nan
         try:
             return float(aggregate_fun(values))
         except TypeError:
@@ -2035,7 +2033,6 @@ def analyze_gazepoint_window(
             return float(np.max(z))
         if stat == "sum":
             return float(np.sum(z))
-        raise ValueError("Unknown summary statistic.")
 
     if by_cols:
         grouped = df.groupby(by_cols, dropna=False, sort=True)
