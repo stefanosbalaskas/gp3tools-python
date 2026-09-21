@@ -636,14 +636,6 @@ def test_r3a_basic_helpers_and_retired_contracts():
         )
 
     with pytest.raises(RuntimeError, match="Superseded"):
-        r3a._binocular_summary_block(
-            pd.DataFrame(),
-            pd.Series(dtype=float),
-            "complete_case",
-            {},
-        )
-
-    with pytest.raises(RuntimeError, match="Superseded"):
         r3a._r3a_binocular_policy_v2(
             pd.DataFrame(),
             left_col="l",

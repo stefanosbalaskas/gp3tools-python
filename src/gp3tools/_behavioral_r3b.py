@@ -2594,6 +2594,13 @@ def run_gazepoint_workflow(
     ) -> pd.DataFrame:
         output = frame.copy()
 
+        if user_col not in output.columns:
+            if output.empty:
+                output["USER_ID"] = pd.Series(dtype=float)
+                return output
+
+            raise ValueError(f"Missing user column: {user_col}")
+
         output["USER_ID"] = pd.to_numeric(
             output[user_col],
             errors="coerce",
