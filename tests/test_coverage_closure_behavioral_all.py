@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-import gp3tools._behavioral_r2 as r2
-import gp3tools._behavioral_r3a as r3a
-import gp3tools._behavioral_r3b as r3b
+r2 = importlib.import_module("gp3tools._behavioral_r2")
+r3a = importlib.import_module("gp3tools._behavioral_r3a")
+r3b = importlib.import_module("gp3tools._behavioral_r3b")
 
 
 # ============================================================================

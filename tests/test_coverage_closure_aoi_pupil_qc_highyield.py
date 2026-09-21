@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import importlib
+
 import numpy as np
 import pandas as pd
 import pytest
 
-import gp3tools.aoi as aoi
-import gp3tools.pupil as pupil
-import gp3tools.qc as qc
+aoi = importlib.import_module("gp3tools.aoi")
+pupil = importlib.import_module("gp3tools.pupil")
+qc = importlib.import_module("gp3tools.qc")
 
 
 # ============================================================================

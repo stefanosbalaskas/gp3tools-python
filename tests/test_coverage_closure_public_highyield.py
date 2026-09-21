@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import importlib
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from gp3tools import aoi, pupil, qc
+aoi = importlib.import_module("gp3tools.aoi")
+pupil = importlib.import_module("gp3tools.pupil")
+qc = importlib.import_module("gp3tools.qc")
 
 
 def test_qc_real_data_readiness_explicit_success_and_audit_objects():
