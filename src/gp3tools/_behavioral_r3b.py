@@ -1135,11 +1135,7 @@ def estimate_gazepoint_divergence_point(
 
         observed_at_onset = float(observed_difference[onset_index])
 
-        observed_direction = (
-            "positive"
-            if observed_at_onset > float(null_value)
-            else "negative"
-        )
+        observed_direction = "positive" if observed_at_onset > float(null_value) else "negative"
 
         detector_status = "complete"
 
@@ -2595,11 +2591,17 @@ def run_gazepoint_workflow(
         output = frame.copy()
 
         if user_col not in output.columns:
-            if output.empty:
-                output["USER_ID"] = pd.Series(dtype=float)
-                return output
+            # read_folder() guarantees user_col for every non-empty stream.
+            # A disabled fixation stream is legitimately empty.
+            assert output.empty, (
+                "Internal workflow invariant violated: "
+                f"non-empty stream lacks user column {user_col!r}"
+            )
 
-            raise ValueError(f"Missing user column: {user_col}")
+            output[user_col] = pd.Series(
+                index=output.index,
+                dtype=float,
+            )
 
         output["USER_ID"] = pd.to_numeric(
             output[user_col],

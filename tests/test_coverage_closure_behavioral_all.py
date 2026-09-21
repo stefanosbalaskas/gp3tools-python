@@ -1019,7 +1019,6 @@ def test_r3b_workflow_single_group_scalar_keys(tmp_path):
     assert pd.isna(result["aoi_table"].loc[0, "fixation_ttff_sec"])
 
 
-
 def test_r3b_result_property_and_report_scalar_edges(tmp_path, monkeypatch):
     result = r3b._R3BResult({"x": 1}, r_class="coverage|list")
     assert result.gp3_r_class == "coverage|list"
@@ -1039,13 +1038,9 @@ def test_r3b_result_property_and_report_scalar_edges(tmp_path, monkeypatch):
     monkeypatch.setattr(pd, "isna", guarded_isna)
 
     report_input = {
-        "sampling": pd.DataFrame(
-            {"value": [float("inf"), sentinel]}
-        ),
+        "sampling": pd.DataFrame({"value": [float("inf"), sentinel]}),
         "quality": pd.DataFrame({"value": [float("-inf")]}),
-        "flagged_quality": pd.DataFrame(
-            {"review_required": [True], "value": [sentinel]}
-        ),
+        "flagged_quality": pd.DataFrame({"review_required": [True], "value": [sentinel]}),
         "aoi_table": pd.DataFrame({"value": [1.25]}),
     }
 

@@ -214,9 +214,7 @@ def test_qc_boolean_and_exclusion_helpers():
     with pytest.raises(ValueError, match="interpretable"):
         qc._gp3_exclusion_r_bool(["mystery"], "x")
 
-    aliases = qc._gp3_exclusion_r_aliases(
-        pd.DataFrame({"MEDIA_ID": ["M1"], "USER_FILE": ["S1"]})
-    )
+    aliases = qc._gp3_exclusion_r_aliases(pd.DataFrame({"MEDIA_ID": ["M1"], "USER_FILE": ["S1"]}))
     assert {"media_id", "subject"}.issubset(aliases.columns)
 
     assert qc._gp3_exclusion_r_col(aliases, None, "x", optional=True) is None
@@ -634,6 +632,4 @@ def test_aoi_scanpath_representatives_mapping_and_transition_helpers():
     with pytest.raises(ValueError, match="group_cols"):
         aoi._gp3_transition_r_group_cols([])
 
-    assert aoi._gp3_transition_r_prepare_aoi(
-        ["A", pd.NA, "", " B "]
-    ) == ["A", " B "]
+    assert aoi._gp3_transition_r_prepare_aoi(["A", pd.NA, "", " B "]) == ["A", " B "]
