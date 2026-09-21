@@ -58,6 +58,7 @@ jobs:
           pytest -q \
             --cov=src/gp3tools \
             --cov-report=term-missing \
+            --cov-report=json:coverage.json \
             --cov-report=xml:coverage.xml \
             --cov-fail-under=90
 
@@ -65,14 +66,48 @@ jobs:
       - name: R4 compatibility coverage gate
         if: matrix.python-version == '3.13'
         run: |
-          pytest -q \
-            tests/test_coverage_closure_behavioral_r4.py \
-            tests/test_r_behavioral_parity_tranche_r4.py \
-            tests/test_r_behavioral_parity_tranche_r4_deep_edges.py \
-            tests/test_r_behavioral_parity_tranche_r4_helper_edges.py \
-            --cov=gp3tools._behavioral_r4 \
-            --cov-report=term-missing \
-            --cov-fail-under=100
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(
+              Path("coverage.json").read_text(encoding="utf-8")
+          )
+
+          matches = [
+              (name, payload)
+              for name, payload in report["files"].items()
+              if name.replace("\\", "/").endswith(
+                  "gp3tools/_behavioral_r4.py"
+              )
+          ]
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Expected exactly one _behavioral_r4.py coverage record; "
+                  f"found {len(matches)}."
+              )
+
+          name, payload = matches[0]
+          summary = payload["summary"]
+
+          statements = int(summary["num_statements"])
+          missing = int(summary["missing_lines"])
+          coverage = float(summary["percent_covered"])
+
+          print("R4 coverage record:", name)
+          print("R4 statements:", statements)
+          print("R4 missing:", missing)
+          print("R4 coverage:", coverage)
+
+          if missing != 0 or coverage < 100.0:
+              raise SystemExit(
+                  "_behavioral_r4.py must retain 100% executable "
+                  "statement coverage."
+              )
+
+          print("R4 100% COVERAGE CONTRACT: PASS")
+          PY
 
       - name: Examples smoke
         if: matrix.python-version == '3.13'
