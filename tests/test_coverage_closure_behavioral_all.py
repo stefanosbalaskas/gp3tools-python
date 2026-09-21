@@ -950,7 +950,7 @@ def test_r3b_html_table_and_candidate_directions():
     ]
 
 
-def test_r3b_divergence_all_missing_bootstrap_and_zero_direction():
+def test_r3b_divergence_exact_null_is_no_divergence():
     data = pd.DataFrame(
         {
             "condition": ["A", "B"] * 3,
@@ -976,7 +976,8 @@ def test_r3b_divergence_all_missing_bootstrap_and_zero_direction():
         keep_bootstrap=True,
     )
 
-    assert result["divergence_point"].loc[0, "observed_direction"] == "zero"
+    assert result["divergence_point"].loc[0, "detector_status"] == "no_divergence"
+    assert result["divergence_point"].loc[0, "observed_direction"] is None
 
 
 def test_r3b_workflow_single_group_scalar_keys(tmp_path):
@@ -1024,3 +1025,79 @@ def test_r3b_workflow_single_group_scalar_keys(tmp_path):
     assert pd.isna(result["quality"].loc[0, "FPOGV_valid_pct"])
     assert pd.isna(result["aoi_table"].loc[0, "sample_time_viewed_sec"])
     assert pd.isna(result["aoi_table"].loc[0, "fixation_ttff_sec"])
+
+
+
+def test_r3b_result_property_and_report_scalar_edges(tmp_path, monkeypatch):
+    result = r3b._R3BResult({"x": 1}, r_class="coverage|list")
+    assert result.gp3_r_class == "coverage|list"
+
+    class Sentinel:
+        def __str__(self):
+            return "sentinel"
+
+    sentinel = Sentinel()
+    original_isna = pd.isna
+
+    def guarded_isna(value):
+        if value is sentinel:
+            raise TypeError("synthetic missingness failure")
+        return original_isna(value)
+
+    monkeypatch.setattr(pd, "isna", guarded_isna)
+
+    report_input = {
+        "sampling": pd.DataFrame(
+            {"value": [float("inf"), sentinel]}
+        ),
+        "quality": pd.DataFrame({"value": [float("-inf")]}),
+        "flagged_quality": pd.DataFrame(
+            {"review_required": [True], "value": [sentinel]}
+        ),
+        "aoi_table": pd.DataFrame({"value": [1.25]}),
+    }
+
+    output = tmp_path / "scalar_edges.html"
+    out = r3b.create_gazepoint_report(
+        report_input,
+        output,
+        save_plots=False,
+    )
+    html = output.read_text(encoding="utf-8")
+
+    assert out.loc[0, "n_flagged"] == 1
+    assert "inf" in html
+    assert "-inf" in html
+    assert "sentinel" in html
+
+
+def test_r3b_workflow_all_missing_aoi_time_and_single_group(tmp_path):
+    gaze = pd.DataFrame(
+        {
+            "USER": ["S1", "S1"],
+            "MEDIA_ID": ["M1", "M1"],
+            "MEDIA_NAME": ["Stim", "Stim"],
+            "TIME": [np.nan, np.nan],
+            "FPOGV": [np.nan, np.nan],
+            "AOI": ["target", "target"],
+        }
+    )
+    gaze.to_csv(tmp_path / "missing_all_gaze.csv", index=False)
+
+    result = r3b.run_gazepoint_workflow(
+        export_dir=tmp_path,
+        all_gaze_pattern="all_gaze",
+        fixation_pattern=None,
+        check_file_pairs=False,
+        group_cols=["USER"],
+        user_col="USER",
+        sample_rate=0,
+        expected_hz=None,
+        output_dir=None,
+        save_plots=False,
+        create_report=False,
+    )
+
+    assert pd.isna(result["aoi_table"].loc[0, "sample_ttff_sec"])
+    assert pd.isna(result["aoi_table"].loc[0, "sample_time_viewed_sec"])
+    assert pd.isna(result["quality"].loc[0, "FPOGV_valid_pct"])
