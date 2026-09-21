@@ -119,7 +119,7 @@ def test_r4_static_aoi_unresolved_fields_and_duplicate_names() -> None:
             include_overlap_count=False,
         )
 
-    definitions = pd.DataFrame(
+    duplicate_definitions = pd.DataFrame(
         {
             "AOI": ["target", "target"],
             "x_min": [0.0, 0.5],
@@ -129,9 +129,44 @@ def test_r4_static_aoi_unresolved_fields_and_duplicate_names() -> None:
         }
     )
 
+    with pytest.raises(
+        ValueError,
+        match="AOI names must be unique",
+    ):
+        r4._static_aoi(
+            master,
+            duplicate_definitions,
+            x_col="FPOGX",
+            y_col="FPOGY",
+            aoi_name=None,
+            output="logical",
+            prefix="aoi_",
+            label_col="aoi_current",
+            outside_label="outside",
+            overlap="first",
+            include_overlap_count=False,
+        )
+
+    # Raw AOI names are distinct, satisfying the scientific/API contract,
+    # but their Python-safe column names collide after sanitisation:
+    # "target 1" -> "target.1"
+    # "target.1" -> "target.1"
+    #
+    # The second logical column must therefore receive a deterministic
+    # suffix rather than silently overwriting the first one.
+    collision_definitions = pd.DataFrame(
+        {
+            "AOI": ["target 1", "target.1"],
+            "x_min": [0.0, 0.5],
+            "x_max": [0.5, 1.0],
+            "y_min": [0.0, 0.5],
+            "y_max": [0.5, 1.0],
+        }
+    )
+
     out = r4._static_aoi(
         master,
-        definitions,
+        collision_definitions,
         x_col="FPOGX",
         y_col="FPOGY",
         aoi_name=None,
@@ -143,11 +178,11 @@ def test_r4_static_aoi_unresolved_fields_and_duplicate_names() -> None:
         include_overlap_count=False,
     )
 
-    assert "aoi_target" in out.columns
     assert "aoi_target.1" in out.columns
+    assert "aoi_target.1.1" in out.columns
 
-    assert out["aoi_target"].tolist() == [True, False]
-    assert out["aoi_target.1"].tolist() == [False, True]
+    assert out["aoi_target.1"].tolist() == [True, False]
+    assert out["aoi_target.1.1"].tolist() == [False, True]
 
 
 def test_r4_workflow_result_alias_uses_canonical_summary() -> None:
