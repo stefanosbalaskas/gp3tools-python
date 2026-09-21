@@ -1814,9 +1814,6 @@ def _gp3_perf_summarise_trials(results) -> pd.DataFrame:
         dropna=False,
         sort=False,
     ):
-        if not isinstance(keys, tuple):
-            keys = (keys,)
-
         values = dict(zip(group_cols, keys, strict=True))
         ok = part["status"].astype("string").eq("ok")
 
