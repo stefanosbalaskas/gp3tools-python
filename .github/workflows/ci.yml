@@ -62,6 +62,18 @@ jobs:
             --cov-fail-under=90
 
 
+      - name: R4 compatibility coverage gate
+        if: matrix.python-version == '3.13'
+        run: |
+          pytest -q \
+            tests/test_coverage_closure_behavioral_r4.py \
+            tests/test_r_behavioral_parity_tranche_r4.py \
+            tests/test_r_behavioral_parity_tranche_r4_deep_edges.py \
+            tests/test_r_behavioral_parity_tranche_r4_helper_edges.py \
+            --cov=gp3tools._behavioral_r4 \
+            --cov-report=term-missing \
+            --cov-fail-under=100
+
       - name: Examples smoke
         if: matrix.python-version == '3.13'
         run: |

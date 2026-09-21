@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1.dev0 ? coverage and release hardening
+
+- preserve the immutable published `v0.1.0` release and begin post-release hardening;
+- close genuine executable coverage gaps without weakening validation or excluding scientific modules;
+- add tranche-specific 100% coverage gates before raising the package-wide gate to 100%;
+- retain the 278-export public API and R/Python scientific-contract compatibility.
+
 ## 0.1.0a1 — comprehensive migration alpha
 
 - froze the 278-name public API from R gp3tools v2.3.0;

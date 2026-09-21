@@ -248,6 +248,19 @@ def _collapse_nullable(
     return ", ".join(str(item) for item in values)
 
 
+def _group_key_tuple(
+    value: Any,
+) -> tuple[Any, ...]:
+    """Normalize a pandas group key while retaining scalar-key compatibility."""
+    if isinstance(
+        value,
+        tuple,
+    ):
+        return value
+
+    return (value,)
+
+
 # ============================================================================
 # Pupil-response features
 # ============================================================================
@@ -633,11 +646,7 @@ def _audit_master(
             sort=True,
             dropna=False,
         ):
-            if not isinstance(
-                key,
-                tuple,
-            ):
-                key = (key,)
+            key = _group_key_tuple(key)
 
             row = dict(
                 zip(
@@ -1799,11 +1808,7 @@ def _geometry_audit(
         if len(frame) <= 1:
             continue
 
-        if not isinstance(
-            key,
-            tuple,
-        ):
-            key = (key,)
+        key = _group_key_tuple(key)
 
         row = dict(
             zip(
