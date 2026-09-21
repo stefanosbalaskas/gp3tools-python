@@ -2087,9 +2087,6 @@ def check_gazepoint_performance_regression(
             }
         )
 
-    if current is None:
-        raise TypeError("x is required for the R-compatible interface")
-
     if limits is None:
         limits = gp3tools_performance_limits()
 
