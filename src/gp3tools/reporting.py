@@ -1452,8 +1452,18 @@ def report_gazepoint_qc_overview(data, max_objects=None):
         label: int(status.eq(label).sum()) for label in ["pass", "warn", "fail", "info", "unknown"]
     }
     counts["unknown"] += int(
-        ~status.isin(
-            ["pass", "warn", "fail", "info", "unknown", "available", "not_available"]
+        (
+            ~status.isin(
+                [
+                    "pass",
+                    "warn",
+                    "fail",
+                    "info",
+                    "unknown",
+                    "available",
+                    "not_available",
+                ]
+            )
         ).sum()
     )
     counts["pass"] += int(status.eq("available").sum())
