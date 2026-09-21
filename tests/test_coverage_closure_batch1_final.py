@@ -570,3 +570,115 @@ def test_stats_final_cluster_grid_and_multiverse_paths():
         }
     )
     assert completed["overview"].iloc[-1]["multiverse_status"] == "completed"
+
+
+def test_reporting_and_stats_last_batch1_lines(monkeypatch):
+    explicit = reporting.report_gazepoint_multiverse(
+        pd.DataFrame(
+            {
+                "branch": ["a"],
+                "status": ["ok"],
+                "estimate": [0.2],
+                "p_value": [0.5],
+            }
+        ),
+        branch_col="branch",
+        alpha=0.05,
+    )
+    assert explicit["branch_summary"].loc[0, "branch"] == "a"
+
+    class DoubleFailCI:
+        params = pd.Series([1.0], index=["x"])
+        bse = np.array([0.2])
+        pvalues = np.array([0.2])
+
+        def conf_int(self, alpha=None):
+            if alpha is not None:
+                raise TypeError("legacy")
+            raise RuntimeError("unavailable")
+
+    fallback = stats_mod._gp3_model_fixed_effects_r(
+        DoubleFailCI(),
+        "m",
+        0.95,
+        False,
+        False,
+    )
+    assert np.isfinite(fallback.loc[0, "conf_low"])
+
+    too_short = stats_mod.analyze_gazepoint_window(
+        pd.DataFrame(
+            {
+                "TIME": [0.0, 1.0],
+                "value": [1.0, 2.0],
+            }
+        ),
+        by=None,
+        value_cols=["value"],
+        window_size=100.0,
+        step=1.0,
+        window_unit="native",
+        include_partial=False,
+    )
+    assert too_short.empty
+
+    unknown_overview = stats_mod.summarise_gazepoint_multiverse_results(
+        results={"x": {"_gp3_class": "custom"}}
+    )
+    assert unknown_overview["overview"].iloc[-1]["multiverse_status"] == "not_run"
+
+    monkeypatch.setattr(
+        stats_mod,
+        "_fit_spline",
+        lambda *a, **k: "pfe",
+    )
+    assert stats_mod.fit_gazepoint_pupil_pfe_gamm(
+        pd.DataFrame({"x": [1]})
+    ) == "pfe"
+
+
+def test_reporting_dashboard_executes_summary(monkeypatch):
+    fake = types.ModuleType("shiny")
+
+    class FakeUI:
+        @staticmethod
+        def h2(value):
+            return value
+
+        @staticmethod
+        def output_text_verbatim(value):
+            return value
+
+        @staticmethod
+        def page_fluid(*args):
+            return args
+
+    class FakeRender:
+        @staticmethod
+        def text(fn):
+            return fn
+
+    class FakeApp:
+        def __init__(self, ui, server):
+            self.ui = ui
+            self.server = server
+
+    fake.App = FakeApp
+    fake.render = FakeRender()
+    fake.ui = FakeUI()
+    monkeypatch.setitem(sys.modules, "shiny", fake)
+
+    app = reporting.launch_gazepoint_qc_dashboard(
+        pd.DataFrame({"x": [1.0, np.nan]})
+    )
+
+    captured = {}
+
+    def output(fn):
+        captured["summary"] = fn()
+        return fn
+
+    app.server(None, output, None)
+
+    assert "Rows: 2" in captured["summary"]
+    assert "Missing cells: 1" in captured["summary"]
