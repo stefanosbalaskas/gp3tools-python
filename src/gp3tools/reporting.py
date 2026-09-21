@@ -1185,51 +1185,6 @@ def create_gazepoint_report(
             **kwargs,
         )
 
-    if (
-        isinstance(results, dict)
-        and {
-            "sampling",
-            "quality",
-            "flagged_quality",
-            "aoi_table",
-        }.issubset(results)
-        and metadata is None
-        and any(
-            key in kwargs
-            for key in {
-                "overwrite",
-                "max_rows",
-                "save_plots",
-                "plot_dir",
-            }
-        )
-    ):
-        from ._behavioral_r3b import (
-            create_gazepoint_report as _r3b,
-        )
-
-        return _r3b(
-            results=results,
-            output_file=output_file,
-            title=title,
-            overwrite=kwargs.pop(
-                "overwrite",
-                True,
-            ),
-            max_rows=kwargs.pop(
-                "max_rows",
-                30,
-            ),
-            save_plots=kwargs.pop(
-                "save_plots",
-                True,
-            ),
-            plot_dir=kwargs.pop(
-                "plot_dir",
-                None,
-            ),
-        )
-
     sections = []
     if isinstance(results, pd.DataFrame):
         results = {"Results": results}
