@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import builtins
 import contextlib
@@ -26,9 +26,7 @@ from gp3tools.datasets import load_example_data
 
 
 def test_dataset_loader_direct_csv_and_unknown_name():
-    master = load_example_data(
-        "gazepoint_example_master.csv"
-    )
+    master = load_example_data("gazepoint_example_master.csv")
 
     assert master.shape == (
         1440,
@@ -39,9 +37,7 @@ def test_dataset_loader_direct_csv_and_unknown_name():
         KeyError,
         match="Unknown example dataset",
     ):
-        load_example_data(
-            "definitely_not_a_dataset"
-        )
+        load_example_data("definitely_not_a_dataset")
 
 
 # ---------------------------------------------------------------------------
@@ -59,9 +55,7 @@ def test_ensure_dataframe_all_supported_inputs_and_copy_contract():
         }
     )
 
-    copied = utils.ensure_dataframe(
-        frame
-    )
+    copied = utils.ensure_dataframe(frame)
 
     same = utils.ensure_dataframe(
         frame,
@@ -80,52 +74,28 @@ def test_ensure_dataframe_all_supported_inputs_and_copy_contract():
         name="x",
     )
 
-    series_copy = utils.ensure_dataframe(
-        series
-    )
+    series_copy = utils.ensure_dataframe(series)
 
     series_view = utils.ensure_dataframe(
         series,
         copy=False,
     )
 
-    assert list(series_copy.columns) == [
-        "x"
-    ]
+    assert list(series_copy.columns) == ["x"]
 
-    assert list(series_view.columns) == [
-        "x"
-    ]
+    assert list(series_view.columns) == ["x"]
 
-    assert utils.ensure_dataframe(
-        {
-            "x": [
-                1
-            ]
-        }
-    ).shape == (
+    assert utils.ensure_dataframe({"x": [1]}).shape == (
         1,
         1,
     )
 
-    assert utils.ensure_dataframe(
-        [
-            {
-                "x": 1
-            }
-        ]
-    ).shape == (
+    assert utils.ensure_dataframe([{"x": 1}]).shape == (
         1,
         1,
     )
 
-    assert utils.ensure_dataframe(
-        (
-            {
-                "x": 1
-            },
-        )
-    ).shape == (
+    assert utils.ensure_dataframe(({"x": 1},)).shape == (
         1,
         1,
     )
@@ -134,23 +104,15 @@ def test_ensure_dataframe_all_supported_inputs_and_copy_contract():
         TypeError,
         match="Expected a pandas DataFrame",
     ):
-        utils.ensure_dataframe(
-            object()
-        )
+        utils.ensure_dataframe(object())
 
 
 def test_column_inference_all_contract_edges():
     frame = pd.DataFrame(
         {
-            "USER": [
-                "S1"
-            ],
-            "TIME": [
-                0.0
-            ],
-            "custom": [
-                1
-            ],
+            "USER": ["S1"],
+            "TIME": [0.0],
+            "custom": [1],
         }
     )
 
@@ -236,12 +198,8 @@ def test_column_inference_all_contract_edges():
 def test_group_column_normalization_contract():
     frame = pd.DataFrame(
         {
-            "subject": [
-                "S1"
-            ],
-            "trial": [
-                1
-            ],
+            "subject": ["S1"],
+            "trial": [1],
         }
     )
 
@@ -253,29 +211,21 @@ def test_group_column_normalization_contract():
         == []
     )
 
-    assert (
-        utils.normalize_group_cols(
-            frame,
-            "subject",
-        )
-        == [
-            "subject"
-        ]
-    )
+    assert utils.normalize_group_cols(
+        frame,
+        "subject",
+    ) == ["subject"]
 
-    assert (
-        utils.normalize_group_cols(
-            frame,
-            [
-                "subject",
-                "trial",
-            ],
-        )
-        == [
+    assert utils.normalize_group_cols(
+        frame,
+        [
             "subject",
             "trial",
-        ]
-    )
+        ],
+    ) == [
+        "subject",
+        "trial",
+    ]
 
     with pytest.raises(
         KeyError,
@@ -283,9 +233,7 @@ def test_group_column_normalization_contract():
     ):
         utils.normalize_group_cols(
             frame,
-            [
-                "missing"
-            ],
+            ["missing"],
         )
 
 
@@ -303,15 +251,9 @@ def test_numeric_and_boolean_helpers_cover_all_types():
     )
 
     assert numeric.iloc[0] == 1
-    assert pd.isna(
-        numeric.iloc[1]
-    )
-    assert pd.isna(
-        numeric.iloc[2]
-    )
-    assert pd.isna(
-        numeric.iloc[3]
-    )
+    assert pd.isna(numeric.iloc[1])
+    assert pd.isna(numeric.iloc[2])
+    assert pd.isna(numeric.iloc[3])
     assert numeric.iloc[4] == 2
 
     boolean = utils.as_bool(
@@ -401,9 +343,7 @@ def test_robust_mad_empty_and_finite_values():
             2,
             3,
         ]
-    ) == pytest.approx(
-        1.0
-    )
+    ) == pytest.approx(1.0)
 
 
 def test_group_iter_ungrouped_single_and_multi_key():
@@ -431,18 +371,14 @@ def test_group_iter_ungrouped_single_and_multi_key():
         )
     )
 
-    assert len(
-        ungrouped
-    ) == 1
+    assert len(ungrouped) == 1
 
     assert ungrouped[0][0] == ()
 
     one = list(
         utils.group_iter(
             frame,
-            [
-                "subject"
-            ],
+            ["subject"],
         )
     )
 
@@ -451,8 +387,7 @@ def test_group_iter_ungrouped_single_and_multi_key():
             key,
             tuple,
         )
-        for key, _
-        in one
+        for key, _ in one
     )
 
     two = list(
@@ -465,21 +400,11 @@ def test_group_iter_ungrouped_single_and_multi_key():
         )
     )
 
-    assert all(
-        len(key) == 2
-        for key, _
-        in two
-    )
+    assert all(len(key) == 2 for key, _ in two)
 
 
 def test_utility_output_helpers(tmp_path):
-    frame = pd.DataFrame(
-        {
-            "x": [
-                1
-            ]
-        }
-    )
+    frame = pd.DataFrame({"x": [1]})
 
     out = utils.attach_attrs(
         frame,
@@ -488,16 +413,10 @@ def test_utility_output_helpers(tmp_path):
     )
 
     assert out is frame
-    assert out.attrs[
-        "method"
-    ] == "test"
-    assert out.attrs[
-        "version"
-    ] == 1
+    assert out.attrs["method"] == "test"
+    assert out.attrs["version"] == 1
 
-    resolved = utils.safe_path(
-        tmp_path / ".." / tmp_path.name
-    )
+    resolved = utils.safe_path(tmp_path / ".." / tmp_path.name)
 
     assert resolved == tmp_path.resolve()
 
@@ -506,9 +425,7 @@ def test_utility_output_helpers(tmp_path):
         b="x",
     )
 
-    assert result.to_dict(
-        "records"
-    ) == [
+    assert result.to_dict("records") == [
         {
             "a": 1,
             "b": "x",
@@ -530,17 +447,11 @@ def test_ordered_unique_hashable_and_unhashable_values():
             1,
             2,
         ],
-        {
-            "x": 1
-        },
-        {
-            "x": 1
-        },
+        {"x": 1},
+        {"x": 1},
     ]
 
-    result = utils.ordered_unique(
-        values
-    )
+    result = utils.ordered_unique(values)
 
     assert result[0:2] == [
         "a",
@@ -552,19 +463,13 @@ def test_ordered_unique_hashable_and_unhashable_values():
         2,
     ]
 
-    assert result[3] == {
-        "x": 1
-    }
+    assert result[3] == {"x": 1}
 
-    assert len(
-        result
-    ) == 4
+    assert len(result) == 4
 
 
 def test_collapse_consecutive_contract():
-    assert utils.collapse_consecutive(
-        []
-    ) == []
+    assert utils.collapse_consecutive([]) == []
 
     assert utils.collapse_consecutive(
         [
@@ -592,9 +497,7 @@ def test_time_to_seconds_all_heuristic_paths():
     )
 
     assert empty.isna().iloc[0]
-    assert np.isinf(
-        empty.iloc[1]
-    )
+    assert np.isinf(empty.iloc[1])
 
     seconds = utils.time_to_seconds(
         pd.Series(
@@ -660,9 +563,7 @@ def test_require_optional_success_and_failure():
         "testing",
     )
 
-    assert module.sqrt(
-        9
-    ) == 3
+    assert module.sqrt(9) == 3
 
     with pytest.raises(
         ImportError,
@@ -703,41 +604,28 @@ def test_r_bridge_wrapper_metadata_and_dispatch(monkeypatch):
         fake_call,
     )
 
-    wrapper = compat.make_r_bridge_wrapper(
-        "example_r_function"
-    )
+    wrapper = compat.make_r_bridge_wrapper("example_r_function")
+
+    assert wrapper.__name__ == "example_r_function"
+
+    assert wrapper.__qualname__ == "example_r_function"
+
+    assert wrapper._gp3tools_status == "r-bridge"
+
+    assert "Compatibility wrapper" in wrapper.__doc__
 
     assert (
-        wrapper.__name__
-        == "example_r_function"
+        wrapper(
+            1,
+            value=2,
+        )
+        == "ok"
     )
-
-    assert (
-        wrapper.__qualname__
-        == "example_r_function"
-    )
-
-    assert (
-        wrapper._gp3tools_status
-        == "r-bridge"
-    )
-
-    assert (
-        "Compatibility wrapper"
-        in wrapper.__doc__
-    )
-
-    assert wrapper(
-        1,
-        value=2,
-    ) == "ok"
 
     assert calls == [
         (
             "example_r_function",
-            (
-                1,
-            ),
+            (1,),
             {
                 "value": 2,
             },
@@ -784,9 +672,7 @@ def test_r_aliases_alias_absent_present_conflict_and_signature():
         },
     )
 
-    parameters = inspect.signature(
-        wrapped
-    ).parameters
+    parameters = inspect.signature(wrapped).parameters
 
     assert "x" in parameters
     assert "r_value" in parameters
@@ -826,15 +712,9 @@ def test_r_alias_existing_parameter_not_duplicated():
         value="value",
     )
 
-    signature = inspect.signature(
-        wrapped
-    )
+    signature = inspect.signature(wrapped)
 
-    assert list(
-        signature.parameters
-    ).count(
-        "value"
-    ) == 1
+    assert list(signature.parameters).count("value") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -856,9 +736,7 @@ class _FakeConversion:
         *,
         fail_back_conversion=False,
     ):
-        self.fail_back_conversion = (
-            fail_back_conversion
-        )
+        self.fail_back_conversion = fail_back_conversion
 
     @contextlib.contextmanager
     def localconverter(
@@ -881,9 +759,7 @@ class _FakeConversion:
         value,
     ):
         if self.fail_back_conversion:
-            raise RuntimeError(
-                "deliberate conversion failure"
-            )
+            raise RuntimeError("deliberate conversion failure")
 
         return (
             "PY",
@@ -898,40 +774,25 @@ def _install_fake_rpy2(
     fail_back_conversion=False,
     importr_error=None,
 ):
-    top = types.ModuleType(
-        "rpy2"
-    )
+    top = types.ModuleType("rpy2")
 
     top.__path__ = []
 
-    robjects = types.ModuleType(
-        "rpy2.robjects"
-    )
+    robjects = types.ModuleType("rpy2.robjects")
 
-    packages = types.ModuleType(
-        "rpy2.robjects.packages"
-    )
+    packages = types.ModuleType("rpy2.robjects.packages")
 
-    conversion = _FakeConversion(
-        fail_back_conversion=(
-            fail_back_conversion
-        )
-    )
+    conversion = _FakeConversion(fail_back_conversion=(fail_back_conversion))
 
     robjects.conversion = conversion
-    robjects.default_converter = (
-        _FakeConverter()
-    )
+    robjects.default_converter = _FakeConverter()
 
-    robjects.pandas2ri = types.SimpleNamespace(
-        converter=_FakeConverter()
-    )
+    robjects.pandas2ri = types.SimpleNamespace(converter=_FakeConverter())
 
     if importr_error is None:
-        packages.importr = (
-            lambda name: package
-        )
+        packages.importr = lambda name: package
     else:
+
         def fail_importr(
             name,
         ):
@@ -970,12 +831,8 @@ def test_rbridge_missing_rpy2_is_explicit(monkeypatch):
         fromlist=(),
         level=0,
     ):
-        if name.startswith(
-            "rpy2"
-        ):
-            raise ImportError(
-                "rpy2 unavailable"
-            )
+        if name.startswith("rpy2"):
+            raise ImportError("rpy2 unavailable")
 
         return real_import(
             name,
@@ -1004,9 +861,7 @@ def test_rbridge_missing_r_package_is_explicit(monkeypatch):
     _install_fake_rpy2(
         monkeypatch,
         package=None,
-        importr_error=RuntimeError(
-            "R package unavailable"
-        ),
+        importr_error=RuntimeError("R package unavailable"),
     )
 
     with pytest.raises(
@@ -1042,19 +897,13 @@ def test_rbridge_success_converts_arguments_and_keyword_names(monkeypatch):
         *args,
         **kwargs,
     ):
-        captured[
-            "args"
-        ] = args
+        captured["args"] = args
 
-        captured[
-            "kwargs"
-        ] = kwargs
+        captured["kwargs"] = kwargs
 
         return "r-result"
 
-    package = types.SimpleNamespace(
-        target=bridged
-    )
+    package = types.SimpleNamespace(target=bridged)
 
     _install_fake_rpy2(
         monkeypatch,
@@ -1067,18 +916,14 @@ def test_rbridge_success_converts_arguments_and_keyword_names(monkeypatch):
         sample_value=2,
     )
 
-    assert captured[
-        "args"
-    ] == (
+    assert captured["args"] == (
         (
             "R",
             1,
         ),
     )
 
-    assert captured[
-        "kwargs"
-    ] == {
+    assert captured["kwargs"] == {
         "sample.value": (
             "R",
             2,
@@ -1094,9 +939,7 @@ def test_rbridge_success_converts_arguments_and_keyword_names(monkeypatch):
 def test_rbridge_failed_back_conversion_returns_raw_result(monkeypatch):
     raw = object()
 
-    package = types.SimpleNamespace(
-        target=lambda: raw
-    )
+    package = types.SimpleNamespace(target=lambda: raw)
 
     _install_fake_rpy2(
         monkeypatch,
@@ -1104,12 +947,7 @@ def test_rbridge_failed_back_conversion_returns_raw_result(monkeypatch):
         fail_back_conversion=True,
     )
 
-    assert (
-        rbridge.call_r_function(
-            "target"
-        )
-        is raw
-    )
+    assert rbridge.call_r_function("target") is raw
 
 
 # ---------------------------------------------------------------------------
@@ -1118,9 +956,7 @@ def test_rbridge_failed_back_conversion_returns_raw_result(monkeypatch):
 
 
 def test_hddm_script_without_path_has_no_write_side_effect():
-    script = (
-        interop.create_gazepoint_hddm_fit_script()
-    )
+    script = interop.create_gazepoint_hddm_fit_script()
 
     assert "import hddm" in script
     assert "model.sample" in script
@@ -1140,33 +976,21 @@ def test_bids_export_without_subject_column_uses_default_subject(tmp_path):
         }
     )
 
-    result = (
-        interop.export_gazepoint_to_bids(
-            frame,
-            tmp_path,
-            task="coverage",
-        )
+    result = interop.export_gazepoint_to_bids(
+        frame,
+        tmp_path,
+        task="coverage",
     )
 
-    assert len(
-        result["files"]
-    ) == 1
+    assert len(result["files"]) == 1
 
-    exported = Path(
-        result["files"][0]
-    )
+    exported = Path(result["files"][0])
 
-    assert (
-        "sub-01"
-        in str(exported)
-    )
+    assert "sub-01" in str(exported)
 
     assert exported.exists()
 
-    assert (
-        tmp_path
-        / "dataset_description.json"
-    ).exists()
+    assert (tmp_path / "dataset_description.json").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1295,9 +1119,7 @@ def test_recalibration_r_route_unknown_keyword_and_offset_mapping(
         data,
         **kwargs,
     ):
-        captured.update(
-            kwargs
-        )
+        captured.update(kwargs)
 
         return data.copy()
 
@@ -1316,14 +1138,9 @@ def test_recalibration_r_route_unknown_keyword_and_offset_mapping(
         method="offset",
     )
 
-    assert len(out) == len(
-        frame
-    )
+    assert len(out) == len(frame)
 
-    assert (
-        captured["method"]
-        == "median_shift"
-    )
+    assert captured["method"] == "median_shift"
 
 
 def test_adaptive_trial_data_alias_and_no_score_column():
@@ -1336,30 +1153,15 @@ def test_adaptive_trial_data_alias_and_no_score_column():
         }
     )
 
-    result = (
-        misc.select_gazepoint_adaptive_trial(
-            data=frame,
-        )
+    result = misc.select_gazepoint_adaptive_trial(
+        data=frame,
     )
 
-    assert len(
-        result
-    ) == 1
+    assert len(result) == 1
 
-    assert (
-        result.iloc[0][
-            "candidate"
-        ]
-        == "A"
-    )
+    assert result.iloc[0]["candidate"] == "A"
 
-    empty = (
-        misc.select_gazepoint_adaptive_trial(
-            data=frame.iloc[
-                0:0
-            ]
-        )
-    )
+    empty = misc.select_gazepoint_adaptive_trial(data=frame.iloc[0:0])
 
     assert empty.empty
 
@@ -1370,21 +1172,23 @@ def test_adaptive_trial_data_alias_and_no_score_column():
 
 
 def test_r4_argument_and_geometry_helpers():
-    assert dual._argument(
-        (),
-        {
-            "value": 1
-        },
-        "value",
-    ) == 1
+    assert (
+        dual._argument(
+            (),
+            {"value": 1},
+            "value",
+        )
+        == 1
+    )
 
-    assert dual._argument(
-        (
-            2,
-        ),
-        {},
-        "value",
-    ) == 2
+    assert (
+        dual._argument(
+            (2,),
+            {},
+            "value",
+        )
+        == 2
+    )
 
     assert (
         dual._argument(
@@ -1397,21 +1201,15 @@ def test_r4_argument_and_geometry_helpers():
 
     geometry = pd.DataFrame(
         {
-            "AOI": [
-                "target"
-            ],
-            "x_min": [
-                0
-            ],
+            "AOI": ["target"],
+            "x_min": [0],
         }
     )
 
     assert (
         dual._aoi_geometry(
             (),
-            {
-                "aoi_defs": geometry
-            },
+            {"aoi_defs": geometry},
         )
         is geometry
     )
@@ -1439,18 +1237,10 @@ def test_r4_argument_and_geometry_helpers():
 def test_r4_static_aoi_dispatch_edges():
     assert dual._r4_static_aoi(
         (),
-        {
-            "aoi_name": "target"
-        },
+        {"aoi_name": "target"},
     )
 
-    canonical = pd.DataFrame(
-        {
-            "AOI": [
-                "target"
-            ]
-        }
-    )
+    canonical = pd.DataFrame({"AOI": ["target"]})
 
     assert dual._r4_static_aoi(
         (
@@ -1462,21 +1252,11 @@ def test_r4_static_aoi_dispatch_edges():
 
     legacy = pd.DataFrame(
         {
-            "aoi": [
-                "target"
-            ],
-            "xmin": [
-                0
-            ],
-            "xmax": [
-                1
-            ],
-            "ymin": [
-                0
-            ],
-            "ymax": [
-                1
-            ],
+            "aoi": ["target"],
+            "xmin": [0],
+            "xmax": [1],
+            "ymin": [0],
+            "ymax": [1],
         }
     )
 
@@ -1497,50 +1277,28 @@ def test_r4_static_aoi_dispatch_edges():
 def test_r4_geometry_audit_dispatch_edges():
     assert dual._r4_geometry_audit(
         (),
-        {
-            "aoi_col": "AOI"
-        },
+        {"aoi_col": "AOI"},
     )
 
-    canonical = pd.DataFrame(
-        {
-            "NAME": [
-                "target"
-            ]
-        }
-    )
+    canonical = pd.DataFrame({"NAME": ["target"]})
 
     assert dual._r4_geometry_audit(
         (),
-        {
-            "data": canonical
-        },
+        {"data": canonical},
     )
 
     legacy = pd.DataFrame(
         {
-            "aoi": [
-                "target"
-            ],
-            "xmin": [
-                0
-            ],
-            "xmax": [
-                1
-            ],
-            "ymin": [
-                0
-            ],
-            "ymax": [
-                1
-            ],
+            "aoi": ["target"],
+            "xmin": [0],
+            "xmax": [1],
+            "ymin": [0],
+            "ymax": [1],
         }
     )
 
     assert not dual._r4_geometry_audit(
-        (
-            legacy,
-        ),
+        (legacy,),
         {},
     )
 
@@ -1553,32 +1311,18 @@ def test_r4_geometry_audit_dispatch_edges():
 def test_r4_qc_and_workflow_dispatch_edges():
     qc_frame = pd.DataFrame(
         {
-            "object_name": [
-                "sampling"
-            ],
-            "qc_status": [
-                "ok"
-            ],
+            "object_name": ["sampling"],
+            "qc_status": ["ok"],
         }
     )
 
     assert dual._r4_qc(
-        (
-            qc_frame,
-        ),
+        (qc_frame,),
         {},
     )
 
     assert not dual._r4_qc(
-        (
-            pd.DataFrame(
-                {
-                    "x": [
-                        1
-                    ]
-                }
-            ),
-        ),
+        (pd.DataFrame({"x": [1]}),),
         {},
     )
 
@@ -1590,9 +1334,7 @@ def test_r4_qc_and_workflow_dispatch_edges():
     }
 
     assert dual._r4_qc(
-        (
-            canonical,
-        ),
+        (canonical,),
         {},
     )
 
@@ -1604,25 +1346,17 @@ def test_r4_qc_and_workflow_dispatch_edges():
     }
 
     assert dual._r4_qc(
-        (
-            alternative,
-        ),
+        (alternative,),
         {},
     )
 
     assert not dual._r4_qc(
-        (
-            {
-                "x": 1
-            },
-        ),
+        ({"x": 1},),
         {},
     )
 
     assert not dual._r4_qc(
-        (
-            object(),
-        ),
+        (object(),),
         {},
     )
 
@@ -1636,18 +1370,12 @@ def test_r4_qc_and_workflow_dispatch_edges():
     }
 
     assert dual._r4_workflow(
-        (
-            workflow,
-        ),
+        (workflow,),
         {},
     )
 
     assert not dual._r4_workflow(
-        (
-            {
-                "all_gaze": 1
-            },
-        ),
+        ({"all_gaze": 1},),
         {},
     )
 
@@ -1656,17 +1384,13 @@ def test_use_r4_all_dispatch_names():
     assert dual._use_r4(
         "add_gazepoint_aoi",
         (),
-        {
-            "aoi_name": "target"
-        },
+        {"aoi_name": "target"},
     )
 
     assert dual._use_r4(
         "audit_gazepoint_aoi_geometry",
         (),
-        {
-            "aoi_col": "AOI"
-        },
+        {"aoi_col": "AOI"},
     )
 
     qc = {
@@ -1678,17 +1402,13 @@ def test_use_r4_all_dispatch_names():
 
     assert dual._use_r4(
         "summarise_gazepoint_qc_status",
-        (
-            qc,
-        ),
+        (qc,),
         {},
     )
 
     assert dual._use_r4(
         "summarize_gazepoint_qc_status",
-        (
-            qc,
-        ),
+        (qc,),
         {},
     )
 
@@ -1703,9 +1423,7 @@ def test_use_r4_all_dispatch_names():
 
     assert dual._use_r4(
         "summarise_gazepoint_workflow",
-        (
-            workflow,
-        ),
+        (workflow,),
         {},
     )
 
@@ -1725,13 +1443,9 @@ def test_legacy_callable_and_dual_contract_dispatch():
             value,
         )
 
-    legacy.__name__ = (
-        "example"
-    )
+    legacy.__name__ = "example"
 
-    legacy.__module__ = (
-        "gp3tools.aoi"
-    )
+    legacy.__module__ = "gp3tools.aoi"
 
     def canonical(
         value,
@@ -1741,21 +1455,15 @@ def test_legacy_callable_and_dual_contract_dispatch():
             value,
         )
 
-    canonical.__name__ = (
-        "example"
-    )
+    canonical.__name__ = "example"
 
-    canonical.__module__ = (
-        "gp3tools._behavioral_r4"
-    )
+    canonical.__module__ = "gp3tools._behavioral_r4"
 
     canonical.__wrapped__ = legacy
 
-    recovered = (
-        dual._legacy_callable(
-            canonical,
-            "example",
-        )
+    recovered = dual._legacy_callable(
+        canonical,
+        "example",
     )
 
     assert recovered is legacy
@@ -1765,9 +1473,7 @@ def test_legacy_callable_and_dual_contract_dispatch():
         name="unrelated_function",
     )
 
-    assert wrapped(
-        1
-    ) == (
+    assert wrapped(1) == (
         "canonical",
         1,
     )
@@ -1804,13 +1510,9 @@ def test_dual_contract_legacy_fallback():
             value,
         )
 
-    legacy.__name__ = (
-        "add_gazepoint_aoi"
-    )
+    legacy.__name__ = "add_gazepoint_aoi"
 
-    legacy.__module__ = (
-        "gp3tools.aoi"
-    )
+    legacy.__module__ = "gp3tools.aoi"
 
     def canonical(
         value,
@@ -1820,13 +1522,9 @@ def test_dual_contract_legacy_fallback():
             value,
         )
 
-    canonical.__name__ = (
-        "add_gazepoint_aoi"
-    )
+    canonical.__name__ = "add_gazepoint_aoi"
 
-    canonical.__module__ = (
-        "gp3tools._behavioral_r4"
-    )
+    canonical.__module__ = "gp3tools._behavioral_r4"
 
     canonical.__wrapped__ = legacy
 
@@ -1837,27 +1535,15 @@ def test_dual_contract_legacy_fallback():
 
     legacy_geometry = pd.DataFrame(
         {
-            "aoi": [
-                "A"
-            ],
-            "xmin": [
-                0
-            ],
-            "xmax": [
-                1
-            ],
-            "ymin": [
-                0
-            ],
-            "ymax": [
-                1
-            ],
+            "aoi": ["A"],
+            "xmin": [0],
+            "xmax": [1],
+            "ymin": [0],
+            "ymax": [1],
         }
     )
 
-    result = wrapped(
-        legacy_geometry
-    )
+    result = wrapped(legacy_geometry)
 
     assert result == (
         "legacy",
@@ -1916,9 +1602,7 @@ def test_group_iter_normalizes_scalar_group_key(monkeypatch):
         dropna=False,
         sort=False,
     ):
-        assert by == [
-            "subject"
-        ]
+        assert by == ["subject"]
 
         assert dropna is False
         assert sort is False
@@ -1934,33 +1618,21 @@ def test_group_iter_normalizes_scalar_group_key(monkeypatch):
     result = list(
         utils.group_iter(
             frame,
-            [
-                "subject"
-            ],
+            ["subject"],
         )
     )
 
-    assert len(
-        result
-    ) == 1
+    assert len(result) == 1
 
-    key, grouped = result[
-        0
-    ]
+    key, grouped = result[0]
 
-    assert key == (
-        "S1",
-    )
+    assert key == ("S1",)
 
     assert grouped is frame
 
 
 def test_r4_legacy_callable_handles_empty_closure_on_input_function():
-    canonical = (
-        _make_empty_closure_function(
-            "canonical"
-        )
-    )
+    canonical = _make_empty_closure_function("canonical")
 
     with pytest.raises(
         RuntimeError,
@@ -1973,28 +1645,18 @@ def test_r4_legacy_callable_handles_empty_closure_on_input_function():
 
 
 def test_r4_legacy_callable_handles_empty_closure_on_candidate():
-    candidate = (
-        _make_empty_closure_function(
-            "other_name"
-        )
-    )
+    candidate = _make_empty_closure_function("other_name")
 
-    candidate.__module__ = (
-        "gp3tools._behavioral_r4"
-    )
+    candidate.__module__ = "gp3tools._behavioral_r4"
 
     def canonical():
         return None
 
-    canonical.__wrapped__ = (
-        candidate
-    )
+    canonical.__wrapped__ = candidate
 
-    recovered = (
-        dual._legacy_callable(
-            canonical,
-            "wanted_name",
-        )
+    recovered = dual._legacy_callable(
+        canonical,
+        "wanted_name",
     )
 
     assert recovered is candidate
@@ -2028,8 +1690,6 @@ def test_r4_geometry_audit_unknown_geometry_shape_falls_back():
     )
 
     assert not dual._r4_geometry_audit(
-        (
-            geometry,
-        ),
+        (geometry,),
         {},
     )

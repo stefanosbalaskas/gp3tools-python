@@ -123,22 +123,16 @@ def plot_gazepoint_heatmap(data, x_col=None, y_col=None, bins=40, ax=None, **kwa
         errors="coerce",
     ).to_numpy(float)
 
-    finite = (
-        np.isfinite(x_values)
-        & np.isfinite(y_values)
-    )
+    finite = np.isfinite(x_values) & np.isfinite(y_values)
 
     if not finite.any():
-        raise ValueError(
-            "No finite gaze coordinate pairs are available for the heatmap."
-        )
+        raise ValueError("No finite gaze coordinate pairs are available for the heatmap.")
 
     if not finite.all():
         n_omitted = int((~finite).sum())
 
         warnings.warn(
-            f"Omitted {n_omitted} row(s) with non-finite gaze "
-            "coordinates from the heatmap.",
+            f"Omitted {n_omitted} row(s) with non-finite gaze coordinates from the heatmap.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -429,14 +423,10 @@ def plot_gazepoint_face_quality(data, **kwargs):
         overview = q.get("overview")
 
         if not isinstance(overview, pd.DataFrame) or overview.empty:
-            raise ValueError(
-                "Face-quality audit did not provide a usable overview."
-            )
+            raise ValueError("Face-quality audit did not provide a usable overview.")
 
         if "n_valid" not in overview:
-            raise ValueError(
-                "Face-quality audit overview is missing n_valid."
-            )
+            raise ValueError("Face-quality audit overview is missing n_valid.")
 
         n_valid = float(overview["n_valid"].iloc[0])
 
@@ -449,45 +439,27 @@ def plot_gazepoint_face_quality(data, **kwargs):
             )
         )
 
-        if (
-            isinstance(audit_data, pd.DataFrame)
-            and "face_confidence" in audit_data
-        ):
+        if isinstance(audit_data, pd.DataFrame) and "face_confidence" in audit_data:
             confidence = pd.to_numeric(
                 audit_data["face_confidence"],
                 errors="coerce",
             )
 
-            below_threshold = float(
-                (
-                    confidence.notna()
-                    & confidence.lt(threshold)
-                ).sum()
-            )
+            below_threshold = float((confidence.notna() & confidence.lt(threshold)).sum())
         elif "n_invalid" in overview:
-            below_threshold = float(
-                overview["n_invalid"].iloc[0]
-            )
+            below_threshold = float(overview["n_invalid"].iloc[0])
         else:
             below_threshold = 0.0
 
     else:
         if not isinstance(q, pd.DataFrame) or q.empty:
-            raise ValueError(
-                "Face-quality audit did not return a usable result."
-            )
+            raise ValueError("Face-quality audit did not return a usable result.")
 
         n_valid = float(q["n_valid"].iloc[0])
 
-        proportion = float(
-            q["prop_below_threshold"].iloc[0]
-        )
+        proportion = float(q["prop_below_threshold"].iloc[0])
 
-        below_threshold = (
-            proportion * float(q["n"].iloc[0])
-            if np.isfinite(proportion)
-            else 0.0
-        )
+        below_threshold = proportion * float(q["n"].iloc[0]) if np.isfinite(proportion) else 0.0
 
     fig, ax = _figax(None)
 

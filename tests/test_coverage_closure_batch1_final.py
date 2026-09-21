@@ -303,10 +303,7 @@ def test_stats_final_wrapper_and_formula_paths(monkeypatch):
         lambda *a, **k: "multimodal",
     )
     assert (
-        stats_mod.fit_gazepoint_multimodal_response_model(
-            pd.DataFrame({"x": [1]})
-        )
-        == "multimodal"
+        stats_mod.fit_gazepoint_multimodal_response_model(pd.DataFrame({"x": [1]})) == "multimodal"
     )
 
     monkeypatch.setattr(
@@ -314,9 +311,9 @@ def test_stats_final_wrapper_and_formula_paths(monkeypatch):
         "_fit_formula",
         lambda *a, **k: ("nb", a, k),
     )
-    assert stats_mod.fit_gazepoint_transition_count_nb_sensitivity(
-        pd.DataFrame({"x": [1]})
-    )[0] == "nb"
+    assert (
+        stats_mod.fit_gazepoint_transition_count_nb_sensitivity(pd.DataFrame({"x": [1]}))[0] == "nb"
+    )
 
     monkeypatch.setattr(
         stats_mod,
@@ -340,9 +337,7 @@ def test_stats_final_model_summary_paths(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "arviz", fake_arviz)
 
-    arviz_summary = stats_mod._gp3_model_legacy_summary(
-        {"idata": object()}
-    )
+    arviz_summary = stats_mod._gp3_model_legacy_summary({"idata": object()})
     assert arviz_summary.loc[0, "term"] == "beta"
 
     class NoStatistic:
@@ -632,9 +627,7 @@ def test_reporting_and_stats_last_batch1_lines(monkeypatch):
         "_fit_spline",
         lambda *a, **k: "pfe",
     )
-    assert stats_mod.fit_gazepoint_pupil_pfe_gamm(
-        pd.DataFrame({"x": [1]})
-    ) == "pfe"
+    assert stats_mod.fit_gazepoint_pupil_pfe_gamm(pd.DataFrame({"x": [1]})) == "pfe"
 
 
 def test_reporting_dashboard_executes_summary(monkeypatch):
@@ -668,9 +661,7 @@ def test_reporting_dashboard_executes_summary(monkeypatch):
     fake.ui = FakeUI()
     monkeypatch.setitem(sys.modules, "shiny", fake)
 
-    app = reporting.launch_gazepoint_qc_dashboard(
-        pd.DataFrame({"x": [1.0, np.nan]})
-    )
+    app = reporting.launch_gazepoint_qc_dashboard(pd.DataFrame({"x": [1.0, np.nan]}))
 
     captured = {}
 

@@ -176,9 +176,7 @@ def test_r2_blink_residual_gap_paths():
             "mean_pupil": [1.0],
         }
     )
-    no_blinks = pd.DataFrame(
-        columns=["USER_ID", "start_time", "end_time"]
-    )
+    no_blinks = pd.DataFrame(columns=["USER_ID", "start_time", "end_time"])
     out = r2.interpolate_blinks(
         one,
         no_blinks,
@@ -498,9 +496,7 @@ def test_r2_final_detector_default_status_and_matched_skip(monkeypatch):
 
 def test_r3a_master_missing_optional_and_media_name_paths():
     with pytest.raises(ValueError, match="Missing required columns"):
-        r3a._r3a_create_gazepoint_master_v3(
-            pd.DataFrame({"USER_FILE": ["S1"]})
-        )
+        r3a._r3a_create_gazepoint_master_v3(pd.DataFrame({"USER_FILE": ["S1"]}))
 
     data = pd.DataFrame(
         {
@@ -698,9 +694,7 @@ def test_r3a_face_reactivity_residual_matrix():
 
 def test_r3a_reporting_validation_and_no_eligible_column(monkeypatch):
     with pytest.raises(ValueError, match="reconstruct_gazepoint_binocular_pupil"):
-        r3a._r3a_summarise_gazepoint_binocular_reporting(
-            pd.DataFrame({"x": [1.0]})
-        )
+        r3a._r3a_summarise_gazepoint_binocular_reporting(pd.DataFrame({"x": [1.0]}))
 
     fake_result = {
         "summary": pd.DataFrame(

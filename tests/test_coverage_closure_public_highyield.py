@@ -58,9 +58,7 @@ def test_qc_real_data_readiness_explicit_success_and_audit_objects():
     )
 
     assert result["overview"].loc[0, "object_name"] == "coverage_gate"
-    assert {"fail", "warn", "pass", "info"}.issuperset(
-        set(result["checks"]["status"])
-    )
+    assert {"fail", "warn", "pass", "info"}.issuperset(set(result["checks"]["status"]))
     assert len(result["detected_columns"]) == 10
 
     with pytest.raises(ValueError, match="analysis_type"):
@@ -127,9 +125,7 @@ def test_aoi_geometry_legacy_and_r_bounds_origin_paths():
     legacy_result = aoi.audit_gazepoint_aoi_geometry(legacy)
     assert not legacy_result["valid"]
 
-    missing = aoi.audit_gazepoint_aoi_geometry(
-        pd.DataFrame({"xmin": [0.0]})
-    )
+    missing = aoi.audit_gazepoint_aoi_geometry(pd.DataFrame({"xmin": [0.0]}))
     assert not missing["valid"]
 
     bounds = pd.DataFrame(

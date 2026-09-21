@@ -94,17 +94,10 @@ def test_io_export_classification_paths(
 ) -> None:
     missing = tmp_path / "missing.csv"
 
-    with pytest.raises(
-        FileNotFoundError
-    ):
-        io_mod.classify_gazepoint_export(
-            missing
-        )
+    with pytest.raises(FileNotFoundError):
+        io_mod.classify_gazepoint_export(missing)
 
-    summary = (
-        tmp_path
-        / "Data_Summary_export_demo.csv"
-    )
+    summary = tmp_path / "Data_Summary_export_demo.csv"
     summary.write_text(
         "x,y\n1,2\n",
         encoding="utf-8",
@@ -128,19 +121,13 @@ def test_io_export_classification_paths(
         encoding="utf-8",
     )
 
-    header_summary = (
-        tmp_path
-        / "generic_summary.csv"
-    )
+    header_summary = tmp_path / "generic_summary.csv"
     header_summary.write_text(
         "Gazepoint Analysis,Version\n",
         encoding="utf-8",
     )
 
-    gaze_table = (
-        tmp_path
-        / "generic_gaze.csv"
-    )
+    gaze_table = tmp_path / "generic_gaze.csv"
     gaze_table.write_text(
         "FPOGX,FPOGY\n",
         encoding="utf-8",
@@ -152,70 +139,28 @@ def test_io_export_classification_paths(
         encoding="utf-8",
     )
 
-    assert (
-        io_mod.classify_gazepoint_export(
-            summary
-        )
-        == "summary"
-    )
+    assert io_mod.classify_gazepoint_export(summary) == "summary"
 
-    assert (
-        io_mod.classify_gazepoint_export(
-            fixation
-        )
-        == "fixations"
-    )
+    assert io_mod.classify_gazepoint_export(fixation) == "fixations"
 
-    assert (
-        io_mod.classify_gazepoint_export(
-            all_gaze
-        )
-        == "all_gaze"
-    )
+    assert io_mod.classify_gazepoint_export(all_gaze) == "all_gaze"
 
-    assert (
-        io_mod.classify_gazepoint_export(
-            user
-        )
-        == "all_gaze"
-    )
+    assert io_mod.classify_gazepoint_export(user) == "all_gaze"
 
-    assert (
-        io_mod.classify_gazepoint_export(
-            header_summary
-        )
-        == "summary"
-    )
+    assert io_mod.classify_gazepoint_export(header_summary) == "summary"
 
-    assert (
-        io_mod.classify_gazepoint_export(
-            gaze_table
-        )
-        == "gaze_table"
-    )
+    assert io_mod.classify_gazepoint_export(gaze_table) == "gaze_table"
 
-    assert (
-        io_mod.classify_gazepoint_export(
-            unknown
-        )
-        == "unknown"
-    )
+    assert io_mod.classify_gazepoint_export(unknown) == "unknown"
 
 
 def test_io_read_gazepoint_contracts(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(
-        FileNotFoundError
-    ):
-        io_mod.read_gazepoint(
-            tmp_path / "missing.csv"
-        )
+    with pytest.raises(FileNotFoundError):
+        io_mod.read_gazepoint(tmp_path / "missing.csv")
 
-    summary = (
-        tmp_path
-        / "Data_Summary_export.csv"
-    )
+    summary = tmp_path / "Data_Summary_export.csv"
     summary.write_text(
         "x,y\n1,2\n",
         encoding="utf-8",
@@ -225,41 +170,25 @@ def test_io_read_gazepoint_contracts(
         ValueError,
         match="summary",
     ):
-        io_mod.read_gazepoint(
-            summary
-        )
+        io_mod.read_gazepoint(summary)
 
     gaze = tmp_path / "user.csv"
 
     gaze.write_text(
-        "TIME(ms),FPOGX,Unnamed: 2\n"
-        "0,0.1,\n"
-        "1,0.2,\n",
+        "TIME(ms),FPOGX,Unnamed: 2\n0,0.1,\n1,0.2,\n",
         encoding="utf-8",
     )
 
-    result = io_mod.read_gazepoint(
-        gaze
-    )
+    result = io_mod.read_gazepoint(gaze)
 
     assert list(result.columns) == [
         "TIME",
         "FPOGX",
     ]
 
-    assert (
-        result.attrs[
-            "gp3_file_type"
-        ]
-        == "all_gaze"
-    )
+    assert result.attrs["gp3_file_type"] == "all_gaze"
 
-    assert (
-        result.attrs[
-            "gp3_source_file"
-        ]
-        == "user.csv"
-    )
+    assert result.attrs["gp3_source_file"] == "user.csv"
 
     raw = io_mod.read_gazepoint(
         gaze,
@@ -276,12 +205,8 @@ def test_io_folder_contracts(
 ) -> None:
     missing = tmp_path / "absent"
 
-    with pytest.raises(
-        FileNotFoundError
-    ):
-        io_mod.read_gazepoint_folder(
-            missing
-        )
+    with pytest.raises(FileNotFoundError):
+        io_mod.read_gazepoint_folder(missing)
 
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -290,17 +215,12 @@ def test_io_folder_contracts(
         FileNotFoundError,
         match="No files matching",
     ):
-        io_mod.read_gazepoint_folder(
-            empty
-        )
+        io_mod.read_gazepoint_folder(empty)
 
     summaries = tmp_path / "summaries"
     summaries.mkdir()
 
-    (
-        summaries
-        / "Data_Summary_export.csv"
-    ).write_text(
+    (summaries / "Data_Summary_export.csv").write_text(
         "x,y\n1,2\n",
         encoding="utf-8",
     )
@@ -309,31 +229,19 @@ def test_io_folder_contracts(
         ValueError,
         match="none were row-level",
     ):
-        io_mod.read_gazepoint_folder(
-            summaries
-        )
+        io_mod.read_gazepoint_folder(summaries)
 
     root = tmp_path / "exports"
     nested = root / "nested"
-    nested.mkdir(
-        parents=True
-    )
+    nested.mkdir(parents=True)
 
-    (
-        root
-        / "all_gaze_A.csv"
-    ).write_text(
-        "TIME,FPOGX\n"
-        "0,0.1\n",
+    (root / "all_gaze_A.csv").write_text(
+        "TIME,FPOGX\n0,0.1\n",
         encoding="utf-8",
     )
 
-    (
-        nested
-        / "fix_B.csv"
-    ).write_text(
-        "TIME,FPOGX\n"
-        "1,0.2\n",
+    (nested / "fix_B.csv").write_text(
+        "TIME,FPOGX\n1,0.2\n",
         encoding="utf-8",
     )
 
@@ -343,23 +251,17 @@ def test_io_folder_contracts(
     )
 
     assert len(top) == 1
-    assert top["SOURCE"].tolist() == [
-        "all_gaze_A.csv"
-    ]
+    assert top["SOURCE"].tolist() == ["all_gaze_A.csv"]
 
-    recursive = (
-        io_mod.read_gazepoint_folder(
-            root,
-            source_col="SOURCE",
-            recursive=True,
-        )
+    recursive = io_mod.read_gazepoint_folder(
+        root,
+        source_col="SOURCE",
+        recursive=True,
     )
 
     assert len(recursive) == 2
 
-    assert set(
-        recursive["SOURCE"]
-    ) == {
+    assert set(recursive["SOURCE"]) == {
         "all_gaze_A.csv",
         "fix_B.csv",
     }
@@ -372,40 +274,21 @@ def test_io_summary_parser_and_raw_fallback(
     path = tmp_path / "summary.csv"
 
     path.write_text(
-        "Gazepoint Analysis,5.0\n"
-        "USER,VALUE\n"
-        "S1,1\n"
-        "S2,2\n"
-        "\n"
-        "other,data\n",
+        "Gazepoint Analysis,5.0\nUSER,VALUE\nS1,1\nS2,2\n\nother,data\n",
         encoding="utf-8",
     )
 
-    parsed = (
-        io_mod.read_gazepoint_summary(
-            path
-        )
-    )
+    parsed = io_mod.read_gazepoint_summary(path)
 
-    assert (
-        parsed["source_file"]
-        == "summary.csv"
-    )
+    assert parsed["source_file"] == "summary.csv"
 
-    assert (
-        parsed["metadata"][
-            "Gazepoint Analysis"
-        ]
-        == "5.0"
-    )
+    assert parsed["metadata"]["Gazepoint Analysis"] == "5.0"
 
     assert parsed["tables"]
     assert len(parsed["tables"][0]) == 2
 
     def fail_read_csv(*args, **kwargs):
-        raise RuntimeError(
-            "synthetic parser failure"
-        )
+        raise RuntimeError("synthetic parser failure")
 
     monkeypatch.setattr(
         io_mod.pd,
@@ -413,90 +296,52 @@ def test_io_summary_parser_and_raw_fallback(
         fail_read_csv,
     )
 
-    fallback = (
-        io_mod.read_gazepoint_summary(
-            path
-        )
-    )
+    fallback = io_mod.read_gazepoint_summary(path)
 
-    assert list(
-        fallback["raw"].columns
-    ) == ["raw_line"]
+    assert list(fallback["raw"].columns) == ["raw_line"]
 
 
 def test_io_face_export_and_column_inspection(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(
-        FileNotFoundError
-    ):
-        io_mod.read_gazepoint_face_export(
-            tmp_path / "missing.tsv"
-        )
+    with pytest.raises(FileNotFoundError):
+        io_mod.read_gazepoint_face_export(tmp_path / "missing.tsv")
 
     tsv = tmp_path / "face.tsv"
 
     tsv.write_text(
-        "timestamp\tconfidence\n"
-        "0.0\t0.9\n",
+        "timestamp\tconfidence\n0.0\t0.9\n",
         encoding="utf-8",
     )
 
-    face = (
-        io_mod.read_gazepoint_face_export(
-            tsv
-        )
-    )
+    face = io_mod.read_gazepoint_face_export(tsv)
 
     assert face.shape == (1, 2)
 
-    assert (
-        face.attrs[
-            "gp3_source_file"
-        ]
-        == "face.tsv"
-    )
+    assert face.attrs["gp3_source_file"] == "face.tsv"
 
     csv = tmp_path / "user.csv"
 
     csv.write_text(
-        "TIME,LPD\n"
-        "0,3.1\n"
-        "1,3.2\n",
+        "TIME,LPD\n0,3.1\n1,3.2\n",
         encoding="utf-8",
     )
 
-    inspected_path = (
-        io_mod.inspect_gazepoint_columns(
-            csv
-        )
-    )
+    inspected_path = io_mod.inspect_gazepoint_columns(csv)
 
-    assert set(
-        inspected_path["column"]
-    ) == {
+    assert set(inspected_path["column"]) == {
         "TIME",
         "LPD",
     }
 
-    with pytest.raises(
-        TypeError
-    ):
+    with pytest.raises(TypeError):
         io_mod.inspect_gazepoint_columns(
-            pd.DataFrame(
-                {"x": [1]}
-            ),
-            x=pd.DataFrame(
-                {"x": [1]}
-            ),
+            pd.DataFrame({"x": [1]}),
+            x=pd.DataFrame({"x": [1]}),
         )
 
-    with pytest.raises(
-        ValueError
-    ):
-        io_mod.inspect_gazepoint_columns(
-            [1, 2]
-        )
+    with pytest.raises(ValueError):
+        io_mod.inspect_gazepoint_columns([1, 2])
 
     frame = pd.DataFrame(
         {
@@ -533,11 +378,7 @@ def test_io_face_export_and_column_inspection(
         }
     )
 
-    inspected = (
-        io_mod.inspect_gazepoint_columns(
-            frame
-        )
-    )
+    inspected = io_mod.inspect_gazepoint_columns(frame)
 
     dtype_map = dict(
         zip(
@@ -547,42 +388,28 @@ def test_io_face_export_and_column_inspection(
         )
     )
 
-    assert (
-        dtype_map["MEDIA_ID"]
-        == "integer"
-    )
+    assert dtype_map["MEDIA_ID"] == "integer"
 
     assert dtype_map["TIME"] == "numeric"
     assert dtype_map["flag"] == "logical"
 
-    assert (
-        dtype_map["when"]
-        == "POSIXct/POSIXt"
-    )
+    assert dtype_map["when"] == "POSIXct/POSIXt"
 
     assert dtype_map["cat"] == "factor"
 
     group_map = dict(
         zip(
             inspected["column"],
-            inspected[
-                "semantic_group"
-            ],
+            inspected["semantic_group"],
             strict=True,
         )
     )
 
-    assert (
-        group_map["MEDIA_ID"]
-        == "identification"
-    )
+    assert group_map["MEDIA_ID"] == "identification"
 
     assert group_map["TIME"] == "time"
 
-    assert (
-        group_map["LPD"]
-        == "left_eye_pupil"
-    )
+    assert group_map["LPD"] == "left_eye_pupil"
 
     assert group_map["label"] == "other"
 
@@ -598,16 +425,12 @@ def test_plot_figax_xy_and_time_series() -> None:
 
     fig, ax = plotting_mod._figax()
 
-    same_fig, same_ax = (
-        plotting_mod._figax(ax)
-    )
+    same_fig, same_ax = plotting_mod._figax(ax)
 
     assert same_fig is fig
     assert same_ax is ax
 
-    data, x, y = plotting_mod._xy(
-        frame
-    )
+    data, x, y = plotting_mod._xy(frame)
 
     assert data is frame
     assert x == "time"
@@ -620,29 +443,21 @@ def test_plot_figax_xy_and_time_series() -> None:
         }
     )
 
-    _, fallback_x, fallback_y = (
-        plotting_mod._xy(
-            fallback
-        )
-    )
+    _, fallback_x, fallback_y = plotting_mod._xy(fallback)
 
     assert fallback_x == "a"
     assert fallback_y == "b"
 
-    grouped = (
-        plotting_mod.plot_gazepoint_time_series(
-            frame,
-            group_col="group",
-        )
+    grouped = plotting_mod.plot_gazepoint_time_series(
+        frame,
+        group_col="group",
     )
 
     assert len(grouped.axes[0].lines) == 2
 
-    ungrouped = (
-        plotting_mod.plot_gazepoint_time_series(
-            frame,
-            group_col="missing",
-        )
+    ungrouped = plotting_mod.plot_gazepoint_time_series(
+        frame,
+        group_col="missing",
     )
 
     assert len(ungrouped.axes[0].lines) == 1
@@ -681,33 +496,13 @@ def test_plot_pupil_and_basic_wrappers() -> None:
         is not None
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_pupil_preprocessing(
-            frame
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_pupil_preprocessing(frame) is not None
 
-    assert (
-        plotting_mod.plot_gazepoint_pupil_status(
-            frame
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_pupil_status(frame) is not None
 
-    assert (
-        plotting_mod.plot_gazepoint_qc_overview(
-            frame
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_qc_overview(frame) is not None
 
-    assert (
-        plotting_mod.plot_gazepoint_phase_timeline(
-            frame
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_phase_timeline(frame) is not None
 
     _close_figures()
 
@@ -741,16 +536,12 @@ def test_plot_sampling_and_tracking_quality(
         fake_sampling,
     )
 
-    sampling = (
-        plotting_mod.plot_sampling_rate(
-            frame,
-            expected_hz=60,
-        )
+    sampling = plotting_mod.plot_sampling_rate(
+        frame,
+        expected_hz=60,
     )
 
-    assert sampling.axes[0].get_title() == (
-        "Sampling rate"
-    )
+    assert sampling.axes[0].get_title() == ("Sampling rate")
 
     def fake_quality_prop(
         data,
@@ -771,11 +562,7 @@ def test_plot_sampling_and_tracking_quality(
         fake_quality_prop,
     )
 
-    quality = (
-        plotting_mod.plot_tracking_quality(
-            frame
-        )
-    )
+    quality = plotting_mod.plot_tracking_quality(frame)
 
     assert quality is not None
 
@@ -798,11 +585,7 @@ def test_plot_sampling_and_tracking_quality(
         fake_quality_numeric,
     )
 
-    fallback = (
-        plotting_mod.plot_tracking_quality(
-            frame
-        )
-    )
+    fallback = plotting_mod.plot_tracking_quality(frame)
 
     assert fallback is not None
 
@@ -827,33 +610,21 @@ def test_plot_missingness_heatmap_and_export(
         }
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_missingness_profile(
-            frame
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_missingness_profile(frame) is not None
 
     with pytest.warns(
         RuntimeWarning,
         match="non-finite gaze coordinates",
     ):
-        heatmap = (
-            plotting_mod.plot_gazepoint_heatmap(
-                frame,
-                x_col="x",
-                y_col="y",
-            )
+        heatmap = plotting_mod.plot_gazepoint_heatmap(
+            frame,
+            x_col="x",
+            y_col="y",
         )
 
     assert heatmap is not None
 
-    finite_frame = (
-        frame.dropna(
-            subset=["x", "y"]
-        )
-        .reset_index(drop=True)
-    )
+    finite_frame = frame.dropna(subset=["x", "y"]).reset_index(drop=True)
 
     assert (
         plotting_mod.plot_gazepoint_heatmap(
@@ -910,19 +681,13 @@ def test_plot_missingness_heatmap_and_export(
         is not None
     )
 
-    path = (
-        tmp_path
-        / "nested"
-        / "heatmap.png"
-    )
+    path = tmp_path / "nested" / "heatmap.png"
 
-    exported = (
-        plotting_mod.export_gazepoint_heatmap_png(
-            frame,
-            path=path,
-            x_col="x",
-            y_col="y",
-        )
+    exported = plotting_mod.export_gazepoint_heatmap_png(
+        frame,
+        path=path,
+        x_col="x",
+        y_col="y",
     )
 
     assert exported == path
@@ -961,12 +726,7 @@ def test_plot_aoi_timeline_and_transition_paths(
 
     matrix.index.name = "from"
 
-    assert (
-        plotting_mod.plot_gazepoint_aoi_transition_matrix(
-            matrix
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_aoi_transition_matrix(matrix) is not None
 
     def fake_transition(
         data,
@@ -986,19 +746,9 @@ def test_plot_aoi_timeline_and_transition_paths(
         }
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_aoi_transition_matrix(
-            raw
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_aoi_transition_matrix(raw) is not None
 
-    assert (
-        plotting_mod.plot_transition_heatmap(
-            matrix
-        )
-        is not None
-    )
+    assert plotting_mod.plot_transition_heatmap(matrix) is not None
 
     _close_figures()
 
@@ -1065,12 +815,7 @@ def test_plot_scanpath_paths() -> None:
         ]
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_scanpath_clusters(
-            clustered
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_scanpath_clusters(clustered) is not None
 
     stability = pd.DataFrame(
         {
@@ -1087,12 +832,7 @@ def test_plot_scanpath_paths() -> None:
         }
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_scanpath_cluster_stability(
-            stability
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_scanpath_cluster_stability(stability) is not None
 
     fallback = pd.DataFrame(
         {
@@ -1103,12 +843,7 @@ def test_plot_scanpath_paths() -> None:
         }
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_scanpath_cluster_stability(
-            fallback
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_scanpath_cluster_stability(fallback) is not None
 
     _close_figures()
 
@@ -1126,12 +861,7 @@ def test_plot_event_detector_paths(
         }
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_event_detector_agreement(
-            agreement
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_event_detector_agreement(agreement) is not None
 
     def fake_compare(
         data,
@@ -1146,12 +876,7 @@ def test_plot_event_detector_paths(
     )
 
     assert (
-        plotting_mod.plot_gazepoint_event_detector_agreement(
-            pd.DataFrame(
-                {"x": [1]}
-            )
-        )
-        is not None
+        plotting_mod.plot_gazepoint_event_detector_agreement(pd.DataFrame({"x": [1]})) is not None
     )
 
     benchmark = pd.DataFrame(
@@ -1169,12 +894,7 @@ def test_plot_event_detector_paths(
         }
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_event_detector_benchmark(
-            benchmark
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_event_detector_benchmark(benchmark) is not None
 
     _close_figures()
 
@@ -1193,12 +913,7 @@ def test_plot_binocular_and_model_predictions() -> None:
         }
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_binocular_diagnostics(
-            binocular
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_binocular_diagnostics(binocular) is not None
 
     class Model:
         fittedvalues = np.array(
@@ -1232,12 +947,7 @@ def test_plot_binocular_and_model_predictions() -> None:
     ):
         plotting_mod.plot_gazepoint_model_predictions()
 
-    assert (
-        plotting_mod.plot_gazepoint_model_predictions(
-            model
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_model_predictions(model) is not None
 
     assert (
         plotting_mod.plot_gazepoint_model_predictions(
@@ -1255,12 +965,7 @@ def test_plot_binocular_and_model_predictions() -> None:
         is not None
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_gca(
-            model
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_gca(model) is not None
 
     series = pd.DataFrame(
         {
@@ -1275,26 +980,11 @@ def test_plot_binocular_and_model_predictions() -> None:
         }
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_gca(
-            series
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_gca(series) is not None
 
-    assert (
-        plotting_mod.plot_gazepoint_aoi_gamm(
-            series
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_aoi_gamm(series) is not None
 
-    assert (
-        plotting_mod.plot_gazepoint_time_varying_effect(
-            series
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_time_varying_effect(series) is not None
 
     _close_figures()
 
@@ -1318,11 +1008,7 @@ def test_plot_model_residual_contracts() -> None:
         ValueError,
         match="Could not identify",
     ):
-        plotting_mod.plot_gazepoint_model_residuals(
-            data=pd.DataFrame(
-                {"x": [1.0]}
-            )
-        )
+        plotting_mod.plot_gazepoint_model_residuals(data=pd.DataFrame({"x": [1.0]}))
 
     with pytest.raises(
         ValueError,
@@ -1398,12 +1084,7 @@ def test_plot_model_residual_contracts() -> None:
             ]
         )
 
-    assert (
-        plotting_mod.plot_gazepoint_model_residuals(
-            model=Model()
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_model_residuals(model=Model()) is not None
 
     _close_figures()
 
@@ -1444,12 +1125,7 @@ def test_plot_cluster_and_multiverse_paths() -> None:
         }
     )
 
-    assert (
-        plotting_mod.plot_gazepoint_cluster_results(
-            alternative
-        )
-        is not None
-    )
+    assert plotting_mod.plot_gazepoint_cluster_results(alternative) is not None
 
     assert (
         plotting_mod.plot_gazepoint_cluster_permutation(
@@ -1562,16 +1238,9 @@ def test_plot_face_quality_supports_structured_and_legacy_audits() -> None:
         }
     )
 
-    structured = (
-        plotting_mod.plot_gazepoint_face_quality(
-            face
-        )
-    )
+    structured = plotting_mod.plot_gazepoint_face_quality(face)
 
-    heights = [
-        patch.get_height()
-        for patch in structured.axes[0].patches
-    ]
+    heights = [patch.get_height() for patch in structured.axes[0].patches]
 
     assert heights == pytest.approx(
         [
@@ -1580,18 +1249,13 @@ def test_plot_face_quality_supports_structured_and_legacy_audits() -> None:
         ]
     )
 
-    legacy = (
-        plotting_mod.plot_gazepoint_face_quality(
-            face,
-            confidence_col="confidence",
-            threshold=0.80,
-        )
+    legacy = plotting_mod.plot_gazepoint_face_quality(
+        face,
+        confidence_col="confidence",
+        threshold=0.80,
     )
 
-    legacy_heights = [
-        patch.get_height()
-        for patch in legacy.axes[0].patches
-    ]
+    legacy_heights = [patch.get_height() for patch in legacy.axes[0].patches]
 
     assert legacy_heights == pytest.approx(
         [
@@ -1624,11 +1288,7 @@ def test_plot_face_quality_rejects_malformed_audit(
         ValueError,
         match="usable overview",
     ):
-        plotting_mod.plot_gazepoint_face_quality(
-            pd.DataFrame(
-                {"x": [1]}
-            )
-        )
+        plotting_mod.plot_gazepoint_face_quality(pd.DataFrame({"x": [1]}))
 
     def missing_valid(
         data,
@@ -1654,11 +1314,7 @@ def test_plot_face_quality_rejects_malformed_audit(
         ValueError,
         match="missing n_valid",
     ):
-        plotting_mod.plot_gazepoint_face_quality(
-            pd.DataFrame(
-                {"x": [1]}
-            )
-        )
+        plotting_mod.plot_gazepoint_face_quality(pd.DataFrame({"x": [1]}))
 
     def bad_legacy(
         data,
@@ -1676,11 +1332,7 @@ def test_plot_face_quality_rejects_malformed_audit(
         ValueError,
         match="usable result",
     ):
-        plotting_mod.plot_gazepoint_face_quality(
-            pd.DataFrame(
-                {"x": [1]}
-            )
-        )
+        plotting_mod.plot_gazepoint_face_quality(pd.DataFrame({"x": [1]}))
 
     _close_figures()
 
@@ -1692,142 +1344,76 @@ def test_io_residual_branch_contracts(
     tmp_path: Path,
 ) -> None:
     # Scalar string route in standardise_gazepoint_names().
-    assert (
-        io_mod.standardise_gazepoint_names(
-            " TIME(ms) "
-        )
-        == "TIME"
-    )
+    assert io_mod.standardise_gazepoint_names(" TIME(ms) ") == "TIME"
 
-    assert (
-        io_mod.standardise_gazepoint_names(
-            "TIMETICK(Hz)"
-        )
-        == "TIMETICK"
-    )
+    assert io_mod.standardise_gazepoint_names("TIMETICK(Hz)") == "TIMETICK"
 
     # Missing summary input has its own deterministic error route.
-    with pytest.raises(
-        FileNotFoundError
-    ):
-        io_mod.read_gazepoint_summary(
-            tmp_path / "missing-summary.csv"
-        )
+    with pytest.raises(FileNotFoundError):
+        io_mod.read_gazepoint_summary(tmp_path / "missing-summary.csv")
 
     # A detected table header with no body exercises the
     # zero-iteration and empty-body paths.
-    empty_table = (
-        tmp_path
-        / "empty-table-summary.csv"
-    )
+    empty_table = tmp_path / "empty-table-summary.csv"
 
     empty_table.write_text(
         "AOI,VALUE\n",
         encoding="utf-8",
     )
 
-    parsed_empty = (
-        io_mod.read_gazepoint_summary(
-            empty_table
-        )
-    )
+    parsed_empty = io_mod.read_gazepoint_summary(empty_table)
 
-    assert (
-        parsed_empty["tables"]
-        == []
-    )
+    assert parsed_empty["tables"] == []
 
     # A malformed body width must terminate that candidate
     # table rather than manufacturing/coercing a row.
-    malformed_table = (
-        tmp_path
-        / "malformed-table-summary.csv"
-    )
+    malformed_table = tmp_path / "malformed-table-summary.csv"
 
     malformed_table.write_text(
-        "USER,VALUE\n"
-        "only-one-field\n",
+        "USER,VALUE\nonly-one-field\n",
         encoding="utf-8",
     )
 
-    parsed_malformed = (
-        io_mod.read_gazepoint_summary(
-            malformed_table
-        )
-    )
+    parsed_malformed = io_mod.read_gazepoint_summary(malformed_table)
 
-    assert (
-        parsed_malformed["tables"]
-        == []
-    )
+    assert parsed_malformed["tables"] == []
 
     # Non-TSV facial export: separator must not be silently
     # changed to tab.
-    face_csv = (
-        tmp_path
-        / "face.csv"
-    )
+    face_csv = tmp_path / "face.csv"
 
     face_csv.write_text(
-        "timestamp,confidence\n"
-        "0.0,0.95\n",
+        "timestamp,confidence\n0.0,0.95\n",
         encoding="utf-8",
     )
 
-    face_result = (
-        io_mod.read_gazepoint_face_export(
-            face_csv
-        )
-    )
+    face_result = io_mod.read_gazepoint_face_export(face_csv)
 
-    assert list(
-        face_result.columns
-    ) == [
+    assert list(face_result.columns) == [
         "timestamp",
         "confidence",
     ]
 
-    assert (
-        face_result.attrs[
-            "gp3_source_file"
-        ]
-        == "face.csv"
-    )
+    assert face_result.attrs["gp3_source_file"] == "face.csv"
 
     # Cover path-via-string and R-compatible x alias path route.
-    gaze_csv = (
-        tmp_path
-        / "user.csv"
-    )
+    gaze_csv = tmp_path / "user.csv"
 
     gaze_csv.write_text(
-        "TIME,LPD\n"
-        "0,3.1\n",
+        "TIME,LPD\n0,3.1\n",
         encoding="utf-8",
     )
 
-    inspected_string = (
-        io_mod.inspect_gazepoint_columns(
-            str(gaze_csv)
-        )
-    )
+    inspected_string = io_mod.inspect_gazepoint_columns(str(gaze_csv))
 
-    assert set(
-        inspected_string["column"]
-    ) == {
+    assert set(inspected_string["column"]) == {
         "TIME",
         "LPD",
     }
 
-    inspected_alias = (
-        io_mod.inspect_gazepoint_columns(
-            x=str(gaze_csv)
-        )
-    )
+    inspected_alias = io_mod.inspect_gazepoint_columns(x=str(gaze_csv))
 
-    assert set(
-        inspected_alias["column"]
-    ) == {
+    assert set(inspected_alias["column"]) == {
         "TIME",
         "LPD",
     }
@@ -1849,12 +1435,10 @@ def test_plot_residual_explicit_column_and_model_fallback_paths() -> None:
         }
     )
 
-    explicit_fig = (
-        plotting_mod.plot_gazepoint_model_residuals(
-            data=explicit,
-            fitted_col="fit_custom",
-            residual_col="res_custom",
-        )
+    explicit_fig = plotting_mod.plot_gazepoint_model_residuals(
+        data=explicit,
+        fitted_col="fit_custom",
+        residual_col="res_custom",
     )
 
     assert explicit_fig is not None
@@ -1868,11 +1452,7 @@ def test_plot_residual_explicit_column_and_model_fallback_paths() -> None:
             ]
         )
 
-    residual_fig = (
-        plotting_mod.plot_gazepoint_model_residuals(
-            model=ResidualOnlyModel()
-        )
-    )
+    residual_fig = plotting_mod.plot_gazepoint_model_residuals(model=ResidualOnlyModel())
 
     assert residual_fig is not None
 
@@ -1894,11 +1474,7 @@ def test_plot_residual_explicit_column_and_model_fallback_paths() -> None:
                 dtype=float,
             )
 
-    fitted_fig = (
-        plotting_mod.plot_gazepoint_model_predictions(
-            FittedModel()
-        )
-    )
+    fitted_fig = plotting_mod.plot_gazepoint_model_predictions(FittedModel())
 
     assert fitted_fig is not None
 
@@ -1945,24 +1521,19 @@ def test_plot_face_quality_structured_fallback_paths(
         structured_n_invalid,
     )
 
-    fig = (
-        plotting_mod.plot_gazepoint_face_quality(
-            pd.DataFrame(
-                {
-                    "x": [
-                        1,
-                        2,
-                        3,
-                    ]
-                }
-            )
+    fig = plotting_mod.plot_gazepoint_face_quality(
+        pd.DataFrame(
+            {
+                "x": [
+                    1,
+                    2,
+                    3,
+                ]
+            }
         )
     )
 
-    heights = [
-        patch.get_height()
-        for patch in fig.axes[0].patches
-    ]
+    heights = [patch.get_height() for patch in fig.axes[0].patches]
 
     assert heights == pytest.approx(
         [
@@ -2002,23 +1573,18 @@ def test_plot_face_quality_structured_fallback_paths(
         structured_zero_fallback,
     )
 
-    zero_fig = (
-        plotting_mod.plot_gazepoint_face_quality(
-            pd.DataFrame(
-                {
-                    "x": [
-                        1,
-                        2,
-                    ]
-                }
-            )
+    zero_fig = plotting_mod.plot_gazepoint_face_quality(
+        pd.DataFrame(
+            {
+                "x": [
+                    1,
+                    2,
+                ]
+            }
         )
     )
 
-    zero_heights = [
-        patch.get_height()
-        for patch in zero_fig.axes[0].patches
-    ]
+    zero_heights = [patch.get_height() for patch in zero_fig.axes[0].patches]
 
     assert zero_heights == pytest.approx(
         [
@@ -2058,24 +1624,19 @@ def test_plot_face_quality_legacy_nonfinite_proportion_fallback(
         legacy_nonfinite,
     )
 
-    fig = (
-        plotting_mod.plot_gazepoint_face_quality(
-            pd.DataFrame(
-                {
-                    "x": [
-                        1,
-                        2,
-                        3,
-                    ]
-                }
-            )
+    fig = plotting_mod.plot_gazepoint_face_quality(
+        pd.DataFrame(
+            {
+                "x": [
+                    1,
+                    2,
+                    3,
+                ]
+            }
         )
     )
 
-    heights = [
-        patch.get_height()
-        for patch in fig.axes[0].patches
-    ]
+    heights = [patch.get_height() for patch in fig.axes[0].patches]
 
     assert heights == pytest.approx(
         [
@@ -2102,9 +1663,7 @@ def test_io_native_column_inspection_rejects_conflicting_names() -> None:
         }
     )
 
-    native = (
-        io_mod.inspect_gazepoint_columns.__wrapped__
-    )
+    native = io_mod.inspect_gazepoint_columns.__wrapped__
 
     with pytest.raises(
         TypeError,
