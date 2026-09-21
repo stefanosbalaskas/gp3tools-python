@@ -1877,6 +1877,7 @@ def test_events_final_coverage_contract_paths(tmp_path):
             "x": [0.5, 0.5, 0.5],
             "y": [0.5, 0.5, 0.5],
             "time": [0.0, 0.1, 0.2],
+            "event_state": ["fixation", "fixation", "fixation"],
         }
     )
     empty_saccades = events.compute_gazepoint_saccade_metrics(
