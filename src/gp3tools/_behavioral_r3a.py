@@ -280,9 +280,6 @@ def _detect_sampling_rate(
 
     delta = float(diffs.median())
 
-    if delta <= 0:
-        return math.nan
-
     return float(1.0 / delta)
 
 
@@ -667,21 +664,6 @@ def _r3a_create_gazepoint_master(
 # =====================================================================
 
 
-def _ivt_one_group(
-    block: pd.DataFrame,
-    *,
-    x_col: str,
-    y_col: str,
-    time_col: str,
-    velocity_threshold: float,
-    min_duration_ms: float,
-    distance_scale: float,
-    time_scale: float,
-    group_cols: list[str],
-) -> pd.DataFrame:
-    raise RuntimeError("Superseded internal R3-A implementation")
-
-
 def _r3a_detect_gazepoint_fixations_ivt(
     data: pd.DataFrame,
     x_col: str = "x",
@@ -817,9 +799,6 @@ def _event_iou(
             intersection / union,
             0.0,
         )
-
-    if not len(iou):
-        return 0.0
 
     return float(np.nanmax(iou))
 
@@ -1696,58 +1675,6 @@ def _r3a_summarize_gazepoint_face_reactivity(
 # =====================================================================
 
 
-def _binocular_policy(
-    data: pd.DataFrame,
-    *,
-    left_col: str,
-    right_col: str,
-    prefix: str,
-    policy: str,
-    valid_min: float | None,
-    valid_max: float | None,
-) -> tuple[
-    pd.Series,
-    pd.Series,
-]:
-    raise RuntimeError("Superseded internal R3-A implementation")
-
-
-def _binocular_summary_block(
-    block: pd.DataFrame,
-    values: pd.Series,
-    policy: str,
-    group_values: Mapping[str, Any],
-) -> dict[
-    str,
-    Any,
-]:
-    raise RuntimeError("Superseded internal R3-A implementation")
-
-
-def _r3a_analyse_gazepoint_binocular_sensitivity(
-    data: pd.DataFrame,
-    left_col: str,
-    right_col: str,
-    policies: Sequence[str] | str = (
-        "complete_case",
-        "available_eye",
-        "reconstructed_mean",
-        "left_only",
-        "right_only",
-    ),
-    prefix: str = "gp3_binocular",
-    group_cols: Sequence[str] | str | None = None,
-    condition_col: str | None = None,
-    valid_min: float | None = None,
-    valid_max: float | None = None,
-    **kwargs: Any,
-) -> dict[
-    str,
-    Any,
-]:
-    raise RuntimeError("Superseded internal R3-A implementation")
-
-
 # =====================================================================
 # BINOCULAR REPORTING
 # =====================================================================
@@ -1961,7 +1888,6 @@ def _r3a_summarise_gazepoint_binocular_reporting(
 
 
 R3A_IMPLEMENTATIONS = {
-    "analyse_gazepoint_binocular_sensitivity": _r3a_analyse_gazepoint_binocular_sensitivity,
     "create_gazepoint_master": _r3a_create_gazepoint_master,
     "detect_gazepoint_fixations_ivt": _r3a_detect_gazepoint_fixations_ivt,
     "summarise_gazepoint_binocular_reporting": _r3a_summarise_gazepoint_binocular_reporting,
