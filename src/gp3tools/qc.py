@@ -867,8 +867,6 @@ def check_sampling_rate(
     rows = []
     iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
     for key, frame in iterator:
-        if groups and not isinstance(key, tuple):
-            key = (key,)
         t = time_to_seconds(frame[time_col]).dropna().sort_values().to_numpy(float)
         diffs = np.diff(t)
         diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
@@ -2394,10 +2392,8 @@ def _gp3_exclusion_r_units(
             status = "conflicting_flags"
         elif any_false:
             status = "excluded"
-        elif any_true:
-            status = "retained"
         else:
-            status = "unclear_status"
+            status = "retained"
         row = {c: part.iloc[0][c] for c in ids if c != "__unit_id"}
         row.update(
             {"n_source_rows": len(part), "retained": status == "retained", status_name: status}

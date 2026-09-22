@@ -1269,8 +1269,6 @@ def _gp3_aoi_geometry_r_audit(
     ):
         if len(block) <= 1:
             continue
-        if not isinstance(key, tuple):
-            key = (key,)
         row = dict(zip(duplicate_group_cols, key, strict=True))
         row["n_aois"] = len(block)
         row["aoi_values"] = ", ".join(block[resolved_aoi].astype(str))
@@ -3506,8 +3504,6 @@ def _sequence_frame(
     rows = []
     iterator = [((), work)] if not groups else work.groupby(groups, dropna=False, sort=False)
     for key, frame in iterator:
-        if groups and not isinstance(key, tuple):
-            key = (key,)
         seq = frame[aoi_col].astype(str).tolist()
         seq = collapse_consecutive(seq) if collapse_repeats else seq
         row = {c: v for c, v in zip(groups, key, strict=False)} if groups else {}
@@ -3632,8 +3628,6 @@ def _gp3_aoi_r_entries(
     rows = []
     entry_group_cols = [*groups, ".gp3_entry_id", ".gp3_aoi_state"]
     for key, block in _gp3_aoi_r_groupby(work, entry_group_cols):
-        if not isinstance(key, tuple):
-            key = (key,)
         base = dict(zip(entry_group_cols, key, strict=True))
         t = block[".gp3_aoi_time"].to_numpy(dtype=float)
         dur = block[".gp3_sample_duration_ms"].to_numpy(dtype=float)
@@ -4943,8 +4937,6 @@ def compute_gazepoint_aoi_entropy(
 
     def entropy_value(values):
         counts = pd.Series(values, dtype="object").value_counts(dropna=False).to_numpy(float)
-        if counts.sum() <= 0:
-            return np.nan
         probabilities = counts / counts.sum()
         return float(-(probabilities * (np.log(probabilities) / np.log(log_base))).sum())
 
@@ -5416,8 +5408,6 @@ def compute_gazepoint_sequence_recurrence(
         line_lengths = []
         for offset in range(1, n):
             diagonal = np.diag(mat, k=offset)
-            if not len(diagonal):
-                continue
             start = 0
             while start < len(diagonal):
                 if not diagonal[start]:
