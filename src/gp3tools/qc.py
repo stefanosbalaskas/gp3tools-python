@@ -4637,8 +4637,6 @@ def recommend_gazepoint_exclusions(
     def collapse_nullable(value):
         if value is None:
             return pd.NA
-        if isinstance(value, (list, tuple)):
-            return ", ".join(map(str, value)) if value else pd.NA
         return str(value)
 
     overview = pd.DataFrame(
