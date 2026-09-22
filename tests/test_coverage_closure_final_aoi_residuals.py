@@ -94,7 +94,7 @@ def test_final_aoi_geometry_and_overlap_public_contracts():
 
     legacy_callable = aoi.audit_gazepoint_aoi_geometry.__wrapped__._gp3_r4_legacy
     with pytest.raises(TypeError, match="either aoi_geometry or data"):
-        legacy_callable(legacy, data=legacy)
+        legacy_callable(legacy, data=legacy, aoi_col="aoi")
 
     with pytest.raises(TypeError, match="either aoi_geometry or data"):
         aoi.audit_gazepoint_aoi_overlap(legacy, data=legacy)
@@ -602,3 +602,99 @@ def test_final_aoi_bootstrap_legacy_records_failed_resample(monkeypatch):
         random_state=1,
     )
     assert pd.isna(result.loc[0, "n_clusters"])
+
+def test_final_aoi_pam_handles_empty_assigned_cluster():
+    distance = pd.DataFrame(
+        np.zeros((3, 3), dtype=float),
+        index=["s1", "s2", "s3"],
+        columns=["s1", "s2", "s3"],
+    )
+    labels, model, medoids = aoi._gp3_scanpath_r_cluster_matrix(
+        distance,
+        k=2,
+        method="pam",
+        linkage="average",
+    )
+    assert labels.tolist() == [1, 1, 1]
+    assert model["method"] == "pam"
+    assert medoids == [0, 1]
+
+
+def test_final_aoi_windows_reject_missing_required_subject():
+    with pytest.raises(ValueError, match="Missing required columns: subject"):
+        aoi.summarise_gazepoint_aoi_windows(
+            pd.DataFrame(
+                {
+                    "time": [0.0],
+                    "aoi_current": ["A"],
+                }
+            ),
+            windows=[0.0, 100.0],
+            condition_col=None,
+        )
+
+
+def _final_scanpath_distance_matrix():
+    return pd.DataFrame(
+        [
+            [0.0, 1.0, 4.0, 5.0],
+            [1.0, 0.0, 4.0, 5.0],
+            [4.0, 4.0, 0.0, 1.0],
+            [5.0, 5.0, 1.0, 0.0],
+        ],
+        index=["s1", "s2", "s3", "s4"],
+        columns=["s1", "s2", "s3", "s4"],
+    )
+
+
+def test_final_aoi_bootstrap_string_linkage_and_pam_specification():
+    distance = _final_scanpath_distance_matrix()
+
+    hierarchical = aoi.bootstrap_gazepoint_scanpath_clusters(
+        x=distance,
+        k=2,
+        n_boot=1,
+        sample_fraction=0.75,
+        method="hierarchical",
+        linkages="average",
+        seed=11,
+    )
+    assert "hierarchical_average" in hierarchical["reference_fits"]
+
+    pam = aoi.bootstrap_gazepoint_scanpath_clusters(
+        x=distance,
+        k=2,
+        n_boot=1,
+        sample_fraction=0.75,
+        method="pam",
+        seed=11,
+    )
+    assert "pam" in pam["reference_fits"]
+
+
+def test_final_aoi_bootstrap_empty_representative_stability(monkeypatch):
+    monkeypatch.setattr(
+        aoi,
+        "_gp3_scanpath_r_representatives",
+        lambda fit: pd.DataFrame(
+            columns=[
+                "cluster",
+                "sequence_id",
+                "mean_within_cluster_distance",
+                "cluster_size",
+            ]
+        ),
+    )
+
+    result = aoi.bootstrap_gazepoint_scanpath_clusters(
+        x=_final_scanpath_distance_matrix(),
+        k=2,
+        n_boot=1,
+        sample_fraction=0.75,
+        method="hierarchical",
+        linkages=["average"],
+        seed=17,
+    )
+    assert result["representative_events"].empty
+    assert result["representative_stability"].empty
+
