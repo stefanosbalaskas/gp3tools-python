@@ -4022,8 +4022,6 @@ def audit_gazepoint_pupil_overlap_risk(
     trial_rows = []
     iterator = work.groupby(keys, dropna=False, sort=False)
     for key, part in iterator:
-        if not isinstance(key, tuple):
-            key = (key,)
         t = pd.to_numeric(part[time_col], errors="coerce").dropna().to_numpy(float)
         row = {c: v for c, v in zip(keys, key, strict=False)}
         row.update(
@@ -4118,8 +4116,6 @@ def audit_gazepoint_pupil_overlap_risk(
     summary_rows = []
     if len(event_gaps):
         for key, part in event_gaps.groupby(keys, dropna=False, sort=False):
-            if not isinstance(key, tuple):
-                key = (key,)
             gaps = pd.to_numeric(part["event_gap_ms"], errors="coerce").dropna().to_numpy(float)
             overlap_amount = (
                 pd.to_numeric(part["overlap_amount_ms"], errors="coerce").dropna().to_numpy(float)
