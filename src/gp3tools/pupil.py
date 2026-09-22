@@ -3664,15 +3664,12 @@ def audit_gazepoint_pupil_reliability(
     pairs = left.merge(right, on=key_cols, how="outer", sort=False)
     pairs["split1_label"] = split_levels[0]
     pairs["split2_label"] = split_levels[1]
-    if len(pairs):
-        pairs["complete_pair"] = (
-            np.isfinite(pd.to_numeric(pairs["split1_value"], errors="coerce"))
-            & np.isfinite(pd.to_numeric(pairs["split2_value"], errors="coerce"))
-            & (pairs["split1_n_valid"].fillna(0) >= min_trials_per_split)
-            & (pairs["split2_n_valid"].fillna(0) >= min_trials_per_split)
-        )
-    else:
-        pairs["complete_pair"] = pd.Series(dtype=bool)
+    pairs["complete_pair"] = (
+        np.isfinite(pd.to_numeric(pairs["split1_value"], errors="coerce"))
+        & np.isfinite(pd.to_numeric(pairs["split2_value"], errors="coerce"))
+        & (pairs["split1_n_valid"].fillna(0) >= min_trials_per_split)
+        & (pairs["split2_n_valid"].fillna(0) >= min_trials_per_split)
+    )
 
     rel_rows = []
     rel_keys = by + ["outcome"]
