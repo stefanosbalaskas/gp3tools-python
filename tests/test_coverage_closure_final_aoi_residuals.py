@@ -59,7 +59,16 @@ def test_final_aoi_dynamic_missing_definition_column_and_rectangle_auto():
     assert result.loc[0, "aoi_current"] == "A"
 
 
-def test_final_aoi_geometry_and_overlap_reject_dual_inputs():
+def test_final_aoi_geometry_and_overlap_public_contracts():
+    legacy = pd.DataFrame(
+        {
+            "aoi": ["A"],
+            "xmin": [0.0],
+            "xmax": [1.0],
+            "ymin": [0.0],
+            "ymax": [1.0],
+        }
+    )
     geometry = pd.DataFrame(
         {
             "aoi": ["A"],
@@ -69,10 +78,26 @@ def test_final_aoi_geometry_and_overlap_reject_dual_inputs():
             "y_max": [1.0],
         }
     )
+
+    legacy_result = aoi.audit_gazepoint_aoi_geometry(legacy)
+    assert legacy_result["valid"]
+
+    r_result = aoi.audit_gazepoint_aoi_geometry(
+        data=geometry,
+        aoi_col="aoi",
+        x_min_col="x_min",
+        x_max_col="x_max",
+        y_min_col="y_min",
+        y_max_col="y_max",
+    )
+    assert r_result["_gp3_class"] == "gp3_aoi_geometry_audit"
+
+    legacy_callable = aoi.audit_gazepoint_aoi_geometry.__wrapped__._gp3_r4_legacy
     with pytest.raises(TypeError, match="either aoi_geometry or data"):
-        aoi.audit_gazepoint_aoi_geometry(geometry, data=geometry, aoi_col="aoi")
+        legacy_callable(legacy, data=legacy)
+
     with pytest.raises(TypeError, match="either aoi_geometry or data"):
-        aoi.audit_gazepoint_aoi_overlap(geometry, data=geometry, aoi_col="aoi")
+        aoi.audit_gazepoint_aoi_overlap(legacy, data=legacy)
 
 
 def test_final_aoi_coding_resolve_rejects_empty_explicit_column():
@@ -201,6 +226,7 @@ def test_final_aoi_transition_summary_classifies_missing_origin():
     )
     result = aoi.summarise_gazepoint_aoi_transitions(
         prepared,
+        group_cols=[],
         include_non_aoi=True,
         target_aoi_values=["A"],
     )
@@ -222,6 +248,7 @@ def _prepared_sequence_rows():
 def test_final_aoi_transition_matrix_prepared_rows_and_missing_by_group():
     result = aoi.compute_gazepoint_aoi_transition_matrix(
         data=_prepared_sequence_rows(),
+        group_cols=[],
         include_self_transitions=True,
     )
     assert result is not None
@@ -229,6 +256,7 @@ def test_final_aoi_transition_matrix_prepared_rows_and_missing_by_group():
     with pytest.raises(ValueError, match="Missing required columns"):
         aoi.compute_gazepoint_aoi_transition_matrix(
             data=_prepared_sequence_rows(),
+            group_cols=[],
             by_cols=["subject"],
         )
 
@@ -283,7 +311,7 @@ def test_final_aoi_time_varying_detection_failure_and_complete_drop_self():
         normalise="row",
     )
     table = result["matrix_long"]
-    assert not table["from"].eq(table["to"]).any()
+    assert not table[".gp3_from"].eq(table[".gp3_to"]).any()
 
 
 def test_final_aoi_scanpath_geometry_legacy_sort_and_r_validation():
@@ -435,6 +463,7 @@ def _entry_frame(rows):
         "entry_end_time",
         "entry_duration_ms",
         "n_samples",
+        "time",
     ]
     return pd.DataFrame(rows, columns=columns)
 
@@ -446,7 +475,7 @@ def test_final_aoi_trial_features_empty_and_fallback_non_aoi():
     result = aoi.summarise_gazepoint_aoi_trial_features(
         _entry_frame(
             [
-                ["S1", "M1", 1, "outside", 0.0, 10.0, 10.0, 2],
+                ["S1", "M1", 1, "outside", 0.0, 10.0, 10.0, 2, 0.0],
             ]
         )
     )
@@ -495,7 +524,7 @@ def test_final_aoi_denominator_zero_review_and_ok_condition_statuses():
         window_col="window_label",
     )
     assert zero["overview"].loc[0, "denominator_audit_status"] == "zero_denominators"
-    assert zero["denominator_imbalance"].loc[0, "condition_imbalance_status"] == "ok"
+    assert zero["denominator_imbalance"].loc[0, "denominator_imbalance_status"] == "ok"
 
     low = aoi.audit_gazepoint_aoi_window_denominators(
         _denominator_frame([2.0, 2.0]),
