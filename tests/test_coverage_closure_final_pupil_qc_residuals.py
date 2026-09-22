@@ -416,7 +416,7 @@ def test_final_pupil_binocular_diagnosis_without_time():
         min_pairs=2,
         min_unique=2,
     )
-    assert not result.empty
+    assert result["_gp3_class"] == "gp3_binocular_diagnostics"
 
 
 def _pooled_calibration():
@@ -468,16 +468,20 @@ def test_final_pupil_reconstruction_negative_gap_and_blocked_bounds():
     assert result.loc[0, "gp3_binocular_status"] == "reconstruction_blocked_bounds"
 
 
-def test_final_pupil_reconstruction_validation_empty_bilateral_group():
+def test_final_pupil_reconstruction_validation_skips_group_without_bilateral_rows():
     result = pupil.validate_gazepoint_binocular_reconstruction(
         pd.DataFrame(
             {
-                "left": [np.nan, np.nan],
-                "right": [1.0, 2.0],
+                "group": ["A", "A", "B", "B"],
+                "left": [1.0, 2.0, np.nan, np.nan],
+                "right": [1.1, 2.1, 3.1, 4.1],
             }
         ),
         left_col="left",
         right_col="right",
+        group_cols=["group"],
+        gap_group_cols=["group"],
+        fallback_group_cols=[[]],
         repeats=1,
         min_pairs=2,
         min_unique=2,
