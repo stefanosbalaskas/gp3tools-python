@@ -566,6 +566,23 @@ def test_final_pupil_baseline_scalar_group_and_overlap_residuals():
     )
     assert len(baseline) == 2
 
+    flagged = pupil.baseline_correct_gazepoint_pupil(
+        pd.DataFrame(
+            {
+                "subject": ["S1", "S1"],
+                "time": [-100.0, 50.0],
+                "pupil": [3.0, 3.2],
+                "is_baseline": [True, False],
+            }
+        ),
+        pupil_col="pupil",
+        time_col="time",
+        baseline_flag_col="is_baseline",
+        baseline_window=(-100.0, 0.0),
+        group_cols="subject",
+    )
+    assert len(flagged) == 2
+
     legacy = pupil.audit_gazepoint_pupil_overlap_risk(
         pd.DataFrame({"pupil": [3.0]})
     )
