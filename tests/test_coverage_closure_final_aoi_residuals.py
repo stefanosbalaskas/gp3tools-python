@@ -334,8 +334,8 @@ def test_final_aoi_scanpath_geometry_no_finite_points_and_nonfinite_dispersion()
     huge = aoi.compute_gazepoint_scanpath_geometry(
         pd.DataFrame(
             {
-                "x": [1e308, 1e308],
-                "y": [1e308, 1e308],
+                "x": [1e308, -1e308],
+                "y": [1e308, -1e308],
                 "subject": ["S1", "S1"],
                 "trial": [1, 1],
             }
