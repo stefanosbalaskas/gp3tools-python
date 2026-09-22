@@ -96,6 +96,16 @@ def test_final_aoi_geometry_and_overlap_public_contracts():
     with pytest.raises(TypeError, match="either aoi_geometry or data"):
         legacy_callable(legacy, data=legacy, aoi_col="aoi")
 
+    legacy_r_result = legacy_callable(
+        data=geometry,
+        aoi_col="aoi",
+        x_min_col="x_min",
+        x_max_col="x_max",
+        y_min_col="y_min",
+        y_max_col="y_max",
+    )
+    assert legacy_r_result["_gp3_class"] == "gp3_aoi_geometry_audit"
+
     with pytest.raises(TypeError, match="either aoi_geometry or data"):
         aoi.audit_gazepoint_aoi_overlap(legacy, data=legacy)
 
