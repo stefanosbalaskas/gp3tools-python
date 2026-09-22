@@ -3057,11 +3057,7 @@ def audit_gazepoint_pupil_baseline(
         interp_pct = 100 * n_interp / n_baseline_rows if n_baseline_rows else np.nan
         artifact_pct = 100 * n_artifact / n_baseline_rows if n_baseline_rows else np.nan
         available_bool = bool(available) if not pd.isna(available) else False
-        no_baseline = (
-            status == "no_baseline"
-            or not available_bool
-            or (np.isfinite(baseline_n_max) and baseline_n_max < min_baseline_samples)
-        )
+        no_baseline = status == "no_baseline" or not available_bool
         low_quality = (
             no_baseline
             or not np.isfinite(baseline_n_max)
@@ -7664,8 +7660,6 @@ def impute_gazepoint_pupil_gp(
             if not np.isfinite(ell) or ell <= 0:
                 ell = 1.0
         ell = float(ell)
-        if not np.isfinite(ell) or ell <= 0:
-            raise ValueError("length_scale must be a positive finite number")
         k_tt = np.exp(-0.5 * ((train_t[:, None] - train_t[None, :]) / ell) ** 2)
         k_tt.flat[:: len(train_t) + 1] += noise
         mean_y = float(np.mean(train_y))
