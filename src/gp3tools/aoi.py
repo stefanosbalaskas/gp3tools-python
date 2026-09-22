@@ -4487,12 +4487,9 @@ def compute_gazepoint_aoi_transition_matrix(
             tmp.groupby(count_cols, dropna=False, sort=False).size().rename("n").reset_index()
         )
         denom_cols = [*by, "from"]
-        if denom_cols:
-            long_table["row_total"] = long_table.groupby(denom_cols, dropna=False, sort=False)[
-                "n"
-            ].transform("sum")
-        else:
-            long_table["row_total"] = long_table["n"].sum()
+        long_table["row_total"] = long_table.groupby(denom_cols, dropna=False, sort=False)[
+            "n"
+        ].transform("sum")
         long_table["prob"] = long_table["n"] / long_table["row_total"]
 
     def make_matrix(table, value_col):
@@ -4941,8 +4938,6 @@ def compute_gazepoint_aoi_entropy(
         return float(-(probabilities * (np.log(probabilities) / np.log(log_base))).sum())
 
     def normalized_entropy(value, n_levels):
-        if not np.isfinite(value):
-            return np.nan
         if n_levels <= 1:
             return 0.0
         maximum = np.log(n_levels) / np.log(log_base)
@@ -6896,8 +6891,6 @@ def summarise_gazepoint_aoi_windows(
         groups = list(
             dict.fromkeys([col for col in defaults if col is not None and col in df.columns])
         )
-        if subject_col not in groups:
-            groups.insert(0, subject_col)
     else:
         groups = list(
             dict.fromkeys(_gp3_aoi_r_list(group_cols, allow_none=False, name="group_cols"))
