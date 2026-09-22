@@ -87,8 +87,6 @@ def detect_gazepoint_fixations_velocity(
             t = time_to_seconds(g[time_col]).to_numpy(float)
             for rid in np.unique(run[cand]):
                 loc = np.where((run == rid) & cand)[0]
-                if not len(loc):
-                    continue
                 duration = (t[loc[-1]] - t[loc[0]]) * 1000 if len(loc) > 1 else 0.0
                 if duration >= min_duration_ms:
                     keep[loc] = True
@@ -791,8 +789,6 @@ def summarise_gazepoint_fixation_trials(
         )
         fix_rows.append(row)
     fix = pd.DataFrame(fix_rows)
-    if fix.empty:
-        raise ValueError("No fixation rows remain after fixation-level reduction")
 
     def ratio(a, b):
         return np.nan if not np.isfinite(b) or b <= 0 else float(a) / float(b)
@@ -1151,9 +1147,6 @@ def audit_gazepoint_fixation_reliability(
 
         counts = counts[np.isfinite(counts) & (counts > 0)]
 
-        if not len(counts):
-            return np.nan
-
         probabilities = counts / counts.sum()
 
         entropy = float(-np.sum(probabilities * np.log2(probabilities)))
@@ -1164,9 +1157,6 @@ def audit_gazepoint_fixation_reliability(
             return 0.0
 
         maximum = np.log2(n_categories)
-
-        if not np.isfinite(maximum) or maximum <= 0:
-            return np.nan
 
         return float(entropy / maximum)
 
@@ -1719,8 +1709,6 @@ def create_gazepoint_event_review_template(
                     "notes": pd.NA,
                 }
             )
-    if not rows:
-        raise ValueError("No sequence contained a finite timestamp.")
     out = pd.DataFrame(rows)
     if path is not None:
         target = Path(path)

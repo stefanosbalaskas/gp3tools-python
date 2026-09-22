@@ -22,7 +22,7 @@ statistics and research reporting.
 
 [Get started](getting-started.md){ .md-button .md-button--primary }
 [Browse the API](API_REFERENCE.md){ .md-button }
-[Release v0.1.0a1](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1){ .md-button }
+[Release v0.1.1](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.1){ .md-button }
 
 <div class="gp3-badges">
 
@@ -36,7 +36,7 @@ statistics and research reporting.
        alt="Documentation">
 </a>
 
-<a href="https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1">
+<a href="https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.1">
   <img src="https://img.shields.io/github/v/release/stefanosbalaskas/gp3tools-python?include_prereleases&label=release"
        alt="Release">
 </a>
@@ -75,7 +75,7 @@ statistics and research reporting.
 === "pip"
 
     ```bash
-    python -m pip install "gp3tools==0.1.0a1"
+    python -m pip install "gp3tools==0.1.1"
     ```
 
 === "latest alpha"
@@ -87,7 +87,7 @@ statistics and research reporting.
 === "uv"
 
     ```bash
-    uv pip install "gp3tools==0.1.0a1"
+    uv pip install "gp3tools==0.1.1"
     ```
 
 Verify:
@@ -223,7 +223,7 @@ without private participant data.
 
 !!! success "Validated release surface"
 
-    **v0.1.0a1** freezes **278 canonical R exports** and exposes **285 Python
+    **v0.1.1** freezes **278 canonical R exports** and exposes **285 Python
     public names**, with **684 passing tests**, **90.06% line coverage**,
     R1–R4 behavioral and semantic validation, strict documentation builds,
     runnable examples, distribution builds and wheel-installation validation.
@@ -247,7 +247,7 @@ without private participant data.
 > [https://doi.org/10.3390/jemr19040076](https://doi.org/10.3390/jemr19040076)
 
 [GitHub](https://github.com/stefanosbalaskas/gp3tools-python){ .md-button .md-button--primary }
-[Release](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.0a1){ .md-button }
+[Release](https://github.com/stefanosbalaskas/gp3tools-python/releases/tag/v0.1.1){ .md-button }
 [PyPI](https://pypi.org/project/gp3tools/){ .md-button }
 [Zenodo DOI](https://doi.org/10.5281/zenodo.22150772){ .md-button }
 [R implementation](https://github.com/stefanosbalaskas/gp3tools){ .md-button }

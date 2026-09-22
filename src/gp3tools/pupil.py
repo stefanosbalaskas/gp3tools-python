@@ -529,8 +529,6 @@ def detect_gazepoint_blinks(
         t = time_to_seconds(df[time_col]).to_numpy(float) if time_col else np.arange(len(df)) / 60.0
         for lab in range(1, n + 1):
             idx = np.flatnonzero(labels == lab)
-            if not idx.size:
-                continue
             duration_ms = (
                 (t[idx[-1]] - t[idx[0]] + np.nanmedian(np.diff(t[np.isfinite(t)]))) * 1000
                 if idx.size > 1
@@ -2713,8 +2711,6 @@ def audit_gazepoint_pupil_gaps(
         rows = []
         iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
         for key, frame in iterator:
-            if groups and not isinstance(key, tuple):
-                key = (key,)
             miss = finite_numeric(frame[resolved_pupil]).isna().to_numpy()
             labels, n = ndimage.label(miss.astype(int))
             lengths = [int((labels == lab).sum()) for lab in range(1, n + 1)]
@@ -2784,8 +2780,6 @@ def audit_gazepoint_pupil_gaps(
     rows = []
     iterator = [((), work)] if not group_cols else work.groupby(group_cols, dropna=False, sort=True)
     for key, frame in iterator:
-        if group_cols and not isinstance(key, tuple):
-            key = (key,)
         base = {col: value for col, value in zip(group_cols, key, strict=False)}
         status = frame[".status"].astype("string")
         pupil = pd.to_numeric(frame[".pupil"], errors="coerce")
@@ -3063,11 +3057,7 @@ def audit_gazepoint_pupil_baseline(
         interp_pct = 100 * n_interp / n_baseline_rows if n_baseline_rows else np.nan
         artifact_pct = 100 * n_artifact / n_baseline_rows if n_baseline_rows else np.nan
         available_bool = bool(available) if not pd.isna(available) else False
-        no_baseline = (
-            status == "no_baseline"
-            or not available_bool
-            or (np.isfinite(baseline_n_max) and baseline_n_max < min_baseline_samples)
-        )
+        no_baseline = status == "no_baseline" or not available_bool
         low_quality = (
             no_baseline
             or not np.isfinite(baseline_n_max)
@@ -3150,8 +3140,6 @@ def audit_gazepoint_pupil_drift(
         rows = []
         iterator = [((), df)] if not groups else df.groupby(groups, dropna=False, sort=False)
         for key, frame in iterator:
-            if groups and not isinstance(key, tuple):
-                key = (key,)
             t = finite_numeric(frame[time_col]).to_numpy(float)
             y = finite_numeric(frame[pupil_col]).to_numpy(float)
             ok = np.isfinite(t) & np.isfinite(y)
@@ -3250,8 +3238,6 @@ def audit_gazepoint_pupil_drift(
         rows = []
         iterator = [((), frame)] if not cols else frame.groupby(cols, dropna=False, sort=False)
         for key, part in iterator:
-            if cols and not isinstance(key, tuple):
-                key = (key,)
             y = _num(part[".gp3_drift_pupil"]).to_numpy(float)
             t = _num(part[".gp3_drift_time"]).to_numpy(float)
             o = _num(part[".gp3_drift_order"]).to_numpy(float)
@@ -3646,8 +3632,6 @@ def audit_gazepoint_pupil_reliability(
     split_rows = []
     group_keys = ["participant"] + by + ["outcome", "split"]
     for key, part in long.groupby(group_keys, dropna=False, sort=False):
-        if not isinstance(key, tuple):
-            key = (key,)
         vals = pd.to_numeric(part["value"], errors="coerce")
         finite = vals[np.isfinite(vals.to_numpy(float))]
         split_value = (
@@ -3680,21 +3664,16 @@ def audit_gazepoint_pupil_reliability(
     pairs = left.merge(right, on=key_cols, how="outer", sort=False)
     pairs["split1_label"] = split_levels[0]
     pairs["split2_label"] = split_levels[1]
-    if len(pairs):
-        pairs["complete_pair"] = (
-            np.isfinite(pd.to_numeric(pairs["split1_value"], errors="coerce"))
-            & np.isfinite(pd.to_numeric(pairs["split2_value"], errors="coerce"))
-            & (pairs["split1_n_valid"].fillna(0) >= min_trials_per_split)
-            & (pairs["split2_n_valid"].fillna(0) >= min_trials_per_split)
-        )
-    else:
-        pairs["complete_pair"] = pd.Series(dtype=bool)
+    pairs["complete_pair"] = (
+        np.isfinite(pd.to_numeric(pairs["split1_value"], errors="coerce"))
+        & np.isfinite(pd.to_numeric(pairs["split2_value"], errors="coerce"))
+        & (pairs["split1_n_valid"].fillna(0) >= min_trials_per_split)
+        & (pairs["split2_n_valid"].fillna(0) >= min_trials_per_split)
+    )
 
     rel_rows = []
     rel_keys = by + ["outcome"]
     for key, part in pairs.groupby(rel_keys, dropna=False, sort=False) if len(pairs) else []:
-        if not isinstance(key, tuple):
-            key = (key,)
         ok = part["complete_pair"].fillna(False).to_numpy(bool)
         x = pd.to_numeric(part.loc[ok, "split1_value"], errors="coerce").to_numpy(float)
         y = pd.to_numeric(part.loc[ok, "split2_value"], errors="coerce").to_numpy(float)
@@ -4043,8 +4022,6 @@ def audit_gazepoint_pupil_overlap_risk(
     trial_rows = []
     iterator = work.groupby(keys, dropna=False, sort=False)
     for key, part in iterator:
-        if not isinstance(key, tuple):
-            key = (key,)
         t = pd.to_numeric(part[time_col], errors="coerce").dropna().to_numpy(float)
         row = {c: v for c, v in zip(keys, key, strict=False)}
         row.update(
@@ -4139,8 +4116,6 @@ def audit_gazepoint_pupil_overlap_risk(
     summary_rows = []
     if len(event_gaps):
         for key, part in event_gaps.groupby(keys, dropna=False, sort=False):
-            if not isinstance(key, tuple):
-                key = (key,)
             gaps = pd.to_numeric(part["event_gap_ms"], errors="coerce").dropna().to_numpy(float)
             overlap_amount = (
                 pd.to_numeric(part["overlap_amount_ms"], errors="coerce").dropna().to_numpy(float)
@@ -4387,9 +4362,7 @@ def audit_gazepoint_stimulus_luminance(
         if len(condition_summary)
         else condition_summary
     )
-    if not len(condition_summary):
-        balance_status = "no_conditions"
-    elif not len(available_conditions):
+    if not len(available_conditions):
         balance_status = "no_luminance_available"
     elif len(available_conditions) < len(condition_summary):
         balance_status = "partial_condition_luminance_available"
@@ -5274,8 +5247,6 @@ def summarise_gazepoint_pupil_windows(
 
     grouper = grouping[0] if len(grouping) == 1 else grouping
     for key, part in windowed.groupby(grouper, dropna=False, sort=False):
-        if len(grouping) == 1:
-            key = (key,)
         row = dict(zip(grouping, key, strict=True))
         values = pd.to_numeric(part["pupil_value"], errors="coerce").to_numpy(float)
         times = pd.to_numeric(part["time_ms"], errors="coerce").to_numpy(float)
@@ -7375,8 +7346,6 @@ def validate_gazepoint_binocular_reconstruction(
                 chosen = np.asarray(chosen[:target], dtype=int)
             selected.extend(np.asarray(chosen, dtype=int).tolist())
         mask_idx = np.asarray(sorted(set(selected)), dtype=int)
-        if not len(mask_idx):
-            continue
         if direction == "both":
             if mask_mode == "contiguous":
                 eyes = np.asarray(
@@ -7684,8 +7653,6 @@ def impute_gazepoint_pupil_gp(
             if not np.isfinite(ell) or ell <= 0:
                 ell = 1.0
         ell = float(ell)
-        if not np.isfinite(ell) or ell <= 0:
-            raise ValueError("length_scale must be a positive finite number")
         k_tt = np.exp(-0.5 * ((train_t[:, None] - train_t[None, :]) / ell) ** 2)
         k_tt.flat[:: len(train_t) + 1] += noise
         mean_y = float(np.mean(train_y))

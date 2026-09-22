@@ -18,7 +18,7 @@ from ._exports import R_EXPORTS
 from ._rbridge import BackendUnavailableError
 from .datasets import load_example_data, load_example_fixations, load_example_master
 
-__version__ = "0.1.1.dev0"
+__version__ = "0.1.1"
 
 _MODULE_NAMES = (
     "io",

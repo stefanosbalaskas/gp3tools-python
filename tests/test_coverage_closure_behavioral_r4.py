@@ -272,9 +272,7 @@ def test_r4_geometry_validation_rejects_bool_nonscalar_and_bad_range_cast() -> N
     ):
         return "ok"
 
-    wrapped = r4.geometry_validation_bridge(
-        implementation
-    )
+    wrapped = r4.geometry_validation_bridge(implementation)
 
     with pytest.raises(
         ValueError,

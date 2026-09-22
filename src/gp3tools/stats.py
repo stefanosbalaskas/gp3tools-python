@@ -242,8 +242,6 @@ def prepare_gazepoint_timecourse_test_data(
     def aggregate_series(series):
         values = pd.to_numeric(series, errors="coerce")
         values = values[np.isfinite(values)]
-        if len(values) == 0:
-            return np.nan
         try:
             return float(aggregate_fun(values))
         except TypeError:
@@ -1122,9 +1120,10 @@ def summarise_gazepoint_fixed_effects(
 def summarise_gazepoint_emmeans(
     data, factor=None, outcome=None, group_cols=None, **kwargs
 ) -> pd.DataFrame:
-    df = ensure_dataframe(data)
     if not isinstance(data, pd.DataFrame) and hasattr(data, "model"):
-        df = data.model.data.frame
+        df = ensure_dataframe(data.model.data.frame)
+    else:
+        df = ensure_dataframe(data)
     factor = factor or infer_column(df, "condition")
     outcome = (
         outcome
@@ -2034,7 +2033,6 @@ def analyze_gazepoint_window(
             return float(np.max(z))
         if stat == "sum":
             return float(np.sum(z))
-        raise ValueError("Unknown summary statistic.")
 
     if by_cols:
         grouped = df.groupby(by_cols, dropna=False, sort=True)

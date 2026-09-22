@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
@@ -122,9 +122,7 @@ def test_api_status_survives_signature_failure(
     def flaky(obj):
         if calls["n"] == 0:
             calls["n"] += 1
-            raise ValueError(
-                "synthetic signature failure"
-            )
+            raise ValueError("synthetic signature failure")
 
         return original(obj)
 
@@ -180,16 +178,9 @@ def test_face_auto_source_detection(
     frame,
     expected,
 ) -> None:
-    result = face_mod.standardize_gazepoint_face_columns(
-        frame
-    )
+    result = face_mod.standardize_gazepoint_face_columns(frame)
 
-    assert (
-        result.attrs[
-            "gp3_face_standardization"
-        ]["detected_source"]
-        == expected
-    )
+    assert result.attrs["gp3_face_standardization"]["detected_source"] == expected
 
 
 def test_face_standardization_validation_and_blank_columns(
@@ -200,9 +191,7 @@ def test_face_standardization_validation_and_blank_columns(
         match="source must be one of",
     ):
         face_mod.standardize_gazepoint_face_columns(
-            pd.DataFrame(
-                {"x": [1]}
-            ),
+            pd.DataFrame({"x": [1]}),
             source="invalid",
         )
 
@@ -210,9 +199,7 @@ def test_face_standardization_validation_and_blank_columns(
         ValueError,
         match="readable CSV path",
     ):
-        face_mod.standardize_gazepoint_face_columns(
-            tmp_path / "missing.csv"
-        )
+        face_mod.standardize_gazepoint_face_columns(tmp_path / "missing.csv")
 
     frame = pd.DataFrame(
         [[1, 2]],
@@ -222,9 +209,7 @@ def test_face_standardization_validation_and_blank_columns(
         ],
     )
 
-    result = face_mod.standardize_gazepoint_face_columns(
-        frame
-    )
+    result = face_mod.standardize_gazepoint_face_columns(frame)
 
     assert {
         "unnamed_face_column_1",
@@ -241,12 +226,7 @@ def test_face_source_metadata_single_mixed_and_empty() -> None:
         )
     )
 
-    assert (
-        single.attrs[
-            "gp3_face_standardization"
-        ]["detected_source"]
-        == "custom"
-    )
+    assert single.attrs["gp3_face_standardization"]["detected_source"] == "custom"
 
     mixed = face_mod.standardize_gazepoint_face_columns(
         pd.DataFrame(
@@ -259,12 +239,7 @@ def test_face_source_metadata_single_mixed_and_empty() -> None:
         )
     )
 
-    assert (
-        mixed.attrs[
-            "gp3_face_standardization"
-        ]["detected_source"]
-        == "mixed"
-    )
+    assert mixed.attrs["gp3_face_standardization"]["detected_source"] == "mixed"
 
     empty = face_mod.standardize_gazepoint_face_columns(
         pd.DataFrame(
@@ -275,12 +250,7 @@ def test_face_source_metadata_single_mixed_and_empty() -> None:
         )
     )
 
-    assert (
-        empty.attrs[
-            "gp3_face_standardization"
-        ]["detected_source"]
-        == "mediapipe"
-    )
+    assert empty.attrs["gp3_face_standardization"]["detected_source"] == "mediapipe"
 
 
 def test_face_explicit_column_and_boolean_paths() -> None:
@@ -364,9 +334,7 @@ def test_face_quality_legacy_autodetect_and_missing_named_confidence() -> None:
     )
 
     assert fallback["n_valid"].iloc[0] == 2
-    assert np.isnan(
-        fallback["mean_confidence"].iloc[0]
-    )
+    assert np.isnan(fallback["mean_confidence"].iloc[0])
 
 
 def test_face_quality_path_empty_single_group_and_time_gap(
@@ -375,9 +343,7 @@ def test_face_quality_path_empty_single_group_and_time_gap(
     csv_path = tmp_path / "face.csv"
 
     csv_path.write_text(
-        "frame,timestamp,confidence,success,AU01_r\n"
-        "1,0.0,0.95,1,0.1\n"
-        "2,0.1,0.96,1,0.2\n",
+        "frame,timestamp,confidence,success,AU01_r\n1,0.0,0.95,1,0.1\n2,0.1,0.96,1,0.2\n",
         encoding="utf-8",
     )
 
@@ -392,9 +358,7 @@ def test_face_quality_path_empty_single_group_and_time_gap(
         ValueError,
         match="at least one row",
     ):
-        face_mod.audit_gazepoint_face_quality(
-            pd.DataFrame()
-        )
+        face_mod.audit_gazepoint_face_quality(pd.DataFrame())
 
     raw = pd.DataFrame(
         {
@@ -428,19 +392,9 @@ def test_face_quality_path_empty_single_group_and_time_gap(
         max_duplicate_frame_percent=100,
     )
 
-    assert (
-        audited[
-            "group_summary"
-        ]["face_quality_status"].iloc[0]
-        == "warn"
-    )
+    assert audited["group_summary"]["face_quality_status"].iloc[0] == "warn"
 
-    assert (
-        audited[
-            "group_summary"
-        ]["participant_id"].iloc[0]
-        == "P1"
-    )
+    assert audited["group_summary"]["participant_id"].iloc[0] == "P1"
 
 
 # ---------------------------------------------------------------------------
@@ -511,12 +465,7 @@ def test_face_sync_validation_mapping_and_tolerance() -> None:
         standardize_face=False,
     )
 
-    assert (
-        milliseconds.attrs[
-            "gp3_face_sync_settings"
-        ]["tolerance_sec"]
-        == pytest.approx(0.025)
-    )
+    assert milliseconds.attrs["gp3_face_sync_settings"]["tolerance_sec"] == pytest.approx(0.025)
 
     for by in (
         "group",
@@ -531,12 +480,7 @@ def test_face_sync_validation_mapping_and_tolerance() -> None:
             standardize_face=False,
         )
 
-        assert (
-            synced[
-                "face_sync_status"
-            ].iloc[0]
-            == "matched"
-        )
+        assert synced["face_sync_status"].iloc[0] == "matched"
 
     with pytest.raises(
         ValueError,
@@ -591,12 +535,7 @@ def test_face_sync_column_detection_and_errors() -> None:
         standardize_face=False,
     )
 
-    assert (
-        detected[
-            "face_sync_status"
-        ].iloc[0]
-        == "matched"
-    )
+    assert detected["face_sync_status"].iloc[0] == "matched"
 
     with pytest.raises(
         ValueError,
@@ -630,12 +569,7 @@ def test_face_sync_unmatched_missing_time_and_frame() -> None:
         standardize_face=False,
     )
 
-    assert (
-        unmatched[
-            "face_sync_status"
-        ].iloc[0]
-        == "unmatched"
-    )
+    assert unmatched["face_sync_status"].iloc[0] == "unmatched"
 
     missing_time = face_mod.sync_gazepoint_face_data(
         pd.DataFrame(
@@ -651,12 +585,7 @@ def test_face_sync_unmatched_missing_time_and_frame() -> None:
         standardize_face=False,
     )
 
-    assert (
-        missing_time[
-            "face_sync_status"
-        ].iloc[0]
-        == "missing_gaze_time"
-    )
+    assert missing_time["face_sync_status"].iloc[0] == "missing_gaze_time"
 
     frames = face_mod.sync_gazepoint_face_data(
         pd.DataFrame(
@@ -763,9 +692,7 @@ def test_face_window_summary_without_groups() -> None:
         value_cols=["metric"],
     )
 
-    assert result["metric"].iloc[0] == pytest.approx(
-        2.0
-    )
+    assert result["metric"].iloc[0] == pytest.approx(2.0)
 
 
 def test_prepare_multimodal_historical_and_unknown_kwargs() -> None:
@@ -778,9 +705,7 @@ def test_prepare_multimodal_historical_and_unknown_kwargs() -> None:
         }
     )
 
-    direct = face_mod.prepare_gazepoint_multimodal_data(
-        gaze=gaze
-    )
+    direct = face_mod.prepare_gazepoint_multimodal_data(gaze=gaze)
 
     pd.testing.assert_frame_equal(
         direct,
@@ -859,21 +784,17 @@ def test_reporting_checklist_non_dataframe_and_status_routes() -> None:
         gp3_class="gp3_face_sync_audit",
     )
 
-    checklist = (
-        face_mod.create_gazepoint_face_reporting_checklist(
-            face_data=object(),
-            quality_audit=quality,
-            sync_audit=sync,
-            window_summary=pd.DataFrame(),
-            reactivity_summary=object(),
-            multimodal_model=object(),
-            include_interpretation_cautions=False,
-        )
+    checklist = face_mod.create_gazepoint_face_reporting_checklist(
+        face_data=object(),
+        quality_audit=quality,
+        sync_audit=sync,
+        window_summary=pd.DataFrame(),
+        reactivity_summary=object(),
+        multimodal_model=object(),
+        include_interpretation_cautions=False,
     )
 
-    statuses = set(
-        checklist["status"]
-    )
+    statuses = set(checklist["status"])
 
     assert "pass" in statuses
     assert "fail" in statuses
@@ -897,32 +818,28 @@ def test_reporting_checklist_unknown_review_and_zero_issue_routes() -> None:
         "custom_status",
     )
 
-    checklist = (
-        face_mod.create_gazepoint_face_reporting_checklist(
-            quality_audit=quality,
-            sync_audit=sync,
-            window_summary=pd.DataFrame(
-                {
-                    "metric": [1.0],
-                }
-            ),
-            reactivity_summary=pd.DataFrame(
-                {
-                    "measure": ["AU01"],
-                }
-            ),
-            multimodal_model={
-                "not_settings": {
-                    "x": 1,
-                }
-            },
-            include_interpretation_cautions=False,
-        )
+    checklist = face_mod.create_gazepoint_face_reporting_checklist(
+        quality_audit=quality,
+        sync_audit=sync,
+        window_summary=pd.DataFrame(
+            {
+                "metric": [1.0],
+            }
+        ),
+        reactivity_summary=pd.DataFrame(
+            {
+                "measure": ["AU01"],
+            }
+        ),
+        multimodal_model={
+            "not_settings": {
+                "x": 1,
+            }
+        },
+        include_interpretation_cautions=False,
     )
 
-    statuses = set(
-        checklist["status"]
-    )
+    statuses = set(checklist["status"])
 
     assert "unknown" in statuses
     assert "review" in statuses
@@ -946,22 +863,18 @@ def test_reporting_checklist_affected_issue_and_nan_window() -> None:
         "ok",
     )
 
-    checklist = (
-        face_mod.create_gazepoint_face_reporting_checklist(
-            quality_audit=quality,
-            sync_audit=sync,
-            window_summary=pd.DataFrame(
-                {
-                    "n_used": [np.nan],
-                }
-            ),
-            include_interpretation_cautions=False,
-        )
+    checklist = face_mod.create_gazepoint_face_reporting_checklist(
+        quality_audit=quality,
+        sync_audit=sync,
+        window_summary=pd.DataFrame(
+            {
+                "n_used": [np.nan],
+            }
+        ),
+        include_interpretation_cautions=False,
     )
 
-    statuses = set(
-        checklist["status"]
-    )
+    statuses = set(checklist["status"])
 
     assert "not_available" in statuses
     assert "review" in statuses
@@ -983,32 +896,23 @@ def test_reporting_checklist_missing_audit_status_column() -> None:
         ),
     }
 
-    checklist = (
-        face_mod.create_gazepoint_face_reporting_checklist(
-            quality_audit=quality,
-            include_interpretation_cautions=False,
-        )
+    checklist = face_mod.create_gazepoint_face_reporting_checklist(
+        quality_audit=quality,
+        include_interpretation_cautions=False,
     )
 
-    row = checklist.loc[
-        checklist["item"].eq(
-            "Face-data quality status is acceptable"
-        )
-    ].iloc[0]
+    row = checklist.loc[checklist["item"].eq("Face-data quality status is acceptable")].iloc[0]
 
     assert row["status"] == "unknown"
 
-    assert (
-        "missing the status column"
-        in row["evidence"]
-    )
-
+    assert "missing the status column" in row["evidence"]
 
 
 def test_velocity_public_legacy_return_fallback_and_no_class(
     monkeypatch,
 ) -> None:
     """Cover legacy return alias and the no-decoration result branch."""
+
     def fake_native(*args, **kwargs):
         return {
             "events": pd.DataFrame(

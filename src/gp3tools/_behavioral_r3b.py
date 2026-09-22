@@ -297,12 +297,6 @@ def create_gazepoint_report(
         data,
         limit=30,
     ):
-        if not isinstance(
-            data,
-            pd.DataFrame,
-        ):
-            return "<p>No table available.</p>\n"
-
         if len(data) == 0:
             return "<p>No rows available.</p>\n"
 
@@ -1141,14 +1135,7 @@ def estimate_gazepoint_divergence_point(
 
         observed_at_onset = float(observed_difference[onset_index])
 
-        if observed_at_onset > float(null_value):
-            observed_direction = "positive"
-
-        elif observed_at_onset < float(null_value):
-            observed_direction = "negative"
-
-        else:
-            observed_direction = "zero"
+        observed_direction = "positive" if observed_at_onset > float(null_value) else "negative"
 
         detector_status = "complete"
 
@@ -1511,9 +1498,6 @@ def run_gazepoint_aoi_multiverse(
 
     elif n_failed == len(branch_results):
         multiverse_status = "failed"
-
-    elif n_failed:
-        multiverse_status = "completed_with_failures"
 
     else:
         multiverse_status = "completed"
@@ -2174,9 +2158,6 @@ def run_gazepoint_pupil_multiverse(
     elif n_failed == len(branch_results):
         multiverse_status = "failed"
 
-    elif n_failed:
-        multiverse_status = "completed_with_failures"
-
     else:
         multiverse_status = "completed"
 
@@ -2358,8 +2339,10 @@ def run_gazepoint_workflow(
 
     sampling_rows: list[dict[str, Any]] = []
 
+    grouper: Any = groups[0] if len(groups) == 1 else groups
+
     grouped_gaze = all_gaze.groupby(
-        groups,
+        grouper,
         dropna=False,
         sort=True,
     )
@@ -2463,7 +2446,7 @@ def run_gazepoint_workflow(
     quality_rows: list[dict[str, Any]] = []
 
     for key, frame in all_gaze.groupby(
-        groups,
+        grouper,
         dropna=False,
         sort=True,
     ):
@@ -2607,6 +2590,19 @@ def run_gazepoint_workflow(
     ) -> pd.DataFrame:
         output = frame.copy()
 
+        if user_col not in output.columns:
+            # read_folder() guarantees user_col for every non-empty stream.
+            # A disabled fixation stream is legitimately empty.
+            assert output.empty, (
+                "Internal workflow invariant violated: "
+                f"non-empty stream lacks user column {user_col!r}"
+            )
+
+            output[user_col] = pd.Series(
+                index=output.index,
+                dtype=float,
+            )
+
         output["USER_ID"] = pd.to_numeric(
             output[user_col],
             errors="coerce",
@@ -2637,12 +2633,6 @@ def run_gazepoint_workflow(
             dropna=False,
             sort=True,
         ):
-            if not isinstance(
-                key,
-                tuple,
-            ):
-                key = (key,)
-
             row = dict(
                 zip(
                     join_columns,
@@ -2707,12 +2697,6 @@ def run_gazepoint_workflow(
             dropna=False,
             sort=True,
         ):
-            if not isinstance(
-                key,
-                tuple,
-            ):
-                key = (key,)
-
             row = dict(
                 zip(
                     join_columns,
