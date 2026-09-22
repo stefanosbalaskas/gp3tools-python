@@ -1,11 +1,14 @@
 # Changelog
 
-## 0.1.1.dev0 ? coverage and release hardening
+## 0.1.1 — 2026-09-22
 
-- preserve the immutable published `v0.1.0` release and begin post-release hardening;
-- close genuine executable coverage gaps without weakening validation or excluding scientific modules;
-- add tranche-specific 100% coverage gates before raising the package-wide gate to 100%;
-- retain the 278-export public API and R/Python scientific-contract compatibility.
+- enforce **100% package-wide executable statement coverage** across the complete `gp3tools` source tree;
+- close residual AOI, pupil, and QC validation/edge paths with deterministic regression tests;
+- remove branches proven unreachable under validated API invariants instead of excluding them from coverage;
+- retain the frozen **278-export** R gp3tools v2.3.0 public API contract and R/Python compatibility gates;
+- validate **1,424 tests** on Python 3.11, 3.12, and 3.13, including the 100% R4 compatibility coverage contract;
+- validate runnable examples, wheel and source-distribution builds, and installation from the freshly built wheel;
+- promote the post-0.1.0 hardening line from `0.1.1.dev0` to stable `0.1.1`.
 
 ## 0.1.0a1 — comprehensive migration alpha
 

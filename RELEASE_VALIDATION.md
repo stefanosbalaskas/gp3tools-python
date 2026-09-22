@@ -1,65 +1,47 @@
 # gp3tools Python release validation
 
-Generated: 2026-08-29T00:30:22+03:00
+Generated: 2026-09-22
+Release candidate: **0.1.1**
 
 ## Frozen reference
 
 - Canonical R package: `gp3tools 2.3.0`
 - Canonical R exports: **278**
-- Python public namespace: **285**
-- Frozen R4 oracle assertions: **3,786**
-- Frozen R4 oracle SHA256: `7749F214B3F16A4A03CEBD030C597999B3BDDA38C1BEB9A4CAEDA5380735F684`
+- Python supported versions: **3.11, 3.12, 3.13**
 
-## Final validation
+## Release-candidate validation
 
-- Static R/Python call-surface hard failures: **0**
-- Full pytest suite: **684 passed**
-- Measured line coverage: **90.06%**
-- Required line coverage: **>= 90%**
+Validated on exact development head `f144c76074303a310599c8b2fdbf7eda61ca9cae` before the version-only release metadata commit.
+
+- Full pytest suite: **1,424 passed**
+- Executable statements: **16,546**
+- Missing executable statements: **0**
+- Package-wide line coverage: **100.00%**
 - Ruff: **PASS**
-- `compileall`: **PASS**
-- `git diff --check`: **PASS**
-- R1-R4 behavioral/semantic regression suites: **PASS**
-- Runnable Python examples: **6/6 PASS**
-- Headless plot smoke: **PASS**
-- MkDocs strict build: **PASS**
+- Public 278-export API contract: **PASS**
+- R4 compatibility coverage contract: **100% PASS**
+- Python 3.11 CI: **PASS**
+- Python 3.12 CI: **PASS**
+- Python 3.13 CI: **PASS**
+- Runnable examples smoke: **PASS**
 - Wheel build: **PASS**
 - Source distribution build: **PASS**
-- Offline extracted-wheel artifact smoke: **PASS**
-- All 278 R exports callable: **PASS**
+- Fresh-wheel installation and `pip check`: **PASS**
+- Fresh-wheel 278-export smoke: **PASS**
 
-## Distribution artifacts
+The release metadata commit raises the CI package-wide coverage threshold from 90% to **100%**. The release is not considered qualified until the same CI matrix passes again on the exact `0.1.1` metadata head.
 
-- Wheel: `gp3tools-0.1.0a1-py3-none-any.whl`
-- Wheel SHA256: `6B5DE8C402BA0C585014765C71704CF11B5AA6EAC6048F2F31BD9D1D5323222B`
-- Source distribution: `gp3tools-0.1.0a1.tar.gz`
-- Source distribution SHA256: `B4E6C56FA0318958881A48736C82DD6695A6773D8500754BF39736B63921F592`
+## Scientific and API contract
 
-## Runnable examples
+The Python implementation preserves the frozen R 2.3.0 export surface while retaining documented Python compatibility interfaces.
 
-- `binocular_pupil.py`
-- `full_workflow.py`
-- `plot_gallery.py`
-- `pupil_qc.py`
-- `quickstart.py`
-- `timecourse.py`
+Coverage closure did **not** disable tests, lower scientific validation, add coverage exclusions, or silently change estimator, missing-data, AOI, censoring, or provenance semantics. Residual defensive branches proven unreachable under existing validated invariants were simplified directly; executable edge paths received deterministic regression coverage.
 
-## Documentation
+## Distribution contract
 
-The documentation build completed successfully under `mkdocs build --strict --clean`.
+The stable release must use the exact validated `0.1.1` source state to produce:
 
-The documentation tree contains the complete workflow, AOI, pupil,
-binocular, scanpath, transition, time-course, statistical, Bayesian,
-face, multimodal, interoperability, QC, plotting, validation and release
-articles currently implemented in the repository.
+- `gp3tools-0.1.1-py3-none-any.whl`
+- `gp3tools-0.1.1.tar.gz`
 
-## Compatibility and parity
-
-The Python implementation preserves the frozen R 2.3.0 export surface
-while retaining documented Python compatibility interfaces.
-
-Parity validation distinguishes exact structural behavior, numerical
-tolerance where appropriate, and backend-equivalent statistical behavior
-where the Python ecosystem does not use the identical R implementation.
-
-The frozen R4 oracle was not modified during completion.
+GitHub Release assets and PyPI publication must refer to those same validated distributions. PyPI publication is performed through the repository's Trusted Publishing workflow.

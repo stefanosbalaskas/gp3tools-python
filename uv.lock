@@ -945,7 +945,7 @@ wheels = [
 
 [[package]]
 name = "gp3tools"
-version = "0.1.1.dev0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },

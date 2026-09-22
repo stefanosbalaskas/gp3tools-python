@@ -12,7 +12,7 @@ private participant exports.
 === "pip"
 
     ```bash
-    python -m pip install "gp3tools==0.1.0a1"
+    python -m pip install "gp3tools==0.1.1"
     ```
 
 === "latest alpha"
@@ -24,7 +24,7 @@ private participant exports.
 === "uv"
 
     ```bash
-    uv pip install "gp3tools==0.1.0a1"
+    uv pip install "gp3tools==0.1.1"
     ```
 
 The GitHub CI matrix validates Python **3.11, 3.12 and 3.13**.
