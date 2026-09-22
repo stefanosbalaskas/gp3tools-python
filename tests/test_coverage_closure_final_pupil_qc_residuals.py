@@ -549,3 +549,111 @@ def test_final_qc_overview_none_columns_are_nullable():
     overview = result["overview"].iloc[0]
     assert pd.isna(overview["trial_col"])
     assert pd.isna(overview["condition_col"])
+
+def test_final_pupil_baseline_scalar_group_and_overlap_residuals():
+    baseline = pupil.baseline_correct_gazepoint_pupil(
+        pd.DataFrame(
+            {
+                "subject": ["S1", "S1"],
+                "time": [-100.0, 50.0],
+                "pupil": [3.0, 3.2],
+            }
+        ),
+        pupil_col="pupil",
+        time_col="time",
+        baseline_window=(-100.0, 0.0),
+        group_cols="subject",
+    )
+    assert len(baseline) == 2
+
+    legacy = pupil.audit_gazepoint_pupil_overlap_risk(
+        pd.DataFrame({"pupil": [3.0]})
+    )
+    assert legacy.loc[0, "status"] == "insufficient_columns"
+
+
+def test_final_pupil_drift_condition_column_not_available():
+    result = pupil.audit_gazepoint_pupil_drift(
+        pd.DataFrame(
+            {
+                "subject": ["S1", "S1", "S1"],
+                "trial": [1, 2, 3],
+                "time": [0.0, 100.0, 200.0],
+                "pupil": [3.0, 3.1, 3.2],
+            }
+        ),
+        pupil_col="pupil",
+        time_col="time",
+        condition_col="",
+    )
+    assert (
+        result["condition_balance"].loc[0, "condition_balance_reason"]
+        == "condition_col_not_available"
+    )
+
+
+def test_final_pupil_overlap_risk_all_rows_excluded():
+    result = pupil.audit_gazepoint_pupil_overlap_risk(
+        pd.DataFrame(
+            {
+                "subject": ["S1"],
+                "trial_global": [1],
+                "time": [0.0],
+                "stimulus_onset_time": [0.0],
+                "target_onset_time": [500.0],
+                "response_time": [1000.0],
+                "excluded_trial": [True],
+            }
+        ),
+        exclude_col="excluded_trial",
+    )
+    assert result["by_trial"].empty
+    assert result["summary"].loc[0, "n_trials"] == 0
+
+
+def test_final_pupil_contiguous_mask_break_when_target_covers_group(monkeypatch):
+    monkeypatch.setattr(
+        pupil,
+        "_gp3_binoc_r_calibration",
+        lambda *args, **kwargs: {},
+    )
+
+    def fake_reconstruct(data, left_col, right_col, **kwargs):
+        out = data.copy()
+        left = pd.to_numeric(out[left_col], errors="coerce")
+        right = pd.to_numeric(out[right_col], errors="coerce")
+        out["gp3_binocular_left_final"] = left.fillna(right)
+        out["gp3_binocular_right_final"] = right.fillna(left)
+        out["gp3_binocular_status"] = "test_reconstruction"
+        out["gp3_binocular_model_id"] = pd.NA
+        out["gp3_binocular_calibration_level"] = pd.NA
+        out["gp3_binocular_r_squared"] = np.nan
+        out["gp3_binocular_extrapolated"] = False
+        out["gp3_binocular_gap_ms"] = np.nan
+        return out
+
+    monkeypatch.setattr(
+        pupil,
+        "reconstruct_gazepoint_binocular_pupil",
+        fake_reconstruct,
+    )
+
+    result = pupil.validate_gazepoint_binocular_reconstruction(
+        pd.DataFrame(
+            {
+                "left": [1.0, 2.0],
+                "right": [1.1, 2.1],
+            }
+        ),
+        left_col="left",
+        right_col="right",
+        repeats=1,
+        mask_prop=0.75,
+        mask_mode="contiguous",
+        block_size=2,
+        seed=1,
+        min_pairs=1,
+        min_unique=1,
+    )
+    assert result["metrics"]["n_requested"].sum() == 2
+
