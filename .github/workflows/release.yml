@@ -175,15 +175,12 @@ jobs:
             {
               echo "# gp3tools 0.1.2"
               echo
-              echo "Stable coverage-hardening release."
+              echo "Documentation-only maintenance release."
               echo
-              echo "- 1,424 tests passed"
-              echo "- 16,546 / 16,546 executable statements covered (100.00%)"
-              echo "- Python 3.11, 3.12, and 3.13 validated"
-              echo "- 278-export public API contract validated"
-              echo "- R4 compatibility coverage contract: 100%"
-              echo "- strict documentation build validated"
-              echo "- wheel/sdist and fresh-wheel installation validated"
+              echo "- Add the October methods briefing and estimation-graphics guidance."
+              echo "- Preserve the frozen 278-export public API and existing scientific implementations."
+              echo "- Validate tests, exact package coverage, strict documentation and fresh-wheel installation in the release workflow."
+              echo "- No experimental estimator or scientific qualification is promoted by this patch."
               echo
               echo "## SHA256"
               echo
