@@ -59,8 +59,8 @@ jobs:
           if any(token in version for token in ("dev", "a", "b", "rc")):
               raise SystemExit(f"Refusing non-stable release version: {version}")
 
-          if version != "0.1.1":
-              raise SystemExit(f"Expected release version 0.1.1, found {version}")
+          if version != "0.1.2":
+              raise SystemExit(f"Expected release version 0.1.2, found {version}")
 
           if len(gp3tools.R_EXPORTS) != 278:
               raise SystemExit(
@@ -89,8 +89,8 @@ jobs:
           rm -rf dist build
           python -m build
           python -m twine check dist/*
-          test -f dist/gp3tools-0.1.1-py3-none-any.whl
-          test -f dist/gp3tools-0.1.1.tar.gz
+          test -f dist/gp3tools-0.1.2-py3-none-any.whl
+          test -f dist/gp3tools-0.1.2.tar.gz
           sha256sum dist/* | tee dist/SHA256SUMS.txt
 
       - name: Validate installation from exact wheel
@@ -99,13 +99,13 @@ jobs:
           set -euo pipefail
           python -m venv /tmp/gp3tools-release-wheel
           /tmp/gp3tools-release-wheel/bin/python -m pip install --upgrade pip
-          /tmp/gp3tools-release-wheel/bin/python -m pip install dist/gp3tools-0.1.1-py3-none-any.whl
+          /tmp/gp3tools-release-wheel/bin/python -m pip install dist/gp3tools-0.1.2-py3-none-any.whl
           /tmp/gp3tools-release-wheel/bin/python -m pip check
           cd /tmp
           /tmp/gp3tools-release-wheel/bin/python - <<'PY'
           import gp3tools
 
-          assert gp3tools.__version__ == "0.1.1"
+          assert gp3tools.__version__ == "0.1.2"
           assert len(gp3tools.R_EXPORTS) == 278
           print("Exact-wheel validation: PASS")
           PY
@@ -113,10 +113,10 @@ jobs:
       - name: Upload validated release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gp3tools-0.1.1-release
+          name: gp3tools-0.1.2-release
           path: |
-            dist/gp3tools-0.1.1-py3-none-any.whl
-            dist/gp3tools-0.1.1.tar.gz
+            dist/gp3tools-0.1.2-py3-none-any.whl
+            dist/gp3tools-0.1.2.tar.gz
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
@@ -140,16 +140,16 @@ jobs:
       - name: Download validated release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: gp3tools-0.1.1-release
+          name: gp3tools-0.1.2-release
           path: dist
 
-      - name: Create or verify v0.1.1 release
+      - name: Create or verify v0.1.2 release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          TAG="v0.1.1"
+          TAG="v0.1.2"
 
           if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
             git fetch --tags origin "${TAG}"
@@ -161,29 +161,26 @@ jobs:
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "${TAG}" "${GITHUB_SHA}" -m "gp3tools 0.1.1"
+            git tag -a "${TAG}" "${GITHUB_SHA}" -m "gp3tools 0.1.2"
             git push origin "${TAG}"
           fi
 
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             echo "GitHub Release ${TAG} already exists; verifying attached distributions."
             gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets \
-              --jq '.assets[].name' | grep -Fx "gp3tools-0.1.1-py3-none-any.whl"
+              --jq '.assets[].name' | grep -Fx "gp3tools-0.1.2-py3-none-any.whl"
             gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets \
-              --jq '.assets[].name' | grep -Fx "gp3tools-0.1.1.tar.gz"
+              --jq '.assets[].name' | grep -Fx "gp3tools-0.1.2.tar.gz"
           else
             {
-              echo "# gp3tools 0.1.1"
+              echo "# gp3tools 0.1.2"
               echo
-              echo "Stable coverage-hardening release."
+              echo "Documentation-only maintenance release."
               echo
-              echo "- 1,424 tests passed"
-              echo "- 16,546 / 16,546 executable statements covered (100.00%)"
-              echo "- Python 3.11, 3.12, and 3.13 validated"
-              echo "- 278-export public API contract validated"
-              echo "- R4 compatibility coverage contract: 100%"
-              echo "- strict documentation build validated"
-              echo "- wheel/sdist and fresh-wheel installation validated"
+              echo "- Add the October methods briefing and estimation-graphics guidance."
+              echo "- Preserve the frozen 278-export public API and existing scientific implementations."
+              echo "- Validate tests, exact package coverage, strict documentation and fresh-wheel installation in the release workflow."
+              echo "- No experimental estimator or scientific qualification is promoted by this patch."
               echo
               echo "## SHA256"
               echo
@@ -191,12 +188,12 @@ jobs:
             } > release-notes.md
 
             gh release create "${TAG}" \
-              dist/gp3tools-0.1.1-py3-none-any.whl \
-              dist/gp3tools-0.1.1.tar.gz \
+              dist/gp3tools-0.1.2-py3-none-any.whl \
+              dist/gp3tools-0.1.2.tar.gz \
               dist/SHA256SUMS.txt \
               --repo "${GITHUB_REPOSITORY}" \
               --target "${GITHUB_SHA}" \
-              --title "gp3tools 0.1.1" \
+              --title "gp3tools 0.1.2" \
               --notes-file release-notes.md
           fi
 
@@ -207,6 +204,6 @@ jobs:
           gh workflow run pypi.yml \
             --repo "${GITHUB_REPOSITORY}" \
             --ref main \
-            -f tag=v0.1.1
+            -f tag=v0.1.2
 
-          echo "Dispatched pypi.yml for v0.1.1"
+          echo "Dispatched pypi.yml for v0.1.2"

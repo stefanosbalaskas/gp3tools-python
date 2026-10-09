@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 — 2026-10-09 (documentation-only maintenance candidate)
+
+- Include the newly reviewed cross-package scientific methods/DABEST-style estimation-graphics guide in the documentation source.
+- Preserve the already published 278-export public API and scientific implementation; no new statistical estimator, parity claim, or experimental feature is promoted.
+- Re-validate full test, exact coverage, strict documentation and wheel/sdist installation on the new immutable release candidate before publication.
+
+
 ## 0.1.1 — 2026-09-22
 
 - enforce **100% package-wide executable statement coverage** across the complete `gp3tools` source tree;
