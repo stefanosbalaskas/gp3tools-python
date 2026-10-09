@@ -87,6 +87,7 @@ nav:
       - Complete Python workflow: articles/complete-python-workflow.md
       - End-to-end workflow: articles/end-to-end-workflow.md
       - Synthetic showcase: articles/paper-grade-synthetic-showcase.md
+      - Python ecosystem methods briefing: articles/methods-briefing-python-ecosystem.md
       - Private-data safety: articles/private-data-safety.md
   - Pupil & signals:
       - Pupil workflow: articles/pupil-workflow.md
