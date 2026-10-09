@@ -7,10 +7,10 @@ This page maps the September–October 2026 methodological recommendations to ex
 | Task | Recommended Python owner | Why |
 | --- | --- | --- |
 | GP3 sample import, AOI/sequence QC, pupil preprocessing | `gp3tools` | Frozen R-parity namespace and legacy GP3 workflows |
-| Trial/participant missingness sensitivity | [eyeprocesspy](https://stefanosbalaskas.github.io/eyeprocesspy/methods/missingness-mechanism-audit/) | Experimental explicitly observed-versus-missing and pattern-mixture audits |
-| Physiological rate lineage and reference agreement | [gpbiometricspy](https://stefanosbalaskas.github.io/gpbiometricspy/methods/measurement-validation-protocol/) | Device-versus-delivered-rate and agreement-versus-construct responsiveness |
-| Cross-modal pairing, split scope, quality weighting | [GazeForge](https://stefanosbalaskas.github.io/GazeForge/multimodal-integrity-research/) | Structurally auditable multimodal evidence |
-| Cluster-aware nonlinear mediation robustness | [gp3bayespy](https://stefanosbalaskas.github.io/gp3bayespy/articles/nonlinear-mediation-audit/) | Experimental diagnostic, not automatic causal identification |
+| Trial/participant missingness sensitivity | [eyeprocesspy](https://github.com/stefanosbalaskas/eyeprocesspy/pull/37) | Experimental explicitly observed-versus-missing and pattern-mixture audits |
+| Physiological rate lineage and reference agreement | [gpbiometricspy](https://github.com/stefanosbalaskas/gpbiometricspy/pull/173) | Device-versus-delivered-rate and agreement-versus-construct responsiveness |
+| Cross-modal pairing, split scope, quality weighting | [GazeForge](https://github.com/stefanosbalaskas/GazeForge/pull/249) | Structurally auditable multimodal evidence |
+| Cluster-aware nonlinear mediation robustness | [gp3bayespy](https://github.com/stefanosbalaskas/gp3bayespy/pull/18) | Experimental diagnostic, not automatic causal identification |
 | Functional trajectories and sparse Bayesian development | [eyetrajectoriespy](https://stefanosbalaskas.github.io/eyetrajectoriespy/) | 1.1 stable versus unreleased 1.2 research boundaries |
 | Ordered scanpaths/transitions | [gp3sequencespy](https://stefanosbalaskas.github.io/gp3sequencespy/) | Sequence-specific analyses, not independent evidence of experimental generalization |
 
