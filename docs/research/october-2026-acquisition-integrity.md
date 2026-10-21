@@ -39,3 +39,9 @@ fig.tight_layout()
 A separate `dispersion_interpretation_audit()` requires target visual angle, eccentricity, task and calibration-versus-task context before a BCEA68-style quantity is interpreted. Task fixation dispersion is not automatically an instrument precision estimate.
 
 **Claims not authorized:** externally validated sampling stability, spatial calibration accuracy, sensor clock drift or causal attribution of observed burst patterns. The image and plot code use synthetic timestamps only.
+
+## Publication and qualification status (21 October 2026)
+
+This page and its original synthetic figures are merged into the GitHub documentation source. The worked research modules are under `research/october_2026/` and **are not automatically included in installed PyPI wheels or exported as stable package APIs**. Their empirical accuracy, device transfer and inferential calibration are not implied by a green CI test or a successful website build.
+
+The explicit outstanding scientific acceptance criteria and eligible real-data benchmarks are tracked in [research-to-release issue #25](https://github.com/stefanosbalaskas/gp3tools-python/issues/25). This source-only research contribution is separate from the existing stable package version, and a new maintenance release must not claim these experiments as installed features.
