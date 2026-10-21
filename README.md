@@ -117,3 +117,9 @@ MIT.
 The Python package freezes the **278-export** R 2.3.0 public API while exposing **285** Python public names in the validated parity branch. Behavioral equality is evidence graded: exact and numerical-tolerance claims are made only where frozen R oracles exist; backend-adapted statistical families are labelled accordingly.
 
 The release gate includes R1–R3 frozen behavioral regressions, R4 canonical structure/compatibility tests plus frozen-oracle integrity checks, whole-surface smoke, plot catalog smoke, runnable examples, Ruff, compilation, strict documentation build, **≥90% test coverage**, wheel/sdist construction and isolated-wheel validation. See `docs/PARITY_STATUS.md`.
+
+## October 2026 research article and figure
+
+[**Native acquisition rate and spatial dispersion**](docs/research/october-2026-acquisition-integrity.md) documents experimental, source-only validation methods and reproducible synthetic examples. It is available in the website navigation, while independently qualified external empirical claims and stable PyPI APIs remain separate ([scientific acceptance criteria](https://github.com/stefanosbalaskas/gp3tools-python/issues/25)).
+
+![Original synthetic research figure](docs/assets/october-2026-acquisition.svg)
