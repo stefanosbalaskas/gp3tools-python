@@ -56,6 +56,10 @@ def acquisition_integrity_certificate(
         "catchup_pair_candidates": int(burst.sum()),
         "invalid_state_fraction": float((~valid).mean()),
         "recording_duration_s": float(time[-1] - time[0]),
+        "analysis_grid_exceeds_declared_native_rate": (
+            bool(analysis_grid_rate_hz > native_rate_hz)
+            if analysis_grid_rate_hz is not None and native_rate_hz is not None
+            else None),
         "analysis_grid_exceeds_observed_rate": (
             bool(analysis_grid_rate_hz > observed_median_rate)
             if analysis_grid_rate_hz is not None else None),
@@ -91,8 +95,9 @@ def dispersion_interpretation_audit(
         d[col] = pd.to_numeric(d[col], errors="coerce")
         if not np.isfinite(d[col]).all():
             raise ValueError("geometry and dispersion must be finite")
-    if (d[dispersion_col] < 0).any() or (d[target_size_col] <= 0).any():
-        raise ValueError("dispersion must be nonnegative, visual angle positive")
+    if ((d[dispersion_col] < 0).any() or (d[target_size_col] <= 0).any()
+            or (d[eccentricity_col] < 0).any()):
+        raise ValueError("dispersion/eccentricity must be nonnegative, visual angle positive")
     d["interpretation"] = d[source_col].map({
         "calibration_target": "calibration_session_dispersion_not_accuracy",
         "task_fixation": "stimulus_conditioned_task_dispersion_not_tracker_precision",
