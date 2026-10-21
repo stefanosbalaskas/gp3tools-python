@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3 — 2026-10-21 (documentation maintenance)
+
+- Publish the original October 2026 acquisition-integrity and dispersion article with synthetic figures and GitHub Pages navigation.
+- Preserve the complete 278-function stable public API and all existing scientific estimators; research validation modules in `research/october_2026/` remain source-only, not installed PyPI APIs.
+- Record hardware-validation and transfer gaps in issue #25; retain the entire strict CI, fresh-wheel and PyPI trusted-publisher provenance gates.
+
+
 ## 0.1.2 — 2026-10-09 (documentation-only maintenance candidate)
 
 - Include the newly reviewed cross-package scientific methods/DABEST-style estimation-graphics guide in the documentation source.
