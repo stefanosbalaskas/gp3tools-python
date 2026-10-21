@@ -81,6 +81,7 @@ extra:
       name: Peer-reviewed gp3tools paper
 
 nav:
+  - October 2026 research validation: research/october-2026-acquisition-integrity.md
   - Home: index.md
   - Start:
       - Getting started: getting-started.md
