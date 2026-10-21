@@ -1,8 +1,12 @@
-import numpy as np
 import pandas as pd
 import pytest
 
-from research.october_2026.acquisition_and_dispersion import (
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from research.october_2026.acquisition_and_dispersion import (  # noqa: E402
     acquisition_integrity_certificate,
     dispersion_interpretation_audit,
 )
