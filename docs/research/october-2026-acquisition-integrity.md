@@ -1,5 +1,7 @@
 # Delivered gaze samples are not the nominal sampling rate
 
+![Rendered synthetic plot](../assets/october-2026-plot.svg)
+
 This October 2026 **research-only** module audits the timestamp process and preserves the distinction between requested rate, native rate, SDK rate and downstream analysis grid. No hardware sampling rate or cross-device event synchronization is inferred from interpolation.
 
 ![Original schematic of irregular acquisition intervals](../assets/october-2026-acquisition.svg)
