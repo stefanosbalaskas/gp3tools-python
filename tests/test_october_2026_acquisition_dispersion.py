@@ -22,6 +22,7 @@ def test_quantization_catchup_and_rate_provenance():
     assert d["maximum_gap_ms"] == pytest.approx(40)
     assert d["invalid_state_fraction"] == pytest.approx(1 / 6)
     assert d["analysis_grid_exceeds_observed_rate"] is True
+    assert d["analysis_grid_exceeds_declared_native_rate"] is True
 
 
 def test_duplicate_timestamp_retained_and_backward_rejected():
@@ -44,3 +45,16 @@ def test_dispersion_requires_context_and_stays_descriptive():
     assert "not_tracker_precision" in a.iloc[1].interpretation
     with pytest.raises(ValueError, match="missing"):
         dispersion_interpretation_audit(f.drop(columns=["target_visual_angle_deg"]))
+
+
+def test_negative_eccentricity_rejected():
+    data = pd.DataFrame({
+        "participant_id": ["p"],
+        "measurement_context": ["task_fixation"],
+        "target_visual_angle_deg": [1.0],
+        "eccentricity_deg": [-1.0],
+        "task": ["reading"],
+        "bcea68": [.15],
+    })
+    with pytest.raises(ValueError, match="eccentricity"):
+        dispersion_interpretation_audit(data)
